@@ -57,6 +57,7 @@ commits that broke this area: `0752ea59`, `d89c5f14`, `4a64fd1a`, `fa591d6e`, `8
 - [ ] **overlay hidden in OBS when screen recording toggle is off** — Verify that the overlay is NOT visible in OBS (or other screen capture tools) when the "show in screen recording" toggle is off. (`87d107a29`)
 - [ ] **resizable shortcut overlay** — Change shortcut overlay size (small/medium/large) in settings and verify it updates correctly on all spaces. (`1e1e17171`)
 - [ ] **overlay resize support for webview fallback** — Verify that the overlay can be resized even when using the webview fallback. (`d095f5994`)
+- [ ] **webview title hidden** — Verify that webview windows (e.g., for web panels or embedded content) do not show titles in the window chrome. Title bar should be minimal or hidden. (`c42af57d5`)
 - [ ] **text selection not blocked by URL overlays** — On URL-heavy pages, verify that text selection is not blocked by clickable URL overlays. (`eb9e65b4`)
 - [ ] **macOS focused-app capture with AX observers** — On macOS, verify that focused-app capture works correctly when switching between applications, utilizing AX observers. (`22830119`)
 - [ ] **macOS native Live Text interaction** — On macOS, verify that native Live Text interaction, including text selection and data detectors, is re-enabled and functions correctly. (`e9c76934`)
@@ -85,6 +86,7 @@ commits that broke this area: `0752ea59`, `7562ec62`, `2a2bd9b5`, `f2f7f770`, `5
 - [ ] **tray upgrade button opens in-app checkout** — Verify that clicking the tray's upgrade button correctly opens the in-app checkout experience. (`078fcfb2`)
 - [ ] **modernized tray menu** — Verify the tray menu's updated layout and functionality match the modernized design. (`b6c363e5`)
 - [ ] **Recording toggle in tray** — Verify that the tray menu has a single toggle to start/stop recording (replacing separate items). (`cdc1d0fd9`)
+- [ ] **Tray pause for X minutes with auto-resume** — Click the tray menu "Pause" option and select a duration (e.g., 5, 15, 30 minutes). Verify recording pauses immediately, displays a countdown timer in the tray, and resumes automatically after the selected duration. (`cf187f7df`)
 
 ### 3. monitor plug/unplug
 
@@ -323,6 +325,7 @@ commits: `8a5f51dd`, `0b0d8090`, `7e58564e`, `2522a7e2`, `f3e55dbc`, `79f2913f`
 - [ ] **FPS setting** — change capture FPS. recording interval changes accordingly.
 - [ ] **language/OCR engine setting** — change OCR language. new language used on next capture cycle.
 - [ ] **video quality setting** — low/balanced/high/max. affects FFmpeg encoding params (`21bddd0f`).
+- [ ] **unified recording quality knob** — Verify that a single consolidated quality setting in Settings provides options for low/balanced/high/max quality. The setting unifies video encoding, bitrate, and frame handling. Changes apply to active recordings. (`8dce4406b`)
 - [ ] **Settings UI sentence case** — All settings UI elements (billing, pipes, team) should use consistent sentence case.
 - [ ] **Sidebar text visibility in Auto theme** — On macOS, switch between Light, Dark, and Auto system theme modes. Verify that sidebar text remains visible and legible in all modes. (`16d38570d`)
 - [ ] **Billing page links to website** — Verify that the in-app billing page correctly links to the *new* website billing page.
@@ -360,6 +363,7 @@ commits: `87abb00d`, `9464fdc9`, `0f9e43aa`, `7ea15f32`, `bf1f1004`
 - [ ] **onboarding window size** — window is correctly sized, no overflow (`7ea15f32`).
 - [ ] **onboarding doesn't re-show** — after completing onboarding, restart app. main window shows, not onboarding.
 - [ ] **First-run 2-hour reminder notification** — On a fresh install, verify that a custom notification panel appears after approximately 2 hours as a first-run reminder.
+- [ ] **Onboarding streaming prose with thumbnails** — Verify that onboarding screens stream prose dynamically with smooth typography animation. Thumbnail images load and display correctly next to text descriptions. (`d9ad0b8d1`)
 
 commits: `87abb00d`, `9464fdc9`, `0f9e43aa`, `7ea15f32`
 
@@ -420,6 +424,7 @@ commits: `f1255eac`, `25cbdc6b`, `2529367d`, `d9821624`, `e61501da`, `039d5fea`,
 - [ ] **Chat UI code blocks** — verify light text on dark bg in chat code blocks. (`c029f7779`)
 - [ ] **Chat image viewer** — verify images can be viewed in chat. (`2bcdf8d8b`)
 - [ ] **Chat preset dropdown** — verify AI preset switching within chat. (`2bcdf8d8b`)
+- [ ] **Chat prompt tuning** — Verify that chat responses are optimized through improved system prompts. Query results should be more contextually relevant and focused on user intent. (`460c62dc4`)
 - [ ] **Memories Settings UI** — verify frame_id relationship and Memories settings work as expected. (`67f4c4304`)
 
 commits: `f1255eac`, `25cbdc6b`, `2529367d`, `d9821624`
