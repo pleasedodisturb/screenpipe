@@ -113,6 +113,7 @@ commits: `28e5c247`
 - [ ] **bluetooth device connect/disconnect** — AirPods connect mid-recording. audio continues without gap.
 - [ ] **no audio device available** — unplug all audio. app continues (vision still works). log shows warning, not crash.
 - [ ] **audio stream timeout recovery** — if audio stream times out (30s no data), it should reconnect automatically.
+- [ ] **zero-fill device watchdog prevents recovery storm** — Connect a device that produces only silence (e.g. unplugged USB hub mistaken for audio device). Verify the watchdog does NOT repeatedly rebuild the stream; instead, the silent device stays quiet without recovery attempts. Old hijacked devices (was healthy, then went silent) should still trigger watchdog recovery. (`357e4dfcc`)
 - [ ] **multiple audio devices simultaneously** — input (mic) + output (speakers) both recording. both show in device list.
 - [ ] **disable audio setting** — toggling "disable audio" stops all audio recording. re-enabling restarts it.
 - [ ] **Metal GPU for whisper** — transcription uses GPU acceleration on macOS (`f882caef`). verify with Activity Monitor GPU tab.
