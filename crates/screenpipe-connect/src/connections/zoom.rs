@@ -34,12 +34,10 @@ use serde_json::{Map, Value};
 // Add transcript/chat scopes incrementally as features ship.
 static OAUTH: OAuthConfig = OAuthConfig {
     auth_url: "https://zoom.us/oauth/authorize",
-    // TODO: replace with the real Marketplace client_id once the app is
-    // registered. Using a placeholder so the binary builds and the
-    // connection shows up in `connection list` as "not connected" — it
-    // just won't successfully complete the OAuth dance until both this
-    // value and the website-side exchange handler are in place.
-    client_id: "ZOOM_CLIENT_ID_TODO",
+    // Public client ID from the Zoom Marketplace app (User-managed OAuth,
+    // private distribution). Safe to ship in the binary — the secret half
+    // stays on the website (OAUTH_ZOOM_CLIENT_SECRET in Vercel env).
+    client_id: "Nx8XJ_6Qai8ttYUEMHDPg",
     extra_auth_params: &[],
     // Zoom requires HTTPS redirect URIs for OAuth apps; the local
     // callback won't pass app-review. Relay through the website like
