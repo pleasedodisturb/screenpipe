@@ -467,7 +467,7 @@ commits: `b3628788`, `738178da`
 
 ### 15. Windows-specific
 
-commits: `eea0c865`, `fe9060db`, `c99c3967`, `aeaa446b`, `5a219688`, `caae1ebc`, `67caf1d1`, `ff4af7b5`
+commits: `eea0c865`, `fe9060db`, `c99c3967`, `aeaa446b`, `5a219688`, `caae1ebc`, `67caf1d1`, `ff4af7b5`, `a74be160a`
 
 - [ ] **COM thread conflict** — audio and vision threads don't conflict on COM initialization (`eea0c865`).
 - [ ] **high-DPI display (150%, 200%)** — OCR captures at correct resolution.
@@ -475,6 +475,7 @@ commits: `eea0c865`, `fe9060db`, `c99c3967`, `aeaa446b`, `5a219688`, `caae1ebc`,
 - [ ] **Windows Defender** — app not blocked by default security.
 - [ ] **Windows default mode** — On Windows, the app should default to window mode on first launch.
 - [ ] **Windows taskbar icon** — The app should display a taskbar icon on Windows.
+- [ ] **Windows AVX2 CPU support check** — On Windows CPUs without AVX2 (e.g., QEMU qemu64, older cloud VMs), the app shows a clear error dialog instead of crashing silently. Test by booting QEMU with `-cpu qemu64` and verifying the user sees a friendly message. (`a74be160a`)
 - [ ] **Windows audio transcription accuracy** — On Windows, verify improved audio transcription accuracy due to native Silero VAD frame size and lower speech threshold.
 - [ ] **Windows multi-line pipe prompts** — Multi-line pipe prompts should be preserved on Windows.
 - [ ] **Windows ARM64 support** — On a Windows ARM64 device, verify the app installs and runs correctly. (`d62360bc4`)
