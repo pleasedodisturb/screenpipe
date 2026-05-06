@@ -913,7 +913,7 @@ export function PrivacySection() {
                   <span>
                     <span className="font-medium text-foreground">Cloud (enclave)</span>
                     <span className="text-muted-foreground">
-                      {" "}— screenpipe&apos;s confidential-compute enclave. Fast everywhere; data leaves the device but is end-to-end encrypted into the enclave.
+                      {" "}— screenpipe&apos;s confidential-compute enclave. Fast everywhere; your device cryptographically verifies the enclave is running the open-source build before sending anything.
                     </span>
                   </span>
                 </label>
