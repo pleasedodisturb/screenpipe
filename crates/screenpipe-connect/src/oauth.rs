@@ -111,6 +111,13 @@ fn store_key(integration_id: &str, instance: Option<&str>) -> String {
     }
 }
 
+fn connection_manifest_key(integration_id: &str, instance: Option<&str>) -> String {
+    match instance {
+        Some(inst) => format!("{}:{}", integration_id, inst),
+        None => integration_id.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy plaintext file location  (~/.screenpipe/{id}-oauth.json)
 //
@@ -334,6 +341,7 @@ pub async fn write_oauth_token_instance(
     instance: Option<&str>,
     data: &Value,
 ) -> Result<()> {
+    let manifest_key = connection_manifest_key(integration_id, instance);
     let mut stored = data.clone();
     if let Some(expires_in) = data["expires_in"].as_u64() {
         stored["expires_at"] = Value::from(unix_now() + expires_in);
@@ -358,12 +366,21 @@ pub async fn write_oauth_token_instance(
                 path.display(),
             );
         }
+        screenpipe_core::connections::sync::clear_connection_tombstone(
+            &screenpipe_core::paths::default_screenpipe_data_dir(),
+            &manifest_key,
+        );
         return Ok(());
     }
 
     // Fallback: no SecretStore available — `0o600` plaintext file.
     let path = oauth_token_path_instance(integration_id, instance);
-    write_plaintext_0600(&path, &stored)
+    write_plaintext_0600(&path, &stored)?;
+    screenpipe_core::connections::sync::clear_connection_tombstone(
+        &screenpipe_core::paths::default_screenpipe_data_dir(),
+        &manifest_key,
+    );
+    Ok(())
 }
 
 pub async fn delete_oauth_token(integration_id: &str) -> Result<()> {
@@ -375,6 +392,7 @@ pub async fn delete_oauth_token_instance(
     integration_id: &str,
     instance: Option<&str>,
 ) -> Result<()> {
+    let manifest_key = connection_manifest_key(integration_id, instance);
     // Delete from SecretStore if available. Errors are swallowed: the key
     // may legitimately not exist (e.g. fresh install, already deleted), and
     // a store error here must not block removal of any plaintext shadow.
@@ -388,6 +406,10 @@ pub async fn delete_oauth_token_instance(
     // Race-safe: NotFound is not an error.
     let path = oauth_token_path_instance(integration_id, instance);
     remove_plaintext_if_exists(&path)?;
+    screenpipe_core::connections::sync::record_connection_tombstone(
+        &screenpipe_core::paths::default_screenpipe_data_dir(),
+        &manifest_key,
+    );
     Ok(())
 }
 
