@@ -615,14 +615,9 @@ fn build_input_stream(
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 fn cpal_stream_config(
     config: &cpal::SupportedStreamConfig,
-    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] windows_input_aec: bool,
+    #[allow(unused_variables)] windows_input_aec: bool,
 ) -> cpal::StreamConfig {
-    let mut stream_config = config.config();
-    #[cfg(target_os = "windows")]
-    {
-        stream_config.windows_input_aec = windows_input_aec;
-    }
-    stream_config
+    config.config()
 }
 
 impl Drop for AudioStream {
