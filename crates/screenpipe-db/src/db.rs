@@ -3547,6 +3547,18 @@ impl DatabaseManager {
                 audio_transcriptions.start_time,
                 audio_transcriptions.end_time,
                 (
+                    SELECT dr.mode
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_mode,
+                (
                     SELECT ds.provider_speaker_label
                     FROM diarization_segments ds
                     JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
@@ -3748,7 +3760,10 @@ impl DatabaseManager {
                     speaker_provisional,
                     start_time: raw.start_time,
                     end_time: raw.end_time,
-                    source: Some("background".to_string()),
+                    source: Some(
+                        raw.diarization_mode
+                            .unwrap_or_else(|| "background".to_string()),
+                    ),
                     meeting_id: None,
                     provider: None,
                     model: Some(transcription_engine),

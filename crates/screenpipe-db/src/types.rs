@@ -175,6 +175,7 @@ pub struct AudioResultRaw {
     pub speaker_id: Option<i64>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub diarization_mode: Option<String>,
     pub diarization_speaker_label: Option<String>,
     pub diarization_provider: Option<String>,
     pub diarization_source: Option<String>,
