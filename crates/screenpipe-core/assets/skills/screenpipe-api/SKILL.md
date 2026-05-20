@@ -23,7 +23,72 @@ API responses can be large. Always write curl output to a file first (`curl ... 
 
 ---
 
-## 1. Search — `GET /search`
+## 1. Activity Summary — `GET /activity-summary` (default broad-context call)
+
+**Start here for any chat question about "what was I doing?", recent activity, meetings, productivity, or a broad time range.** One bounded call returns activity + recording health + top memories + small screen/audio snippets + an empty-state diagnosis, so you can tell "nothing was recorded" apart from "your query didn't match".
+
+```bash
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/activity-summary?start_time=30m%20ago&end_time=now"
+```
+
+### Parameters
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start_time` | ISO 8601 or relative | **Yes** | `2024-01-15T10:00:00Z` or `16h ago`, `2d ago`, `30m ago` |
+| `end_time` | ISO 8601 or relative | **Yes** | `now`, `1h ago` |
+| `app_name` | string | No | Case-sensitive equality (e.g. `Google Chrome`) |
+| `q` | string | No | Keyword filter for memories + snippets. Drives `query_status`. Leave empty for a broad bundle. |
+| `include_recording` | bool | No | Default **true**. Set `false` to drop the recording health block. |
+| `include_memories` | bool | No | Default **true**. Set `false` to drop memories. |
+| `include_snippets` | bool | No | Default **true**. Set `false` to drop screen/audio snippets. |
+| `include_guidance` | bool | No | Default **true**. Set `false` to drop the next-best-query hint. |
+| `max_snippets` | int | No | Default 8, max 12 |
+| `max_snippet_chars` | int | No | Default 500, clamped 160–1200 |
+| `max_memories` | int | No | Default 5, max 20 |
+
+### Response shape (high-signal fields)
+
+- `apps`, `windows`, `key_texts`, `audio_summary`, `edited_files`, `total_frames`, `time_range` — the core activity bundle. `windows` is usually the most useful: titles, `browser_url`, minutes per tab.
+- `data_status`: `"ok"` | `"empty_but_recording"` | `"no_capture_in_range"` | `"not_recording"`. Check this **before** telling the user there was no activity.
+- `query_status`: `"not_requested"` | `"matched"` | `"no_query_matches"`. Only meaningful when `q` is set.
+- `recording.last_frame_at` / `recording.last_audio_at`: latest timestamps anywhere in the DB. Quote these when the requested range is empty.
+- `memories`: top items by importance, filtered by `q` if set.
+- `snippets`: deduped screen + audio excerpts, capped.
+- `guidance.next_best_query`: ready-to-show hint if the bundle is empty.
+
+### Decision tree
+
+- "What was I doing?" / "summarize my day" → this endpoint only
+- "How long on X?" / "which apps today?" → this endpoint (use `windows[].minutes`, `apps[].minutes`)
+- "Summarize the meeting" → this endpoint first. If you need verbatim transcript → `/search?content_type=audio&start_time=...` with NO `q`.
+- "What button did I click?" → `/elements` with `role=AXButton`
+- "Show me what I saw" → `/search` to find a `frame_id` → `/frames/{id}`
+
+### Slimming the payload
+
+Default ~5–35 KB depending on the range. To shave it down for a specific question:
+
+```bash
+# just app/window time + audio counts, no memories/snippets/health
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \
+  "http://localhost:3030/activity-summary?start_time=1d%20ago&end_time=now&include_memories=false&include_snippets=false&include_recording=false&include_guidance=false"
+```
+
+### Empty-state handling
+
+If `data_status != "ok"`:
+- `"not_recording"` → say recording hasn't started; show `/health` or settings link
+- `"no_capture_in_range"` → quote `recording.last_frame_at` / `last_audio_at` and suggest a range around the latest capture
+- `"empty_but_recording"` → ask to broaden the range or drop filters; do NOT say "nothing happened"
+
+If `query_status == "no_query_matches"` → retry without `q`, then escalate to `/search` only if you need verbatim matches.
+
+---
+
+## 2. Search — `GET /search`
+
+Use when `/activity-summary` says `ok` but you need verbatim quotes, media paths, frame IDs, or a specific content match.
 
 ```bash
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/search?q=QUERY&content_type=all&limit=10&start_time=1h%20ago"
@@ -45,32 +110,13 @@ curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030
 | `focused` | boolean | No | Only focused windows |
 | `max_content_length` | integer | No | Truncate each result's text (middle-truncation) |
 
-### Progressive Disclosure
-
-Don't jump to heavy `/search` calls. Escalate:
-
-| Step | Endpoint | When |
-|------|----------|------|
-| 0 | `GET /memories?q=...` | **Always query first/in parallel** — highest signal, lowest cost |
-| 1 | `GET /activity-summary?start_time=...&end_time=...` | Broad questions ("what was I doing?", "which apps?") |
-| 2 | `GET /search?...` | Need specific content |
-| 3 | `GET /elements?...` or `GET /frames/{id}/context` | UI structure, buttons, links |
-| 4 | `GET /frames/{frame_id}` (PNG) | Visual context needed |
-
-Decision tree:
-- "What was I doing?" → Step 1 only
-- "Summarize my meeting" → Step 2 with `content_type=audio`, NO q param. Add `content_type=all` for screen context.
-- "How long on X?" → Step 1 (`/activity-summary` has `active_minutes`)
-- "Which apps today?" → Step 1 (do NOT use frame counts or SQL)
-- "What button did I click?" → Step 3 (`/elements` with role=AXButton)
-- "Show me what I saw" → Step 2 (find frame_id) → Step 4
-
 ### Critical Rules
 
 1. **ALWAYS include `start_time`** — queries without time bounds WILL timeout
 2. **Use `app_name`** when user mentions a specific app (this is string contains)
 3. **"recent"** = 30 min. **"today"** = since midnight. **"yesterday"** = yesterday's range
-4. If timeout, narrow the time range
+4. If `/search` is empty, fall back to `/activity-summary` and check `data_status` before saying "no data"
+5. If timeout, narrow the time range
 
 ### Response Format
 
@@ -84,22 +130,6 @@ Decision tree:
   "pagination": {"limit": 10, "offset": 0, "total": 42}
 }
 ```
-
----
-
-## 2. Activity Summary — `GET /activity-summary`
-
-```bash
-curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/activity-summary?start_time=1h%20ago&end_time=now"
-```
-
-Returns a rich overview with:
-- **apps**: usage with `active_minutes`, first/last seen
-- **windows**: every distinct window/tab with title, `browser_url`, and time spent — this is the most valuable field, it tells you exactly what the user was working on
-- **key_texts**: one representative text snippet per window context (user input fields prioritized over static page text)
-- **audio_summary.top_transcriptions**: actual transcription text with speaker and timestamp (not just counts)
-
-This is usually enough to answer "what was I doing?" without further searches. Only drill into `/search` if you need verbatim quotes or specific content.
 
 ---
 
