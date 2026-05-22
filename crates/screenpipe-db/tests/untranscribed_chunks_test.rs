@@ -448,12 +448,16 @@ mod tests {
             .iter()
             .map(|row| row.transcript.as_str())
             .collect::<Vec<_>>();
+        // Background rows within ±15s of a live segment are now dropped so the
+        // UI/AI consumer sees one copy of each utterance instead of two. The
+        // "duplicate near live" row sits exactly 15s after the live segment
+        // (on the boundary) and is correctly suppressed; background rows
+        // outside the window (before/after) survive and cover the gaps.
         assert_eq!(
             transcripts,
             vec![
                 "background before live",
                 "live meeting text",
-                "background duplicate near live",
                 "background after live"
             ]
         );
@@ -470,10 +474,12 @@ mod tests {
         assert_eq!(rows[1].speaker_name.as_deref(), Some("Louis"));
 
         assert_eq!(rows[2].source, "background");
-        assert_eq!(rows[2].audio_chunk_id, Some(overlap_chunk));
+        assert_eq!(rows[2].audio_chunk_id, Some(after_chunk));
 
-        assert_eq!(rows[3].source, "background");
-        assert_eq!(rows[3].audio_chunk_id, Some(after_chunk));
+        // The overlap row is dropped by the read endpoint's live-coverage
+        // dedup — keep the local binding referenced so the compiler sees it
+        // and to document why it's NOT in `rows`.
+        let _suppressed_by_live_coverage = overlap_chunk;
     }
 
     #[tokio::test]
