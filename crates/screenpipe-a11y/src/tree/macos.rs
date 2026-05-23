@@ -521,7 +521,6 @@ struct WalkState {
     max_depth: usize,
     max_nodes: usize,
     walk_timeout: std::time::Duration,
-    element_timeout_secs: f32,
     start: Instant,
     truncated: bool,
     truncation_reason: super::TruncationReason,
@@ -570,7 +569,6 @@ impl WalkState {
             max_depth: config.max_depth,
             max_nodes: config.effective_max_nodes(),
             walk_timeout: config.effective_walk_timeout(),
-            element_timeout_secs: config.element_timeout_secs,
             start,
             truncated: false,
             truncation_reason: super::TruncationReason::None,
@@ -691,8 +689,10 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
         std::thread::yield_now();
     }
 
-    // Set a per-element timeout to prevent IPC hangs
-    let _ = elem.set_messaging_timeout_secs(state.element_timeout_secs);
+    // Per-element timeout is unnecessary: AXUIElementSetMessagingTimeout
+    // (called once on the app root at walk start) is inherited by every
+    // child UIElement returned via the messaging protocol. Removing the
+    // per-element call eliminates ~node_count AX IPC roundtrips per walk.
 
     // Get the role
     let role_str = match elem.role() {
@@ -772,19 +772,27 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
 }
 
 /// Extract text attributes from an element, append to the buffer, and collect a structured node.
+///
+/// Bounds (AXPosition + AXSize, 2 AX IPC calls) are fetched lazily only after
+/// text is confirmed — for elements with no text the 2 IPCs are skipped
+/// entirely. See is_on_screen() (issue #2436) for why we keep the raw frame.
 fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut WalkState) {
-    // Read element bounds once (used for all text extraction paths). The
-    // raw screen-absolute frame is also passed to is_on_screen() so we
-    // know whether the captured screenshot actually shows this element —
-    // see issue #2436 for the search-hits-off-screen-text bug this fixes.
-    let frame = get_element_frame(elem);
-    let bounds = frame.and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
-    let on_screen = frame.and_then(|(x, y, w, h)| is_on_screen(x, y, w, h, state));
+    let mut frame_cache: Option<Option<(f64, f64, f64, f64)>> = None;
+    let mut resolve_bounds =
+        |elem: &ax::UiElement,
+         state: &WalkState|
+         -> (Option<super::NodeBounds>, Option<bool>) {
+            let frame = *frame_cache.get_or_insert_with(|| get_element_frame(elem));
+            let bounds = frame.and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
+            let on_screen = frame.and_then(|(x, y, w, h)| is_on_screen(x, y, w, h, state));
+            (bounds, on_screen)
+        };
 
     // For text fields / text areas, prefer value (the actual content)
     if role_str == "AXTextField" || role_str == "AXTextArea" || role_str == "AXComboBox" {
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
+                let (bounds, on_screen) = resolve_bounds(elem, state);
                 append_text(&mut state.text_buffer, &val);
                 let trimmed = val.trim().to_string();
                 let mut node = AccessibilityTreeNode::new(
@@ -811,6 +819,7 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     if role_str == "AXStaticText" {
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
+                let (bounds, on_screen) = resolve_bounds(elem, state);
                 append_text(&mut state.text_buffer, &val);
                 let trimmed = val.trim().to_string();
                 let mut node = AccessibilityTreeNode::new(
@@ -831,6 +840,7 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     // Fall back to title
     if let Some(title) = get_string_attr(elem, ax::attr::title()) {
         if !title.is_empty() {
+            let (bounds, on_screen) = resolve_bounds(elem, state);
             append_text(&mut state.text_buffer, &title);
             let mut node = AccessibilityTreeNode::new(
                 role_str.to_string(),
@@ -848,6 +858,7 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     // Fall back to description
     if let Some(desc) = get_string_attr(elem, ax::attr::desc()) {
         if !desc.is_empty() {
+            let (bounds, on_screen) = resolve_bounds(elem, state);
             append_text(&mut state.text_buffer, &desc);
             let mut node = AccessibilityTreeNode::new(
                 role_str.to_string(),

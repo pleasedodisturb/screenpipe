@@ -155,7 +155,10 @@ impl Default for UiRecorderConfig {
             enable_tree_walker: true,
             tree_walk_interval_ms: 3000,
             record_input_events: true,
-            prioritize_input_latency: false,
+            // Default ON so the BelowNormal QoS + pause-on-input gate are
+            // actually honored — otherwise the AX walker can run while the
+            // user is typing/clicking, which is exactly when CPU lag is felt.
+            prioritize_input_latency: true,
             extraction_thread_priority: ExtractionThreadPriority::BelowNormal,
             pause_extraction_on_input_ms: 150,
         }

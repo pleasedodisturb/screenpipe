@@ -453,7 +453,13 @@ impl Default for TreeWalkerConfig {
     fn default() -> Self {
         Self {
             walk_interval: Duration::from_secs(3),
-            max_depth: 35,
+            // Lowered 35 -> 28 after the AXWebArea depth-reset
+            // (crates/screenpipe-a11y/src/tree/macos.rs walk_element) made the
+            // pre-#3547 absolute-depth headroom redundant for Electron apps —
+            // 25 levels of webarea-relative budget still catches the VS Code
+            // terminal (which sits at relative depth 25) with 3 levels of
+            // headroom. Trims walker work on deep native AX trees.
+            max_depth: 28,
             max_nodes: 5000,
             walk_timeout: Duration::from_millis(250),
             max_text_length: 50_000,
@@ -467,7 +473,11 @@ impl Default for TreeWalkerConfig {
             ignore_incognito_windows: true,
             max_nodes_override: None,
             walk_timeout_override: None,
-            enable_line_bounds: true,
+            // Disabled by default — per-line geometry capture fires
+            // parameterized AX calls on every multi-line AXTextArea /
+            // AXStaticText. Only opt in when consumers actively need
+            // line-level highlighting on screenshots.
+            enable_line_bounds: false,
             line_bounds_max_calls_per_node: 30,
             line_bounds_max_calls_per_frame: 300,
             line_bounds_time_budget: Duration::from_millis(400),
@@ -583,7 +593,7 @@ mod tests {
     fn test_default_config() {
         let config = TreeWalkerConfig::default();
         assert_eq!(config.walk_interval, Duration::from_secs(3));
-        assert_eq!(config.max_depth, 35);
+        assert_eq!(config.max_depth, 28);
         assert_eq!(config.max_nodes, 5000);
         assert_eq!(config.walk_timeout, Duration::from_millis(250));
         assert_eq!(config.max_text_length, 50_000);

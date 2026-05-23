@@ -26,7 +26,10 @@ const BACKFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const BACKFILL_MAX_CHUNKS_PER_PASS: usize = 12;
 const RECONCILIATION_LOOKBACK_HOURS: i64 = 24 * 7;
 const RECONCILIATION_FRESHNESS_DELAY_SECS: i64 = 10 * 60;
-const RECONCILIATION_CHUNKS_PER_SWEEP: i64 = 50;
+// Dropped from 50 -> 15 to flatten the 80%+ CPU spikes observed every 120s
+// in 10-min sample profiles. With the 120s scheduler this still clears
+// ~450 chunks/hour — far above the typical capture rate per device.
+const RECONCILIATION_CHUNKS_PER_SWEEP: i64 = 15;
 
 use crate::core::engine::AudioTranscriptionEngine;
 use crate::metrics::AudioPipelineMetrics;
@@ -167,8 +170,9 @@ pub async fn reconcile_untranscribed(
     let now = chrono::Utc::now();
     let since = now - chrono::Duration::hours(RECONCILIATION_LOOKBACK_HOURS);
     let older_than = now - chrono::Duration::seconds(RECONCILIATION_FRESHNESS_DELAY_SECS);
-    // Limit to 50 chunks per sweep to avoid prolonged CPU spikes.
-    // With 120s between sweeps this still clears ~1500 chunks/hour.
+    // Bounded per-sweep batch to avoid prolonged CPU spikes.
+    // With 120s between sweeps this still clears
+    // RECONCILIATION_CHUNKS_PER_SWEEP * 30 chunks/hour.
     let chunks = match db
         .get_reconciliation_candidate_chunks(since, older_than, RECONCILIATION_CHUNKS_PER_SWEEP)
         .await

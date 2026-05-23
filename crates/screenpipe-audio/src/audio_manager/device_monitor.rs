@@ -349,8 +349,16 @@ pub async fn start_device_monitor(
         // (output)" names to "System Audio (output)" (macOS only).
         let mut legacy_migrated = false;
 
+        // Active poll cadence. The loop body short-circuits when audio is not
+        // Running, so we stretch the sleep in that state to avoid burning CPU
+        // polling a paused subsystem. Failure-retry paths keep their own
+        // backoff and aren't affected.
+        const POLL_INTERVAL_ACTIVE: Duration = Duration::from_secs(2);
+        const POLL_INTERVAL_IDLE: Duration = Duration::from_secs(10);
+
         loop {
-            if audio_manager.status().await == AudioManagerStatus::Running {
+            let manager_running = audio_manager.status().await == AudioManagerStatus::Running;
+            if manager_running {
                 // Check if sleep/wake or display reconfiguration requested
                 // audio stream invalidation. Force-cycle all running devices
                 // to recover from silent CoreAudio stream failures.
@@ -1165,7 +1173,12 @@ pub async fn start_device_monitor(
                 )
                 .await;
             }
-            sleep(Duration::from_secs(2)).await;
+            let interval = if manager_running {
+                POLL_INTERVAL_ACTIVE
+            } else {
+                POLL_INTERVAL_IDLE
+            };
+            sleep(interval).await;
         }
     }));
     Ok(())
