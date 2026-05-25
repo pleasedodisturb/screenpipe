@@ -197,11 +197,15 @@ function PipeRow({
   const showGmailBadge = gmailConnected && pipe.gmailBoost;
   return (
     <motion.button
+      type="button"
+      role="checkbox"
+      aria-checked={selected}
+      aria-label={`${pipe.title}: ${pipe.subtitle}`}
       initial={{ opacity: 0, y: 8 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay, duration: 0.35 }}
       onClick={() => onToggle(pipe.slug)}
-      className={`w-full text-left border p-3 transition-all duration-150 ${
+      className={`w-full text-left border p-3 transition-all duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-foreground ${
         selected
           ? "border-foreground/40 bg-foreground/[0.03]"
           : "border-foreground/10 hover:border-foreground/30"
@@ -273,6 +277,15 @@ export default function PickPipe() {
       .catch(() => {});
   }, []);
 
+  // Expand the onboarding window when customize opens so the 4 optional
+  // pipes don't push the install button below the fold. The parent route
+  // sets pipe step to 500x620 (fits 4 default pipes); customize adds 4
+  // more rows (~58px each = ~232px).
+  useEffect(() => {
+    const height = customizeOpen ? 860 : 620;
+    commands.setWindowSize("Onboarding", 500, height).catch(() => {});
+  }, [customizeOpen]);
+
   const toggle = useCallback((slug: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -292,6 +305,8 @@ export default function PickPipe() {
 
   const handleInstall = useCallback(async () => {
     if (selected.size === 0) return;
+    if (isCompletingRef.current) return;
+    isCompletingRef.current = true;
     setPhase("enabling");
     setError(null);
 
@@ -333,6 +348,9 @@ export default function PickPipe() {
       console.error("failed to enable pipes:", msg);
       setError("Couldn't install all pipes — try again or skip");
       setPhase("choose");
+      // Release guard on failure so retry works; success path keeps it set
+      // because onboarding completion will close the window.
+      isCompletingRef.current = false;
     }
   }, [selected, customized, completeOnboarding]);
 
