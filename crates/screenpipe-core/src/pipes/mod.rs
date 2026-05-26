@@ -3185,8 +3185,11 @@ impl PipeManager {
 
             // Sequential execution: only one scheduled pipe runs at a time to
             // avoid rate-limit stampedes when many pipes share the same cron.
-            // Event-triggered pipes bypass the queue for low-latency response.
+            // Event-triggered pipes use a separate, bounded semaphore — they
+            // still get low latency (cap > 1) but a single event with many
+            // subscribers no longer fans out unbounded onto the LLM gateway.
             let execution_semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            let event_semaphore = Arc::new(tokio::sync::Semaphore::new(4));
             // Track pipes that are queued (waiting for semaphore) or running,
             // so the scheduler doesn't double-queue the same pipe.
             let queued_or_running: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
@@ -3562,21 +3565,26 @@ impl PipeManager {
                     let token_registry_ref = token_registry.clone();
                     let pipe_timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS);
                     let semaphore = execution_semaphore.clone();
+                    let event_sem = event_semaphore.clone();
                     let pipes_dir_for_mark = pipes_dir.clone();
                     let queued_ref = queued_or_running.clone();
 
                     tokio::spawn(async move {
-                        // Event-triggered pipes skip the queue for low-latency response.
-                        // Scheduled pipes wait for the previous one to finish.
-                        let _permit = if !is_event_triggered {
-                            Some(
-                                semaphore
-                                    .acquire()
-                                    .await
-                                    .expect("execution semaphore closed"),
-                            )
+                        // Scheduled pipes serialize through `semaphore` (cap 1);
+                        // event-triggered pipes share `event_sem` (cap 4) so a
+                        // single event with many subscribers can't stampede the
+                        // gateway, while still allowing some parallelism for
+                        // low-latency response.
+                        let _permit = if is_event_triggered {
+                            event_sem
+                                .acquire()
+                                .await
+                                .expect("event semaphore closed")
                         } else {
-                            None
+                            semaphore
+                                .acquire()
+                                .await
+                                .expect("execution semaphore closed")
                         };
 
                         // Mark running + write PID file only after acquiring the permit,

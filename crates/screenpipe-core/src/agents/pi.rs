@@ -9,9 +9,11 @@
 
 use super::{AgentExecutor, AgentOutput, ExecutionHandle};
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -20,6 +22,18 @@ const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
 const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Single-flight cache for the gateway model catalog. Every `ensure_pi_config`
+/// call hits `/v1/models`, and on cold boot 5+ pipes can race that fetch in
+/// under a second — which on anonymous tier (15 req/min) burns the entire
+/// budget before the user finishes onboarding. The Mutex serializes
+/// concurrent callers; the TTL keeps the result warm across back-to-back
+/// pipe starts. Only successful fetches are cached, so a transient 429
+/// doesn't poison subsequent calls.
+static MODEL_CACHE: Lazy<tokio::sync::Mutex<Option<(Instant, serde_json::Value)>>> =
+    Lazy::new(|| tokio::sync::Mutex::new(None));
+
 /// Fetch the model catalog from the Cloudflare Worker gateway and convert
 /// it into the format Pi's `models.json` expects.
 ///
@@ -27,8 +41,17 @@ pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 /// (offline, timeout, gateway down) we fall back to a minimal hardcoded list
 /// so the app still works without network.
 pub async fn screenpipe_cloud_models(api_url: &str, token: Option<&str>) -> serde_json::Value {
+    let mut cache = MODEL_CACHE.lock().await;
+    if let Some((cached_at, cached)) = cache.as_ref() {
+        if cached_at.elapsed() < MODEL_CACHE_TTL {
+            return cached.clone();
+        }
+    }
     match fetch_models_from_gateway(api_url, token).await {
-        Some(models) => models,
+        Some(models) => {
+            *cache = Some((Instant::now(), models.clone()));
+            models
+        }
         None => {
             warn!("failed to fetch models from gateway, using fallback list");
             fallback_cloud_models()

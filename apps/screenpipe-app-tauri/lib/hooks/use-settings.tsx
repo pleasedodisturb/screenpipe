@@ -1122,61 +1122,70 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	};
 
 	const loadUser = async (token: string) => {
+		// Distinguish network-level fetch failures (sleep, DNS, TLS, abort)
+		// from real HTTP errors. The onboarding poller and auth-guard both
+		// retry on network failures; only 401/403 should signal session
+		// expiry. Logging every transient blip as ERROR floods the engine
+		// log when the laptop sleeps or the network flaps.
+		let response: Response;
 		try {
-			const response = await fetch(`https://screenpi.pe/api/user`, {
+			response = await fetch(`https://screenpi.pe/api/user`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({ token }),
 			});
-
-			if (!response.ok) {
-				const body = await response.text().catch(() => "<no body>");
-				throw new Error(`failed to verify token: ${response.status} ${response.statusText} - ${body}`);
-			}
-
-			const data = await response.json();
-			const userData = {
-				...data.user,
-				token
-			} as User;
-
-			// if user was not logged in, send posthog event and bridge identity
-			if (!settings.user?.id) {
-				posthog.capture("app_login", {
-					email: userData.email,
-				});
-				// Bridge app identity → website identity via email alias
-				// This merges the anonymous app profile with any website profile
-				// that used the same email during checkout
-				if (userData.email) {
-					posthog.alias(userData.email);
-					posthog.people?.set({
-						email: userData.email,
-						app_user_id: userData.id,
-						login_source: "app",
-					});
-				}
-			}
-
-			await updateSettings({ user: userData });
-
-			// Push the fresh token into the running sidecar so the
-			// `Server.cloud_token` (used by /v1/chat/completions proxy) and
-			// the `PiExecutor.user_token` (used by pi-agent's models.json
-			// apiKey) both pick up the new value on the next pipe run.
-			// Without this, sign-in only updates the webview's settings —
-			// the engine keeps whatever token it captured at boot (often
-			// `null`), and every Sonnet/Opus pipe 403s on tier=anonymous.
-			try {
-				await invoke("set_cloud_token", { token });
-			} catch (e) {
-				console.warn("failed to push cloud token to sidecar:", e);
-			}
 		} catch (err) {
-			console.error("failed to load user:", err instanceof Error ? err.message : err);
+			const msg = err instanceof Error ? err.message : String(err);
+			console.warn("loadUser: network error, will retry:", msg);
 			throw err;
+		}
+
+		if (!response.ok) {
+			const body = await response.text().catch(() => "<no body>");
+			const msg = `failed to verify token: ${response.status} ${response.statusText} - ${body}`;
+			console.error("failed to load user:", msg);
+			throw new Error(msg);
+		}
+
+		const data = await response.json();
+		const userData = {
+			...data.user,
+			token
+		} as User;
+
+		// if user was not logged in, send posthog event and bridge identity
+		if (!settings.user?.id) {
+			posthog.capture("app_login", {
+				email: userData.email,
+			});
+			// Bridge app identity → website identity via email alias
+			// This merges the anonymous app profile with any website profile
+			// that used the same email during checkout
+			if (userData.email) {
+				posthog.alias(userData.email);
+				posthog.people?.set({
+					email: userData.email,
+					app_user_id: userData.id,
+					login_source: "app",
+				});
+			}
+		}
+
+		await updateSettings({ user: userData });
+
+		// Push the fresh token into the running sidecar so the
+		// `Server.cloud_token` (used by /v1/chat/completions proxy) and
+		// the `PiExecutor.user_token` (used by pi-agent's models.json
+		// apiKey) both pick up the new value on the next pipe run.
+		// Without this, sign-in only updates the webview's settings —
+		// the engine keeps whatever token it captured at boot (often
+		// `null`), and every Sonnet/Opus pipe 403s on tier=anonymous.
+		try {
+			await invoke("set_cloud_token", { token });
+		} catch (e) {
+			console.warn("failed to push cloud token to sidecar:", e);
 		}
 	};
 
