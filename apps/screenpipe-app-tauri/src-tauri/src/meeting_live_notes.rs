@@ -441,18 +441,24 @@ fn hd_recording_default(app: &AppHandle) -> String {
         .to_string()
 }
 
-/// Build the "+ HD" notification action for a known `meeting_id`. Returns
-/// `None` when the user's preference suppresses it.
+/// Build the "+ HD" notification action. Returns `None` when the user's
+/// preference suppresses it.
+///
+/// When `meeting_id` is known (the started notification), starts a
+/// meeting-bound session that auto-stops on `meeting_ended`.
+///
+/// When unknown (the prewarm notification fires *before* the meeting is
+/// in the DB), starts a `prewarm_pending` session. The engine's
+/// `meeting_started` subscriber then upgrades it to meeting-bound on the
+/// next event, preserving `started_at` so the user gets HD coverage for
+/// the whole call — not the previous 1-hour timer that clipped long calls.
 fn build_hd_action(app: &AppHandle, meeting_id: Option<i64>) -> Option<serde_json::Value> {
     if hd_recording_default(app) != "ask" {
         return None;
     }
-    // `boundTo: "meeting"` requires a meeting_id. If we don't have one
-    // (prewarm before the meeting is in the DB), fall back to a 1-hour
-    // timer-bound session — bounded means safe.
     let body = match meeting_id {
         Some(id) => json!({ "boundTo": "meeting", "meetingId": id }),
-        None => json!({ "boundTo": "timer", "durationSecs": 3600 }),
+        None => json!({ "boundTo": "prewarm_pending" }),
     };
     Some(json!({
         "id": "record-hd",

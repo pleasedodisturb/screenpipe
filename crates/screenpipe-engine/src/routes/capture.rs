@@ -72,9 +72,18 @@ impl From<HighFpsSnapshot> for HighFpsState {
 #[serde(rename_all = "camelCase")]
 pub struct StartSessionRequest {
     /// `"meeting"` requires `meeting_id`; `"timer"` requires `duration_secs`.
+    /// `"prewarm_pending"` takes no args — the next `meeting_started` event
+    /// will upgrade it to a meeting-bound session.
     pub bound_to: String,
     pub meeting_id: Option<i64>,
     pub duration_secs: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtendSessionRequest {
+    /// Seconds to push `expires_at` forward by. Clamped server-side.
+    pub additional_secs: u64,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -132,14 +141,27 @@ pub async fn start_hd(
                 .ok_or_else(|| bad_request("durationSecs required when boundTo=timer"))?;
             controller.start_timer_session(Duration::from_secs(secs))
         }
+        "prewarm_pending" => controller.start_prewarm_pending_session(),
         other => {
             return Err(bad_request(&format!(
-                "unknown boundTo value: {:?} (expected \"meeting\" or \"timer\")",
+                "unknown boundTo value: {:?} (expected \"meeting\" | \"timer\" | \"prewarm_pending\")",
                 other
             )));
         }
     };
     Ok(JsonResponse(snap.into()))
+}
+
+pub async fn extend_hd(
+    State(state): State<Arc<AppState>>,
+    JsonResponse(body): JsonResponse<ExtendSessionRequest>,
+) -> Result<JsonResponse<HighFpsState>, (StatusCode, JsonResponse<Value>)> {
+    let controller = require_controller(&state)?;
+    Ok(JsonResponse(
+        controller
+            .extend_session(Duration::from_secs(body.additional_secs))
+            .into(),
+    ))
 }
 
 pub async fn stop_hd(

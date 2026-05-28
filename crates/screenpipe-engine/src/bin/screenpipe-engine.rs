@@ -949,7 +949,8 @@ async fn main() -> anyhow::Result<()> {
         let controller = high_fps_controller.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut sub = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
             while let Some(event) = sub.next().await {
                 let meeting_id = event
                     .data
@@ -963,15 +964,35 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // When `default_mode = Always`, auto-start a meeting-bound session on
-    // every `meeting_started` event. Ask mode is handled by the desktop
-    // shell (it adds a "+ HD" action to the existing notification).
+    // On every `meeting_started`:
+    //   1. Always upgrade any active PrewarmPending session to Meeting{id}
+    //      so the user gets full call coverage instead of the 1hr clip.
+    //      Safe regardless of default_mode — only PrewarmPending sessions
+    //      are upgraded; explicit timers and existing meeting bindings
+    //      are left alone.
+    //   2. If default_mode = Always AND no session is pending an upgrade,
+    //      auto-start a meeting-bound session.
+    //   Ask mode is handled by the desktop shell (it adds a "+ HD" action
+    //   to the existing notification).
     {
         let controller = high_fps_controller.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
-            let mut sub = screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
             while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                let Some(id) = meeting_id else { continue };
+
+                // Step 1: prewarm-pending upgrade is universal.
+                controller.try_upgrade_pending_to_meeting(id);
+
+                // Step 2: auto-start only for Always mode AND only if the
+                // upgrade above didn't already bind a session.
                 let snap = controller.snapshot();
                 if !matches!(
                     snap.default_mode,
@@ -979,12 +1000,11 @@ async fn main() -> anyhow::Result<()> {
                 ) {
                     continue;
                 }
-                let meeting_id = event
-                    .data
-                    .get("meeting_id")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
-                if let Some(id) = meeting_id {
+                let already_bound = matches!(
+                    snap.kind,
+                    Some(screenpipe_engine::high_fps_controller::SessionKind::Meeting { .. })
+                );
+                if !already_bound {
                     controller.start_meeting_session(id);
                 }
             }

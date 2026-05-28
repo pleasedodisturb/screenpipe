@@ -724,14 +724,25 @@ fn create_dynamic_menu(
         if hd.active {
             // Format remaining time succinctly: 1h 23m / 47m / 12s.
             let remaining = format_remaining_secs(hd.remaining_secs);
-            let why = if hd.session_kind == "meeting" {
-                "until call ends"
-            } else {
-                "left"
+            let why = match hd.session_kind.as_str() {
+                "meeting" => "until call ends",
+                "prewarm_pending" => "awaiting call",
+                _ => "left",
             };
-            let label = format!("Stop HD recording ({}, {} {})", fps_label.trim_start_matches(" — "), remaining, why);
+            let label = format!(
+                "Stop HD recording ({}, {} {})",
+                fps_label.trim_start_matches(" — "),
+                remaining,
+                why,
+            );
             menu_builder = menu_builder.item(
                 &MenuItemBuilder::with_id("stop_hd_recording", label).build(app)?,
+            );
+            // "Just realized I want to keep recording" path. +30 min is
+            // the most common "one more demo / one more topic" extension;
+            // bigger bumps go via the API or restart timer from scratch.
+            menu_builder = menu_builder.item(
+                &MenuItemBuilder::with_id("extend_hd_30", "Extend HD by +30 min").build(app)?,
             );
         } else {
             // Idle: offer timer-bound sessions only. The meeting-bound path
@@ -972,6 +983,34 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                     .await
                 {
                     error!("stop_hd POST failed: {} — rolling back optimistic cache", e);
+                    set_high_fps_status(cached);
+                }
+            });
+        }
+        "extend_hd_30" => {
+            let cached = get_high_fps_status();
+            // Optimistic local update: bump the cached remaining so the
+            // next menu open shows the new value without waiting for the
+            // 1-sec poll.
+            set_high_fps_status(HighFpsCacheEntry {
+                remaining_secs: cached.remaining_secs + 30 * 60,
+                ..cached.clone()
+            });
+            let api = local_api_context_from_app(&app_handle);
+            let body = serde_json::json!({ "additionalSecs": 30 * 60 });
+            tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::new();
+                if let Err(e) = api
+                    .apply_auth(client.post(api.url("/capture/hd/extend")))
+                    .header("Content-Type", "application/json")
+                    .body(body.to_string())
+                    .send()
+                    .await
+                {
+                    error!(
+                        "extend_hd POST failed: {} — rolling back optimistic cache",
+                        e
+                    );
                     set_high_fps_status(cached);
                 }
             });

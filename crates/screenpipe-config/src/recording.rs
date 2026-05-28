@@ -206,7 +206,10 @@ pub struct RecordingSettings {
     ///
     /// Runtime-mutable via `POST /capture/hd/settings`; this field
     /// just seeds the controller on startup.
-    #[serde(rename = "hdRecordingDefault", default = "default_hd_recording_default")]
+    #[serde(
+        rename = "hdRecordingDefault",
+        default = "default_hd_recording_default"
+    )]
     pub hd_recording_default: String,
 
     /// Capture debounce (ms) installed while an HD session is active.

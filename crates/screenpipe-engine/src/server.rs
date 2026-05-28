@@ -713,14 +713,26 @@ impl SCServer {
             // Vision/audio pipeline metrics (not in OpenAPI spec — external types)
             .route("/vision/metrics", get(vision_metrics_handler))
             .route("/audio/metrics", get(audio_metrics_handler))
-            // HD recording — bound sessions (meeting or timer), no indefinite mode.
+            // HD recording — bound sessions (meeting / timer / prewarm-pending),
+            // no indefinite mode. Every session has a natural end condition.
             // GET    /capture/hd            → current snapshot
-            // POST   /capture/hd/start      → { boundTo: "meeting"|"timer", meetingId?, durationSecs? }
+            // POST   /capture/hd/start      → { boundTo: "meeting"|"timer"|"prewarm_pending", meetingId?, durationSecs? }
             // POST   /capture/hd/stop       → clear active session
+            // POST   /capture/hd/extend     → { additionalSecs } push expires_at back
             // POST   /capture/hd/settings   → { defaultMode?, intervalMs? }
             .route("/capture/hd", get(crate::routes::capture::get_hd))
-            .route("/capture/hd/start", axum::routing::post(crate::routes::capture::start_hd))
-            .route("/capture/hd/stop", axum::routing::post(crate::routes::capture::stop_hd))
+            .route(
+                "/capture/hd/start",
+                axum::routing::post(crate::routes::capture::start_hd),
+            )
+            .route(
+                "/capture/hd/stop",
+                axum::routing::post(crate::routes::capture::stop_hd),
+            )
+            .route(
+                "/capture/hd/extend",
+                axum::routing::post(crate::routes::capture::extend_hd),
+            )
             .route(
                 "/capture/hd/settings",
                 axum::routing::post(crate::routes::capture::update_hd_settings),
