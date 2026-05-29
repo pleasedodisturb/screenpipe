@@ -1134,8 +1134,5 @@ pub(crate) async fn serve_file(path: &str) -> Result<Response, (StatusCode, Json
     }
 }
 
-/// FrameContent imported from content module for use in video export
-pub use super::content::FrameContent;
-
-/// extract_high_quality_frame re-export for video export
+/// extract_high_quality_frame re-export
 pub use crate::video_utils::extract_high_quality_frame as extract_hq_frame;

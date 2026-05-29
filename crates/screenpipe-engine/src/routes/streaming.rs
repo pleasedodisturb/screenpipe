@@ -6,11 +6,10 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 
 use chrono::{DateTime, Utc};
