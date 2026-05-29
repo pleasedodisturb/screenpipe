@@ -22,7 +22,7 @@ use crate::{
             stop_audio, stop_audio_device,
         },
         content::{
-            add_tags, add_to_database, execute_raw_sql, get_tags_batch, merge_frames_handler,
+            add_tags, execute_raw_sql, get_tags_batch, merge_frames_handler,
             remove_tags, validate_media_handler,
         },
         data::{
@@ -625,7 +625,6 @@ impl SCServer {
             .get("/frames/next-valid", get_next_valid_frame)
             .get("/health", health_check)
             .post("/raw_sql", execute_raw_sql)
-            .post("/add", add_to_database)
             .get("/speakers/unnamed", get_unnamed_speakers_handler)
             .post("/speakers/update", update_speaker_handler)
             .get("/speakers/search", search_speakers_handler)
