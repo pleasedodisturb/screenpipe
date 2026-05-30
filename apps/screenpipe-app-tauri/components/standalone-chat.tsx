@@ -42,6 +42,14 @@ import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { save as saveDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readFile } from "@tauri-apps/plugin-fs";
+import {
+  extractDocument,
+  docsToPromptText,
+  isSupportedDocExt,
+  extFromName,
+  DOC_PICKER_EXTENSIONS,
+  type ExtractedDoc,
+} from "@/lib/pi/extract-document";
 import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
 import { useChatConversations } from "@/components/hooks/use-chat-conversations";
@@ -3286,6 +3294,10 @@ export function StandaloneChat({
   const [prefillFrameId, setPrefillFrameId] = useState<number | null>(null);
   const [isPreparingPrefill, setIsPreparingPrefill] = useState(false);
   const [pastedImages, setPastedImages] = useState<string[]>([]); // Base64 data URLs
+  const [attachedDocs, setAttachedDocs] = useState<ExtractedDoc[]>([]); // extracted text from non-image files
+  // ref mirror so send paths read the latest docs without widening their deps arrays
+  const attachedDocsRef = useRef<ExtractedDoc[]>([]);
+  useEffect(() => { attachedDocsRef.current = attachedDocs; }, [attachedDocs]);
   const [imageViewer, setImageViewer] = useState<{ images: string[]; index: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const steerShortcutInFlightRef = useRef(false);
@@ -3592,23 +3604,53 @@ export function StandaloneChat({
     }
   }, [resizeImage]);
 
-  // Handle file picker
+  // Read a non-image file by path, extract its text, and append to attachedDocs
+  const loadDocFromPath = useCallback(async (filePath: string) => {
+    const name = filePath.split(/[\\/]/).pop() || filePath;
+    const ext = extFromName(name);
+    if (!isSupportedDocExt(ext)) {
+      toast({ title: "unsupported file", description: `can't read .${ext || "?"} files`, variant: "destructive" });
+      return;
+    }
+    try {
+      const bytes = await readFile(filePath);
+      const doc = await extractDocument(name, bytes);
+      if (!doc.text.trim()) {
+        toast({ title: "no text found", description: `${name} looks empty or has no extractable text`, variant: "destructive" });
+        return;
+      }
+      setAttachedDocs((prev) => [...prev, doc]);
+    } catch (err) {
+      console.error("failed to read attached doc:", err);
+      toast({ title: "couldn't read file", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    }
+  }, []);
+
+  // Handle file picker — images and documents
   const handleFilePicker = useCallback(async () => {
+    const imageExtensions = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
     try {
       const selected = await openFileDialog({
-        multiple: false,
-        filters: [{
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"],
-        }],
+        multiple: true,
+        filters: [
+          { name: "Attachments", extensions: [...imageExtensions, ...DOC_PICKER_EXTENSIONS] },
+          { name: "Images", extensions: imageExtensions },
+          { name: "Documents", extensions: [...DOC_PICKER_EXTENSIONS] },
+        ],
       });
-      if (selected) {
-        await loadImageFromPath(selected);
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      for (const path of paths) {
+        if (imageExtensions.includes(extFromName(path))) {
+          await loadImageFromPath(path);
+        } else {
+          await loadDocFromPath(path);
+        }
       }
     } catch (err) {
       console.error("file picker error:", err);
     }
-  }, [loadImageFromPath]);
+  }, [loadImageFromPath, loadDocFromPath]);
 
   // Drag-drop only works in the embedded (non-overlay) chat. The overlay is an
   // NSPanel with NonActivatingPanel style which doesn't receive drag events.
@@ -3623,7 +3665,14 @@ export function StandaloneChat({
         setIsDragging(false);
         const paths = event.payload.paths;
         if (paths && paths.length > 0) {
-          loadImageFromPath(paths[0]);
+          const imageExtensions = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+          for (const path of paths) {
+            if (imageExtensions.includes(extFromName(path))) {
+              loadImageFromPath(path);
+            } else {
+              loadDocFromPath(path);
+            }
+          }
         }
       } else if (event.payload.type === "leave") {
         setIsDragging(false);
@@ -3633,7 +3682,7 @@ export function StandaloneChat({
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [isEmbedded, loadImageFromPath]);
+  }, [isEmbedded, loadImageFromPath, loadDocFromPath]);
 
   // Handle paste events to capture images
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -4481,7 +4530,7 @@ export function StandaloneChat({
     // to native steering so the correction applies to the current answer.
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
-      if (input.trim() || pastedImages.length > 0) {
+      if (input.trim() || pastedImages.length > 0 || attachedDocsRef.current.length > 0) {
         sendMessage(input.trim());
       }
       return;
@@ -6957,19 +7006,33 @@ export function StandaloneChat({
   async function sendMessage(userMessage: string, displayLabel?: string) {
     if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
     const trimmed = userMessage.trim();
-    if (!trimmed && pastedImages.length === 0) return;
+    const queuedDocs = attachedDocsRef.current;
+    if (!trimmed && pastedImages.length === 0 && queuedDocs.length === 0) return;
+
+    // Fold any attached documents into the outgoing turn. The extracted text
+    // rides in `content` (what's sent to the model, kept for history/retries)
+    // while `displayContent` stays the clean user text — so the bubble shows
+    // the prompt, expandable to reveal the attached file text.
+    let outgoingMessage = trimmed;
+    let outgoingDisplay = displayLabel;
+    if (queuedDocs.length > 0) {
+      const docText = docsToPromptText(queuedDocs);
+      outgoingMessage = [trimmed, docText].filter(Boolean).join("\n\n");
+      outgoingDisplay = displayLabel ?? (trimmed || `📎 ${queuedDocs.map((d) => d.name).join(", ")}`);
+      setAttachedDocs([]);
+    }
 
     // Guard the tiny gap between submit and React's loading state update.
     // During this window, rapid Enter presses must queue (not start a second
     // normal turn), otherwise user bubbles can drift.
     if (forceQueueModeRef.current || sendDispatchInFlightRef.current || piMessageIdRef.current || isLoading || isStreaming) {
-      return enqueuePiMessage(trimmed, displayLabel);
+      return enqueuePiMessage(outgoingMessage, outgoingDisplay);
     }
 
     sendDispatchInFlightRef.current = true;
     try {
       // All providers route through Pi agent
-      return await sendPiMessage(trimmed, displayLabel);
+      return await sendPiMessage(outgoingMessage, outgoingDisplay);
     } finally {
       sendDispatchInFlightRef.current = false;
     }
@@ -7689,7 +7752,7 @@ export function StandaloneChat({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() && pastedImages.length === 0) return;
+    if (!input.trim() && pastedImages.length === 0 && attachedDocsRef.current.length === 0) return;
     sendMessage(input.trim());
   };
 
@@ -8894,6 +8957,29 @@ export function StandaloneChat({
           )
         )}
 
+        {/* Attached documents — filename chips with remove */}
+        {attachedDocs.length > 0 && (
+          <div className="px-5 sm:px-6 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
+            {attachedDocs.map((doc, i) => (
+              <div
+                key={`${doc.name}-${i}`}
+                className="relative group flex items-center gap-2 max-w-[220px] rounded-lg border border-border/50 bg-muted/40 px-2.5 py-1.5 shadow-sm"
+                title={`${doc.name}${doc.truncated ? " (truncated to fit)" : ""}`}
+              >
+                <Paperclip className="h-4 w-4 text-muted-foreground shrink-0" />
+                <span className="truncate text-xs text-foreground">{doc.name}</span>
+                <button
+                  type="button"
+                  onClick={() => setAttachedDocs((prev) => prev.filter((_, idx) => idx !== i))}
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         {/* Attached images in the gap (above agent bar, like reference); click to open full-screen viewer */}
         {pastedImages.length > 0 && (
           <div className="px-5 sm:px-6 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
@@ -9201,7 +9287,7 @@ export function StandaloneChat({
                 }}
               />
               {(() => {
-                const hasInput = input.trim().length > 0 || pastedImages.length > 0;
+                const hasInput = input.trim().length > 0 || pastedImages.length > 0 || attachedDocs.length > 0;
                 const primaryAction = getComposerPrimaryAction(isLoading || isStreaming, hasInput);
                 const isStopMode = primaryAction === "stop";
                 return (
