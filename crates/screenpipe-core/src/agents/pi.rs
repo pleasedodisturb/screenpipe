@@ -1507,8 +1507,7 @@ fn seed_pi_package_json(install_dir: &Path) {
                     obj.insert("overrides".to_string(), expected_overrides.clone());
                     changed = true;
                 }
-                if let Some(deps_obj) =
-                    obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
+                if let Some(deps_obj) = obj.get_mut("dependencies").and_then(|d| d.as_object_mut())
                 {
                     let legacy: Vec<String> = deps_obj
                         .keys()
