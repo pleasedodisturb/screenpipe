@@ -286,6 +286,26 @@ impl DatabaseManager {
             ));
         }
 
+        // Ensure the parent directory exists before opening the file. A missing
+        // data dir (fresh install, a relocated/unmounted volume, or a path under
+        // a not-yet-created subfolder) makes SQLite fail with "unable to open
+        // database file" (SQLITE_CANTOPEN, code 14) at create_database / connect
+        // — the single highest-volume DB error in production. Skip in-memory
+        // databases (":memory:"), which have no filesystem path.
+        if !database_path.contains(":memory:") {
+            if let Some(parent) = std::path::Path::new(database_path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        warn!(
+                            "failed to create db parent dir {}: {} — open may still fail with SQLITE_CANTOPEN",
+                            parent.display(),
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
         // Create the database if it doesn't exist
         if !sqlx::Sqlite::database_exists(&connection_string).await? {
             sqlx::Sqlite::create_database(&connection_string).await?;
