@@ -1777,4 +1777,170 @@ mod db_tests {
             "activity-summary unexpectedly slow: {elapsed:?}"
         );
     }
+
+    /// Real screenpipe timestamps are RFC3339 with microseconds and a `+00:00`
+    /// offset (e.g. `2026-06-02T23:47:33.574798+00:00`), not the clean
+    /// `YYYY-MM-DD HH:MM:SS` the other tests use. This locks in that JULIANDAY
+    /// and the BETWEEN range filter both handle the production format, so a
+    /// future capture-format change cannot silently break the duration math.
+    #[tokio::test]
+    async fn real_world_rfc3339_timestamp_format() {
+        let (db, _d) = fresh_db().await;
+        // Same gaps as `seed_mixed` (total 2.5 min) but in the real stored
+        // format, with real-looking microseconds.
+        let rows = [
+            ("2026-06-02T10:00:00.574798+00:00", "Arc", "GitHub"),
+            ("2026-06-02T10:00:20.111111+00:00", "Arc", "GitHub"),
+            ("2026-06-02T10:00:40.999999+00:00", "Arc", "GitHub"),
+            ("2026-06-02T10:01:00.000001+00:00", "Arc", "Gmail"),
+            ("2026-06-02T10:01:30.250000+00:00", "Claude", "Chat"),
+            ("2026-06-02T10:02:00.750000+00:00", "Claude", "Chat"),
+            ("2026-06-02T10:10:00.500000+00:00", "Claude", "Chat"), // +~480s idle
+            ("2026-06-02T10:10:30.500000+00:00", "Claude", "Chat"),
+        ];
+        for (ts, app, win) in rows {
+            add_frame(&db, ts, Some(app), Some(win)).await;
+        }
+        let core = collect_summary_core(
+            &db,
+            &query(None),
+            "2026-06-02T09:00:00Z",
+            "2026-06-02T12:00:00Z",
+        )
+        .await;
+        // Within the ~3.6s tolerance, identical to the clean-format fixture.
+        assert!(
+            near(core.total_active_minutes, 2.5),
+            "real-format total wrong: {}",
+            core.total_active_minutes
+        );
+        assert!(near(app_min(&core, "Arc").unwrap(), 1.0));
+        assert!(near(app_min(&core, "Claude").unwrap(), 1.0));
+        assert_eq!(core.total_frames, 8);
+    }
+
+    /// The scaling guarantee: a one-hour range against a LARGE table must cost
+    /// in proportion to the rows in range, not the table size. Insert ~50k
+    /// frames across weeks, summarize a single hour, and confirm only that hour
+    /// is read (and quickly).
+    #[tokio::test]
+    async fn small_range_over_large_table() {
+        let (db, _d) = fresh_db().await;
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 5, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let total = 50_000usize; // ~34 days at 1 frame/min
+        let batch = 1_000usize;
+        let mut i = 0usize;
+        while i < total {
+            let mut vals = Vec::with_capacity(batch);
+            for _ in 0..batch {
+                let ts = base + chrono::Duration::seconds(i as i64 * 60);
+                vals.push(format!(
+                    "('{}.000000+00:00', 'App{}', 'Win')",
+                    ts.format("%Y-%m-%dT%H:%M:%S"),
+                    i % 4
+                ));
+                i += 1;
+            }
+            db.execute_raw_sql(&format!(
+                "INSERT INTO frames (timestamp, app_name, window_name) VALUES {}",
+                vals.join(",")
+            ))
+            .await
+            .unwrap();
+        }
+
+        // One hour, ~14 days in: 1 frame/min => ~61 in range out of 50_000.
+        let start = "2026-05-15T00:00:00.000000+00:00";
+        let end = "2026-05-15T01:00:00.000000+00:00";
+        let started = std::time::Instant::now();
+        let core = collect_summary_core(&db, &query(None), start, end).await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "1h range over {total} frames took {elapsed:?}, in-range frames={}",
+            core.total_frames
+        );
+
+        // Only the in-range hour is summarized, not the whole table.
+        assert!(
+            (55..=65).contains(&core.total_frames),
+            "expected ~61 in-range frames, got {}",
+            core.total_frames
+        );
+        // Index-backed range read. Loose ceiling, but a dropped index / full
+        // table scan on 50k rows would blow past it.
+        assert!(
+            elapsed.as_millis() < 1_500,
+            "range query slow over a big table: {elapsed:?}"
+        );
+    }
+
+    /// Guard the scaling assumption directly: the range predicate must be
+    /// planned as an index SEARCH on idx_frames_timestamp, never a full SCAN.
+    #[tokio::test]
+    async fn range_filter_uses_timestamp_index() {
+        let (db, _d) = fresh_db().await;
+        // Mirrors the WHERE clause shared by the apps / windows / active-ts queries.
+        let plan = db
+            .execute_raw_sql(
+                "EXPLAIN QUERY PLAN SELECT timestamp FROM frames \
+                 WHERE timestamp BETWEEN '2026-05-15T00:00:00Z' AND '2026-05-15T01:00:00Z' \
+                 AND app_name IS NOT NULL AND app_name != ''",
+            )
+            .await
+            .unwrap();
+        let detail = plan.to_string();
+        assert!(
+            detail.contains("idx_frames_timestamp"),
+            "range query must use the timestamp index; plan was: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn null_window_still_counts_toward_app() {
+        let (db, _d) = fresh_db().await;
+        add_frame(&db, &format!("{DAY} 10:00:00"), Some("Arc"), None).await;
+        add_frame(&db, &format!("{DAY} 10:00:30"), Some("Arc"), None).await;
+        let (s, e) = full_range();
+        let core = collect_summary_core(&db, &query(None), &s, &e).await;
+        // App time is still measured (30s gap) even with no window name...
+        assert!(near(app_min(&core, "Arc").unwrap(), 0.5));
+        // ...but a NULL window yields no window row.
+        assert!(win_min(&core, "Arc", "").is_none());
+        assert!(core.windows.iter().all(|w| w.app_name != "Arc"));
+    }
+
+    #[tokio::test]
+    async fn app_name_with_apostrophe_is_escaped() {
+        let (db, _d) = fresh_db().await;
+        let name = "O'Brien's IDE";
+        add_frame(&db, &format!("{DAY} 10:00:00"), Some(name), Some("main")).await;
+        add_frame(&db, &format!("{DAY} 10:00:30"), Some(name), Some("main")).await;
+        let (s, e) = full_range();
+        // Filtering by an app name containing a single quote must not break the SQL.
+        let core = collect_summary_core(&db, &query(Some(name)), &s, &e).await;
+        assert!(
+            near(app_min(&core, name).unwrap_or(-1.0), 0.5),
+            "apostrophe app names: {:?}",
+            core.apps.iter().map(|a| &a.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn out_of_order_inserts_are_sorted() {
+        let (db, _d) = fresh_db().await;
+        // Insert the later frame first; the queries ORDER BY timestamp.
+        add_frame(&db, &format!("{DAY} 10:00:30"), Some("Arc"), Some("Win")).await;
+        add_frame(&db, &format!("{DAY} 10:00:00"), Some("Arc"), Some("Win")).await;
+        let (s, e) = full_range();
+        let core = collect_summary_core(&db, &query(None), &s, &e).await;
+        assert!(
+            near(core.total_active_minutes, 0.5),
+            "insertion order must not matter, got {}",
+            core.total_active_minutes
+        );
+        assert!(near(app_min(&core, "Arc").unwrap(), 0.5));
+    }
 }
