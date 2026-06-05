@@ -922,7 +922,7 @@ interface SettingsContextType {
 	resetSettings: () => Promise<void>;
 	resetSetting: <K extends keyof Settings>(key: K) => Promise<void>;
 	reloadStore: () => Promise<void>;
-	loadUser: (token: string) => Promise<void>;
+	loadUser: (token: string, verify?: boolean) => Promise<void>;
 	getDataDir: () => Promise<string>;
 	isSettingsLoaded: boolean;
 	loadingError: string | null;
@@ -1179,14 +1179,17 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		return `${homeDirPath}/.screenpipe`;
 	};
 
-	const loadUser = async (token: string) => {
+	const loadUser = async (token: string, verify = false) => {
 		try {
 			const response = await fetch(`https://screenpi.pe/api/user`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({ token }),
+				// verify=true asks the server to consult Stripe directly (used by the
+				// entitlement gate right after purchase); normal polls omit it to keep
+				// the hot path off Stripe.
+				body: JSON.stringify({ token, ...(verify ? { verify: true } : {}) }),
 			});
 
 			if (!response.ok) {

@@ -115,4 +115,39 @@ describe("app entitlement", () => {
     });
     expect(hasAppEntitlement(normalized)).toBe(true);
   });
+
+  it("keeps lifetime grants working offline even when the cache is stale", () => {
+    const lifetimeUser = user({
+      subscription_plan: "lifetime",
+      app_entitled: true,
+      entitlement: {
+        active: true,
+        plan: "lifetime",
+        source: "lifetime",
+        checked_at: "2026-05-01T00:00:00.000Z", // weeks stale
+        grace_until: null,
+        features: { app: true },
+      },
+    });
+
+    expect(hasAppEntitlement(lifetimeUser)).toBe(true);
+    expect(needsAppEntitlementRefresh(lifetimeUser)).toBe(false);
+  });
+
+  it("honors a server-issued offline grace window past the freshness limit", () => {
+    expect(
+      hasAppEntitlement(
+        user({
+          entitlement: {
+            active: false,
+            plan: "standard",
+            source: "subscription",
+            checked_at: "2026-05-01T00:00:00.000Z", // weeks stale
+            grace_until: "2026-06-30T00:00:00.000Z", // still in the future
+            features: { app: true },
+          },
+        }),
+      ),
+    ).toBe(true);
+  });
 });

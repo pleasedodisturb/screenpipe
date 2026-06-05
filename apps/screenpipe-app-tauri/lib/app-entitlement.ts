@@ -54,11 +54,28 @@ export const APP_ENTITLEMENT_MAX_STALE_MS = 72 * 60 * 60 * 1000;
 export const APP_ENTITLEMENT_CLOCK_SKEW_MS = 5 * 60 * 1000;
 export const PRICING_URL = "https://screenpipe.com/onboarding";
 
+// localStorage key an e2e spec can set to force the gate ON even in a bypassed
+// build. It can only ever make the gate stricter (never bypass), so it is safe
+// to honor in production too.
+export const E2E_FORCE_BILLING_GATE_KEY = "screenpipe_e2e_force_billing_gate";
+
 export function isDevBillingBypassEnabled() {
+  if (typeof window !== "undefined") {
+    try {
+      if (window.localStorage?.getItem(E2E_FORCE_BILLING_GATE_KEY) === "1") {
+        return false;
+      }
+    } catch {
+      // ignore storage access errors (private mode, etc.)
+    }
+  }
   return (
     process.env.TAURI_ENV_DEBUG === "true" ||
     process.env.NODE_ENV === "development" ||
-    process.env.NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS === "true"
+    process.env.NEXT_PUBLIC_SCREENPIPE_DEV_BILLING_BYPASS === "true" ||
+    // e2e builds bypass the paywall by default so the suite exercises real
+    // features; the dedicated gate spec re-enables it via the key above.
+    process.env.NEXT_PUBLIC_SCREENPIPE_E2E === "true"
   );
 }
 
@@ -91,6 +108,10 @@ function hasFutureGrace(entitlement: AppEntitlement | null) {
   return graceTime !== null && graceTime > Date.now();
 }
 
+function isLifetimeEntitlement(entitlement: AppEntitlement | null) {
+  return entitlement?.plan === "lifetime" || entitlement?.source === "lifetime";
+}
+
 function isEntitlementActive(entitlement: AppEntitlement | null) {
   return entitlement?.active === true || hasFutureGrace(entitlement);
 }
@@ -114,15 +135,18 @@ export function hasAppEntitlement(user: AppUser | null | undefined) {
   if (hasLegacyPaidAccess(user)) return true;
 
   const entitlement = asEntitlement(user.entitlement);
-  if (
-    isEntitlementFresh(entitlement) &&
-    isEntitlementActive(entitlement) &&
-    (user.app_entitled === true || entitlement?.features?.app === true)
-  ) {
-    return true;
-  }
+  if (!entitlement) return false;
 
-  return false;
+  const hasAppFeature = user.app_entitled === true || entitlement.features?.app === true;
+  if (!hasAppFeature) return false;
+
+  // Perpetual (lifetime) grants and server-issued offline grace windows stay
+  // valid even when the cached entitlement is stale, so a local-first app keeps
+  // recording when it cannot reach the server for a few days.
+  if (isLifetimeEntitlement(entitlement) || hasFutureGrace(entitlement)) return true;
+
+  // Otherwise require a recent check confirming the plan is still active.
+  return isEntitlementFresh(entitlement) && entitlement.active === true;
 }
 
 export function hasCloudEntitlement(user: AppUser | null | undefined) {
@@ -133,6 +157,9 @@ export function needsAppEntitlementRefresh(user: AppUser | null | undefined) {
   if (!user?.token || hasLegacyPaidAccess(user)) return false;
 
   const entitlement = asEntitlement(user.entitlement);
+  // Lifetime grants and active grace windows are already honored offline, so
+  // they never need a re-verification prompt.
+  if (isLifetimeEntitlement(entitlement) || hasFutureGrace(entitlement)) return false;
   const appearsEntitled = user.app_entitled === true || entitlement?.features?.app === true;
   return appearsEntitled && !isEntitlementFresh(entitlement);
 }

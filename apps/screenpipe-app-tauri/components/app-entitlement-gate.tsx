@@ -50,6 +50,8 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const stoppedForGateRef = useRef(false);
+  const autoVerifiedRef = useRef(false);
+  const prevEntitledRef = useRef<boolean | null>(null);
   const user = settings.user as AppUser | null | undefined;
   const devBypass = isDevBillingBypassEnabled();
   const isEntitled = hasAppEntitlement(user);
@@ -99,7 +101,9 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     setIsRefreshing(true);
     setRefreshError(null);
     try {
-      await loadUser(token);
+      // verify=true asks the server to consult Stripe directly, so a user who
+      // just paid unlocks immediately instead of waiting for the webhook.
+      await loadUser(token, true);
       posthog.capture("app_entitlement_refresh_clicked");
     } catch (err) {
       const message = err instanceof Error ? err.message : "refresh failed";
@@ -116,6 +120,31 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
     } catch {}
     commands.openLoginWindow();
   }, [updateSettings]);
+
+  // A signed-in user who is not yet entitled may have just paid, with the Stripe
+  // webhook still in flight. Verify once against the server (Stripe fallback) so
+  // they unlock without waiting for the next periodic poll.
+  useEffect(() => {
+    if (!isSettingsLoaded || devBypass || isEntitled) return;
+    if (!user?.token || autoVerifiedRef.current) return;
+    autoVerifiedRef.current = true;
+    void refreshUser();
+  }, [devBypass, isEntitled, isSettingsLoaded, user?.token, refreshUser]);
+
+  // Resume capture when access transitions to entitled within a session (after
+  // sign-in, purchase, or a successful refresh). Native autostart only runs once
+  // at launch, so without this a freshly-paid user would see the app but get no
+  // recording until they restarted it.
+  useEffect(() => {
+    if (!isSettingsLoaded || devBypass) return;
+    const previouslyEntitled = prevEntitledRef.current;
+    prevEntitledRef.current = isEntitled;
+    if (previouslyEntitled === false && isEntitled) {
+      commands.spawnScreenpipe(null).catch((err) => {
+        console.warn("failed to start screenpipe after entitlement restored:", err);
+      });
+    }
+  }, [devBypass, isEntitled, isSettingsLoaded]);
 
   if (!isSettingsLoaded) {
     return (

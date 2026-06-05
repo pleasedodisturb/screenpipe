@@ -861,18 +861,27 @@ fn entitlement_checked_recently(entitlement: &serde_json::Value) -> bool {
             <= chrono::Duration::hours(APP_ENTITLEMENT_MAX_STALE_HOURS)
 }
 
-fn entitlement_active_or_in_grace(entitlement: &serde_json::Value) -> bool {
-    if entitlement
+fn entitlement_active(entitlement: &serde_json::Value) -> bool {
+    entitlement
         .get("active")
         .and_then(|active| active.as_bool())
         .unwrap_or(false)
-    {
-        return true;
-    }
+}
 
+fn entitlement_has_future_grace(entitlement: &serde_json::Value) -> bool {
     parse_entitlement_time(entitlement.get("grace_until"))
         .map(|grace_until| grace_until > chrono::Utc::now())
         .unwrap_or(false)
+}
+
+fn entitlement_is_lifetime(entitlement: &serde_json::Value) -> bool {
+    let field = |key: &str| {
+        entitlement
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+    };
+    field("plan") == "lifetime" || field("source") == "lifetime"
 }
 
 fn entitlement_feature(entitlement: &serde_json::Value, feature: &str) -> bool {
@@ -1264,12 +1273,13 @@ impl SettingsStore {
     }
 
     pub fn app_entitled_or_dev(&self) -> bool {
-        if cfg!(debug_assertions)
-            || std::env::var("TAURI_ENV_DEBUG").ok().as_deref() == Some("true")
-        {
+        // Debug builds (`bun tauri dev`, e2e, signed dev builds) are never gated.
+        // Release builds must not be bypassable via a runtime env var.
+        if cfg!(debug_assertions) {
             return true;
         }
 
+        // Legacy cloud subscribers keep working during rollout.
         if self.user.cloud_subscribed == Some(true) {
             return true;
         }
@@ -1278,13 +1288,22 @@ impl SettingsStore {
             return false;
         };
 
-        if !entitlement_checked_recently(entitlement)
-            || !entitlement_active_or_in_grace(entitlement)
-        {
+        let has_app_feature =
+            self.user.app_entitled == Some(true) || entitlement_feature(entitlement, "app");
+        if !has_app_feature {
             return false;
         }
 
-        self.user.app_entitled == Some(true) || entitlement_feature(entitlement, "app")
+        // Perpetual (lifetime) grants and server-issued offline grace windows stay
+        // valid even when the cached entitlement is stale. A local-first app must
+        // not stop recording just because it could not reach the server for a few
+        // days.
+        if entitlement_is_lifetime(entitlement) || entitlement_has_future_grace(entitlement) {
+            return true;
+        }
+
+        // Otherwise require a recent check confirming the plan is still active.
+        entitlement_checked_recently(entitlement) && entitlement_active(entitlement)
     }
 
     pub fn audio_engine_resolution(&self) -> AudioEngineResolution {
