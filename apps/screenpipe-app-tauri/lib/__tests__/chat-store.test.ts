@@ -12,7 +12,9 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   useChatStore,
   selectOrderedSessions,
+  selectRecentSwitcherSessions,
   getOrCreateEmptyChatId,
+  dedupeSessionRecords,
   type SessionRecord,
 } from "../stores/chat-store";
 
@@ -264,6 +266,60 @@ describe("chat-store: setCurrent clears unread atomically", () => {
     const state = useChatStore.getState();
     expect(state.currentId).toBe("A");
     expect(state.sessions.A.unread).toBe(false);
+    expect(typeof state.sessions.A.lastViewedAt).toBe("number");
+  });
+});
+
+describe("chat-store: recent switcher ordering", () => {
+  beforeEach(reset);
+
+  it("returns only chats viewed this session ordered by most recent view", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "older-viewed", createdAt: 100 }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "sidebar-top", createdAt: 300 }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "newer-viewed", createdAt: 200 }));
+
+    useChatStore.getState().actions.setCurrent("older-viewed");
+    useChatStore.getState().actions.setCurrent("newer-viewed");
+
+    const ordered = selectRecentSwitcherSessions(useChatStore.getState());
+    expect(ordered.map((s) => s.id)).toEqual([
+      "newer-viewed",
+      "older-viewed",
+    ]);
+  });
+
+  it("returns an empty list when no chats have been viewed this session", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "a", createdAt: 300 }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "b", createdAt: 200 }));
+
+    const ordered = selectRecentSwitcherSessions(useChatStore.getState());
+    expect(ordered.map((s) => s.id)).toEqual([]);
+  });
+
+  it("excludes hidden and draft chats from the switcher", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "visible", createdAt: 300 }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "hidden", createdAt: 200, hidden: true }));
+    useChatStore.getState().actions.upsert(baseRecord({ id: "draft", createdAt: 100, draft: true }));
+
+    useChatStore.getState().actions.setCurrent("visible");
+
+    const ordered = selectRecentSwitcherSessions(useChatStore.getState());
+    expect(ordered.map((s) => s.id)).toEqual(["visible"]);
+  });
+
+  it("excludes pipe-run and pipe-watch sessions from the switcher", () => {
+    useChatStore.getState().actions.upsert(baseRecord({ id: "visible", createdAt: 300 }));
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "pipe-run", kind: "pipe-run", createdAt: 200, lastViewedAt: 500 })
+    );
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "pipe-watch", kind: "pipe-watch", createdAt: 100, lastViewedAt: 400 })
+    );
+
+    useChatStore.getState().actions.setCurrent("visible");
+
+    const ordered = selectRecentSwitcherSessions(useChatStore.getState());
+    expect(ordered.map((s) => s.id)).toEqual(["visible"]);
   });
 });
 
@@ -296,5 +352,134 @@ describe("chat-store: markUnread guards", () => {
     useChatStore.getState().actions.markUnread("B");
     expect(useChatStore.getState().sessions.A.unread).toBe(false);
     expect(useChatStore.getState().sessions.B.unread).toBe(true);
+  });
+});
+
+describe("chat-store: cross-window duplicate row collapsing", () => {
+  // Bug: one logical conversation persisted under two ids (home + chat-overlay
+  // cross-window save race) showed as two sidebar rows. listConversations
+  // already dedups on disk; the live sidebar renders selectOrderedSessions
+  // straight from the store, which must dedup the same way.
+  beforeEach(reset);
+
+  const withMessages = (
+    id: string,
+    firstUser: string,
+    reply: string | null,
+    over: Partial<SessionRecord> = {},
+  ): SessionRecord =>
+    baseRecord({
+      id,
+      messageCount: reply ? 2 : 1,
+      messages: [
+        { id: `${id}-u`, role: "user", content: firstUser, timestamp: 1 },
+        ...(reply ? [{ id: `${id}-a`, role: "assistant", content: reply, timestamp: 2 }] : []),
+      ] as any,
+      ...over,
+    });
+
+  it("collapses two ids sharing a first user message into one row, keeping the completed copy", () => {
+    // The exact production signature: a fallback-titled twin frozen at
+    // "Processing..." + the real copy with the reply and an AI title.
+    useChatStore.getState().actions.upsert(
+      withMessages("twin", "hi there", "Processing...", {
+        createdAt: 1_000,
+        title: "hi there",
+        titleSource: "fallback",
+      }),
+    );
+    useChatStore.getState().actions.upsert(
+      withMessages("real", "hi there", "the real answer", {
+        createdAt: 1_500,
+        title: "AI Title",
+        titleSource: "ai",
+      }),
+    );
+    const rows = selectOrderedSessions(useChatStore.getState());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("real");
+  });
+
+  it("matches a metadata-only cross-window twin via its dedupKey", () => {
+    // The twin arrives via syncConversationFromDisk → sessionRecordFromMeta,
+    // which carries dedupKey but no messages.
+    useChatStore.getState().actions.upsert(
+      withMessages("real", "same opener", "answer", { createdAt: 1_000 }),
+    );
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "metaTwin", createdAt: 1_200, dedupKey: "same opener", title: "same opener" }),
+    );
+    const rows = selectOrderedSessions(useChatStore.getState());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("real");
+  });
+
+  it("collapses a stub row after disk sync patches its dedupKey", () => {
+    // Listener ordering bug: home/page's saved-title listener can create a
+    // metadata-only stub before chat-sidebar's disk sync runs. If the later
+    // patch does not include dedupKey, the live Recents selector cannot
+    // recognize this as a cross-window twin.
+    useChatStore.getState().actions.upsert(
+      withMessages("real", "same opener", "answer", { createdAt: 1_000 }),
+    );
+    useChatStore.getState().actions.upsert(
+      baseRecord({ id: "stubTwin", createdAt: 1_200, title: "same opener" }),
+    );
+
+    expect(selectOrderedSessions(useChatStore.getState())).toHaveLength(2);
+
+    useChatStore.getState().actions.patch("stubTwin", {
+      dedupKey: "same opener",
+      messageCount: 2,
+    });
+
+    const rows = selectOrderedSessions(useChatStore.getState());
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("real");
+  });
+
+  it("does NOT merge same-opener chats created more than the window apart", () => {
+    useChatStore.getState().actions.upsert(
+      withMessages("a", "good morning", "x", { createdAt: 1_000 }),
+    );
+    useChatStore.getState().actions.upsert(
+      withMessages("b", "good morning", "y", { createdAt: 1_000 + 31 * 60 * 1_000 }),
+    );
+    expect(selectOrderedSessions(useChatStore.getState())).toHaveLength(2);
+  });
+
+  it("never merges pipe runs that share a templated first message", () => {
+    useChatStore.getState().actions.upsert(
+      withMessages("run1", "daily digest", "a", { createdAt: 1_000, kind: "pipe-run" }),
+    );
+    useChatStore.getState().actions.upsert(
+      withMessages("run2", "daily digest", "b", { createdAt: 1_100, kind: "pipe-run" }),
+    );
+    expect(selectOrderedSessions(useChatStore.getState())).toHaveLength(2);
+  });
+
+  it("keeps the visible twin rather than collapsing into a hidden one", () => {
+    // The store holds hidden + visible at once (unlike the disk candidate set),
+    // so a visible row must never be dropped in favor of a hidden twin — that
+    // would erase the conversation from the sidebar entirely.
+    useChatStore.getState().actions.upsert(
+      withMessages("hiddenTwin", "shared opener", "answer", { createdAt: 1_000, hidden: true }),
+    );
+    useChatStore.getState().actions.upsert(
+      withMessages("visibleTwin", "shared opener", "Processing...", { createdAt: 1_200 }),
+    );
+    const rows = dedupeSessionRecords(Object.values(useChatStore.getState().sessions));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe("visibleTwin");
+  });
+
+  it("leaves distinct conversations untouched", () => {
+    useChatStore.getState().actions.upsert(
+      withMessages("a", "first chat", "x", { createdAt: 1_000 }),
+    );
+    useChatStore.getState().actions.upsert(
+      withMessages("b", "totally different", "y", { createdAt: 1_100 }),
+    );
+    expect(selectOrderedSessions(useChatStore.getState())).toHaveLength(2);
   });
 });

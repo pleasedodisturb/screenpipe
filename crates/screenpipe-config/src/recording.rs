@@ -62,6 +62,17 @@ pub struct RecordingSettings {
     #[serde(rename = "transcriptionMode")]
     pub transcription_mode: String,
 
+    /// Stream live notes only for manually-started live meetings. This is
+    /// separate from 24/7 background transcription: the recorder still writes
+    /// durable chunks, while this powers the low-latency meeting note UI.
+    #[serde(rename = "meetingLiveTranscriptionEnabled")]
+    pub meeting_live_transcription_enabled: bool,
+
+    /// Provider for manually-started live notes. Defaults to the selected audio
+    /// transcription engine so local/custom engines work without Cloud.
+    #[serde(rename = "meetingLiveTranscriptionProvider")]
+    pub meeting_live_transcription_provider: String,
+
     /// Audio device names/IDs to capture from.
     #[serde(rename = "audioDevices")]
     pub audio_devices: Vec<String>,
@@ -87,6 +98,16 @@ pub struct RecordingSettings {
         default = "default_experimental_coreaudio_system_audio"
     )]
     pub experimental_coreaudio_system_audio: bool,
+
+    /// Experimental: request Windows WASAPI microphone Acoustic Echo Cancellation.
+    /// Ignored on non-Windows platforms and fail-open when unsupported by device/driver.
+    #[serde(rename = "windowsInputAecEnabled", default)]
+    pub windows_input_aec_enabled: bool,
+
+    /// Experimental: request Apple VoiceProcessingIO (AEC) on the default macOS microphone.
+    /// Ignored on non-macOS platforms. Only the system default input uses VPIO; other devices use HAL.
+    #[serde(rename = "macosInputVpioEnabled", default)]
+    pub macos_input_vpio_enabled: bool,
 
     /// Duration of each audio chunk in seconds before transcription.
     /// Stored as i32 to match existing store.bin schema (cast to u64 by engine).
@@ -118,6 +139,13 @@ pub struct RecordingSettings {
     /// Disable all screen capture.
     #[serde(rename = "disableVision")]
     pub disable_vision: bool,
+
+    /// Disable the timeline / rewind feature. When true, the engine skips
+    /// timeline-only work: warming the hot frame cache from the DB at startup
+    /// and buffering captured frames/audio into the in-memory hot cache that
+    /// only the timeline streaming endpoint reads.
+    #[serde(rename = "disableTimeline", default)]
+    pub disable_timeline: bool,
 
     /// Specific monitor IDs to capture.
     #[serde(rename = "monitorIds")]
@@ -153,6 +181,98 @@ pub struct RecordingSettings {
     #[serde(rename = "disableMeetingDetector", default)]
     pub disable_meeting_detector: bool,
 
+    // ── Mitsukeru fork: event-driven capture overrides ─────────────────
+    // ミツケル拡張：PowerProfile に依らず個別パラメータを直接指定するための上書き値。
+    // None の場合は通常通り PowerProfile が決定。デスクトップ常時記録のような用途で
+    // 「AC 電源だが Balanced 相当の頻度に固定したい」ケースに対応する。
+    /// Override `EventDrivenCaptureConfig::idle_capture_interval_ms` (milliseconds).
+    /// None = follow active PowerProfile.
+    #[serde(rename = "idleCaptureIntervalMs", default)]
+    pub idle_capture_interval_ms: Option<u64>,
+
+    /// Override `EventDrivenCaptureConfig::visual_check_interval_ms` (milliseconds).
+    /// None = follow active PowerProfile.
+    #[serde(rename = "visualCheckIntervalMs", default)]
+    pub visual_check_interval_ms: Option<u64>,
+
+    /// Override `EventDrivenCaptureConfig::visual_change_threshold` (0.0–1.0).
+    /// None = follow active PowerProfile.
+    #[serde(rename = "visualChangeThreshold", default)]
+    pub visual_change_threshold: Option<f64>,
+
+    /// Override `EventDrivenCaptureConfig::min_capture_interval_ms` (milliseconds).
+    /// None = follow active PowerProfile.
+    #[serde(rename = "minCaptureIntervalMs", default)]
+    pub min_capture_interval_ms: Option<u64>,
+
+    /// Default behavior when a meeting is detected.
+    /// `"ask"` (default) surfaces a "+ HD" action on the existing meeting
+    /// notification; `"always"` auto-starts a meeting-bound HD session
+    /// every time; `"never"` is opt-out — only the manual tray timer
+    /// can start a session.
+    ///
+    /// Runtime-mutable via `POST /capture/hd/settings`; this field
+    /// just seeds the controller on startup.
+    #[serde(
+        rename = "hdRecordingDefault",
+        default = "default_hd_recording_default"
+    )]
+    pub hd_recording_default: String,
+
+    /// Capture debounce (ms) installed while an HD session is active.
+    /// Default 100 ms ≈ 10 fps — smooth enough for human replay without
+    /// exploding disk usage. Clamped to >= 33 ms (30 fps ceiling) by the
+    /// controller.
+    #[serde(
+        rename = "hdRecordingIntervalMs",
+        default = "default_hd_recording_interval_ms"
+    )]
+    pub hd_recording_interval_ms: u64,
+
+    /// Legacy key-trigger override retained for settings compatibility.
+    /// Recording sessions keep keyboard-triggered capture on; raw key/text DB
+    /// rows are controlled separately by `disableKeyboardCapture`.
+    #[serde(rename = "captureOnKeystroke", default)]
+    pub capture_on_keystroke: Option<bool>,
+
+    /// Override `EventDrivenCaptureConfig::capture_on_clipboard`.
+    /// None = engine default (false). When true, clipboard changes fire a
+    /// paired capture. Clipboard DB rows are still controlled separately by
+    /// `disableClipboardCapture`.
+    #[serde(rename = "captureOnClipboard", default)]
+    pub capture_on_clipboard: Option<bool>,
+
+    /// Override `UiRecorderConfig::capture_scroll`.
+    /// None = engine default (false). When true, scroll wheel events are
+    /// recorded into `ui_events` so the `ScrollBurstTracker` can fire a
+    /// `ScrollStop` trigger at burst-end and link the last scroll row to
+    /// the resulting frame. Off by default — wheel ticks fire at ~60Hz
+    /// and inflate the table fast.
+    #[serde(rename = "captureScroll", default)]
+    pub capture_scroll: Option<bool>,
+
+    /// Prioritize mouse/keyboard input latency over a11y event completeness.
+    /// Opt-in master switch for the three coordinated optimizations defined on
+    /// `UiCaptureConfig.prioritize_input_latency`.
+    #[serde(rename = "prioritizeInputLatency", default)]
+    pub prioritize_input_latency: bool,
+
+    /// OS thread priority for a11y extraction threads when `prioritize_input_latency`
+    /// is true. Values: "normal" / "below_normal" / "lowest" / "idle".
+    #[serde(
+        rename = "extractionThreadPriority",
+        default = "default_extraction_thread_priority"
+    )]
+    pub extraction_thread_priority: String,
+
+    /// Skip UIA tree captures within this many ms after the most recent input.
+    /// 0 disables. Ignored when `prioritize_input_latency` is false.
+    #[serde(
+        rename = "pauseExtractionOnInputMs",
+        default = "default_pause_extraction_on_input_ms"
+    )]
+    pub pause_extraction_on_input_ms: u64,
+
     // ── Filters ────────────────────────────────────────────────────────
     /// Window titles to exclude from capture.
     #[serde(rename = "ignoredWindows")]
@@ -178,12 +298,20 @@ pub struct RecordingSettings {
     #[serde(rename = "pauseOnDrmContent", default)]
     pub pause_on_drm_content: bool,
 
-    /// Skip clipboard capture in the UI recorder. Off by default; recommended
-    /// when piping ~/.screenpipe data into a remote LLM or sharing it,
-    /// since passwords / API keys / private keys often pass through the
-    /// clipboard.
-    #[serde(rename = "disableClipboardCapture", default)]
+    /// Skip persisting clipboard rows/content in the UI recorder. Defaults to
+    /// `true` (clipboard DB capture OFF) — passwords / API keys / private keys
+    /// frequently pass through the clipboard. Clipboard operations can still
+    /// wake event-driven capture when `captureOnClipboard` is enabled.
+    #[serde(rename = "disableClipboardCapture", default = "default_true")]
     pub disable_clipboard_capture: bool,
+
+    /// Skip persisting keyboard / typed-text rows in the UI recorder.
+    /// Defaults to `true` (keyboard DB capture OFF). Keyboard events still
+    /// wake event-driven capture, and the accessibility tree + OCR still
+    /// capture on-screen text so Rewind/Ask keep working.
+    /// Opt in to keyboard DB rows via the "Capture keyboard" toggle.
+    #[serde(rename = "disableKeyboardCapture", default = "default_true")]
+    pub disable_keyboard_capture: bool,
 
     /// Continue recording audio when the screen is locked.
     /// Default: false (audio pauses when screen is locked to save resources).
@@ -243,6 +371,22 @@ pub struct RecordingSettings {
     /// Tinfoil operator. Tracked separately; structured for swap-in.
     #[serde(rename = "piiBackend", default = "default_pii_backend")]
     pub pii_backend: String,
+
+    /// Which PII classes the AI redaction workers actually rewrite
+    /// when `asyncPiiRedaction` / `asyncImagePiiRedaction` are on.
+    /// Canonical snake_case `SpanLabel` names (e.g.
+    /// `["secret", "email", "person"]`). The models detect every
+    /// class but only these are removed — the rest is *value* (a
+    /// searchable timeline). Defaults to `["secret"]`, the safety
+    /// baseline; `secret` is always treated as included regardless of
+    /// what's stored (see screenpipe-redact `parse_allow_list`). The
+    /// Settings UI surfaces a curated subset (Names, Emails, Phones,
+    /// Addresses, Sensitive) as opt-in checkboxes.
+    #[serde(
+        rename = "piiRedactionLabels",
+        default = "default_pii_redaction_labels"
+    )]
+    pub pii_redaction_labels: Vec<String>,
 
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
@@ -363,6 +507,14 @@ impl RecordingSettings {
             Some(id)
         }
     }
+
+    /// Returns the display name/email used to label the local microphone speaker.
+    pub fn effective_user_name(&self) -> Option<&str> {
+        self.user_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
 }
 
 impl Default for RecordingSettings {
@@ -372,33 +524,52 @@ impl Default for RecordingSettings {
             audio_transcription_engine: crate::best_engine_for_platform(crate::detect_tier())
                 .to_string(),
             transcription_mode: "batch".to_string(),
+            meeting_live_transcription_enabled: true,
+            meeting_live_transcription_provider: "selected-engine".to_string(),
             audio_devices: vec![],
             use_system_default_audio: true,
             experimental_coreaudio_system_audio: false,
+            windows_input_aec_enabled: false,
+            macos_input_vpio_enabled: false,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),
             filter_music: false,
             batch_max_duration_secs: None,
             vocabulary: vec![],
             disable_vision: false,
+            disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
             video_quality: "balanced".to_string(),
             max_snapshot_width: default_max_snapshot_width(),
             disable_snapshot_compaction: false,
             disable_meeting_detector: false,
+            idle_capture_interval_ms: None,
+            visual_check_interval_ms: None,
+            visual_change_threshold: None,
+            min_capture_interval_ms: None,
+            hd_recording_default: default_hd_recording_default(),
+            hd_recording_interval_ms: default_hd_recording_interval_ms(),
+            capture_on_keystroke: None,
+            capture_on_clipboard: None,
+            capture_scroll: None,
+            prioritize_input_latency: false,
+            extraction_thread_priority: default_extraction_thread_priority(),
+            pause_extraction_on_input_ms: default_pause_extraction_on_input_ms(),
             ignored_windows: vec![],
             included_windows: vec![],
             ignored_urls: vec![],
             ignore_incognito_windows: true,
             pause_on_drm_content: false,
-            disable_clipboard_capture: false,
+            disable_clipboard_capture: true,
+            disable_keyboard_capture: true,
             record_while_locked: false,
             languages: vec![],
             use_pii_removal: false,
             async_pii_redaction: false,
             async_image_pii_redaction: false,
             pii_backend: default_pii_backend(),
+            pii_redaction_labels: default_pii_redaction_labels(),
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,
@@ -441,8 +612,30 @@ fn default_max_snapshot_width() -> u32 {
     1920
 }
 
+fn default_extraction_thread_priority() -> String {
+    "below_normal".to_string()
+}
+
+fn default_pause_extraction_on_input_ms() -> u64 {
+    150
+}
+
 fn default_pii_backend() -> String {
     "local".to_string()
+}
+
+/// Default redaction allow-list: secrets only. The safety baseline —
+/// credentials are the one class where a miss is genuinely dangerous.
+fn default_pii_redaction_labels() -> Vec<String> {
+    vec!["secret".to_string()]
+}
+
+fn default_hd_recording_default() -> String {
+    "ask".to_string()
+}
+
+fn default_hd_recording_interval_ms() -> u64 {
+    100
 }
 
 #[cfg(test)]

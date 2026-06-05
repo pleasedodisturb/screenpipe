@@ -4,7 +4,7 @@
 
 use crate::activity_feed::{ActivityFeed, ActivityKind};
 use crate::config::UiCaptureConfig;
-use crate::events::{ElementContext, EventData, Modifiers, UiEvent};
+use crate::events::{ElementBounds, ElementContext, EventData, Modifiers, UiEvent};
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use chrono::Utc;
@@ -20,6 +20,7 @@ use tracing::{debug, error};
 
 use cidre::cg::event::access as cg_access;
 use cidre::{ax, cf, cg, ns};
+use objc2_app_kit::NSPasteboard;
 
 /// Guard to serialize accessibility queries – concurrent calls to
 /// AXUIElementCopyElementAtPosition can corrupt AppKit's internal
@@ -84,6 +85,11 @@ extern "C" {
 extern "C" {
     fn CFRelease(cf: *const c_void);
     fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+}
+
+#[link(name = "System")]
+extern "C" {
+    fn pthread_main_np() -> i32;
 }
 
 /// Permission status for UI capture
@@ -161,7 +167,7 @@ impl UiRecorder {
     pub fn check_permissions(&self) -> PermissionStatus {
         PermissionStatus {
             accessibility: ax::is_process_trusted(),
-            input_monitoring: cg_access::listen_preflight(),
+            input_monitoring: check_input_monitoring(),
         }
     }
 
@@ -169,7 +175,7 @@ impl UiRecorder {
     pub fn request_permissions(&self) -> PermissionStatus {
         PermissionStatus {
             accessibility: ax::is_process_trusted_with_prompt(true),
-            input_monitoring: cg_access::listen_request(),
+            input_monitoring: request_input_monitoring(),
         }
     }
 
@@ -212,10 +218,12 @@ impl UiRecorder {
         activity_feed: Option<ActivityFeed>,
     ) -> Result<(RecordingHandle, Option<ActivityFeed>)> {
         let perms = self.check_permissions();
-        if !perms.all_granted() {
+        // Accessibility is the hard requirement — without it we can't
+        // resolve focused app/window for any event and can't read AX
+        // context for clicks/clipboard.
+        if !perms.accessibility {
             anyhow::bail!(
-                "Missing permissions - accessibility: {}, input_monitoring: {}",
-                perms.accessibility,
+                "Missing accessibility permission (input_monitoring={})",
                 perms.input_monitoring
             );
         }
@@ -230,18 +238,43 @@ impl UiRecorder {
         let current_app = Arc::new(ArcSwap::from_pointee(None::<String>));
         let current_window = Arc::new(ArcSwap::from_pointee(None::<String>));
 
-        // Thread 1: CGEventTap for input events
-        let tx1 = tx.clone();
-        let stop1 = stop.clone();
-        let config1 = self.config.clone();
-        let app1 = current_app.clone();
-        let window1 = current_window.clone();
-        let feed1 = activity_feed.clone();
-        threads.push(thread::spawn(move || {
-            run_event_tap(tx1, stop1, start_time, config1, app1, window1, feed1);
-        }));
+        // Thread 1: CGEventTap for input events. Requires Input Monitoring.
+        // When not granted we skip it and fall back to the clipboard poller
+        // below — the user loses keystroke/click capture but keeps
+        // clipboard, app switches, and window focus events.
+        if perms.input_monitoring {
+            let tx1 = tx.clone();
+            let stop1 = stop.clone();
+            let config1 = self.config.clone();
+            let app1 = current_app.clone();
+            let window1 = current_window.clone();
+            let feed1 = activity_feed.clone();
+            threads.push(thread::spawn(move || {
+                run_event_tap(tx1, stop1, start_time, config1, app1, window1, feed1);
+            }));
+        } else {
+            tracing::warn!(
+                "input monitoring not granted — running in reduced mode: \
+                 clipboard via change-count polling, app/window events via \
+                 workspace observer, keystrokes and clicks disabled"
+            );
+            // Standalone clipboard poller path. Only spawn when the user
+            // actually wants clipboard capture; otherwise the recorder
+            // emits app_switch / window_focus events only.
+            if self.config.capture_clipboard {
+                let stop_p = stop.clone();
+                let tx_p = tx.clone();
+                let config_p = self.config.clone();
+                let app_p = current_app.clone();
+                let window_p = current_window.clone();
+                threads.push(thread::spawn(move || {
+                    run_clipboard_poller(stop_p, tx_p, config_p, start_time, app_p, window_p);
+                }));
+            }
+        }
 
-        // Thread 2: App/window observer
+        // Thread 2: App/window observer. Needs accessibility only — no
+        // Input Monitoring required. Always spawned.
         let tx2 = tx.clone();
         let stop2 = stop.clone();
         let config2 = self.config.clone();
@@ -260,6 +293,261 @@ impl UiRecorder {
             activity_feed,
         ))
     }
+}
+
+// ============================================================================
+// Free-function permission helpers
+// ============================================================================
+//
+// Callable without constructing a UiRecorder. Used by the Tauri host (where
+// the engine is linked in-process) to drive the Connections-page permission
+// UI without needing a direct cidre dependency.
+
+/// Check whether the current process has macOS Input Monitoring granted.
+/// Polling-safe — does not trigger the system prompt.
+///
+/// `CGPreflightListenEventAccess` alone is unreliable: it returns true for
+/// "ghost" TCC records (orphaned grants from a previous build at the same
+/// signature/path that's been removed from System Settings → Input
+/// Monitoring, or responsibility-attributed grants from a parent process).
+/// When that happens the UI shows "Enabled" but the running CGEventTap can
+/// still fail to create — keystroke capture silently runs in reduced mode.
+/// We verify by actually attempting to create a tap: if it fails the
+/// preflight is lying and we report "not granted" so the user can re-grant.
+pub fn check_input_monitoring() -> bool {
+    if !cg_access::listen_preflight() {
+        return false;
+    }
+    if probe_listen_event_tap() {
+        return true;
+    }
+    debug!(
+        "input monitoring: CGPreflightListenEventAccess=true but CGEventTapCreate failed — \
+         likely a stale TCC record (ghost). User should run tccutil reset ListenEvent."
+    );
+    false
+}
+
+/// Trigger the macOS Input Monitoring permission flow for the current
+/// process. Returns the resulting grant status. First call shows the
+/// native prompt (and registers the process in System Settings →
+/// Privacy & Security → Input Monitoring); subsequent calls return the
+/// current status without re-prompting.
+pub fn request_input_monitoring() -> bool {
+    cg_access::listen_request() && probe_listen_event_tap()
+}
+
+/// Attempt to create a no-op CGEventTap as ground-truth verification that
+/// Input Monitoring is actually granted to *this* process. `CGEventTapCreate`
+/// returns null if TCC denies the listen-event capability — unlike the
+/// preflight API it can't be fooled by ghost records. Cheap (microseconds)
+/// and side-effect-free: the tap is created in LISTEN_ONLY mode and dropped
+/// immediately without ever being added to a run loop.
+fn probe_listen_event_tap() -> bool {
+    extern "C" fn noop(
+        _proxy: *mut cg::EventTapProxy,
+        _event_type: cg::EventType,
+        event: &mut cg::Event,
+        _user_info: *mut c_void,
+    ) -> Option<&cg::Event> {
+        Some(event)
+    }
+    cg::EventTap::new::<c_void>(
+        cg::EventTapLocation::Session,
+        cg::EventTapPlacement::TailAppend,
+        cg::EventTapOpts::LISTEN_ONLY,
+        cg::EventType::KEY_DOWN.mask(),
+        noop,
+        std::ptr::null_mut(),
+    )
+    .is_some()
+}
+
+// ============================================================================
+// Clipboard worker + poller
+// ============================================================================
+//
+// The clipboard subsystem is split from the input-event tap so it can run
+// even when macOS Input Monitoring is not granted. NSPasteboard reads need
+// only Accessibility (for app/window context); change_count() polling is
+// free. The CGEventTap (Input Monitoring) only matters as a *trigger* for
+// reads — we replace that with periodic change_count polling when the tap
+// is unavailable.
+
+/// Spawn the clipboard-capture worker thread and return its request sender.
+///
+/// One worker handles all clipboard reads regardless of the source
+/// (CGEventTap-driven Cmd+C/X/V vs change-count polling). Dispatching reads
+/// to a single dedicated thread keeps NSPasteboard access on a stable
+/// thread (the worker hops to the main queue itself) and bounds the
+/// in-flight read count.
+fn spawn_clipboard_worker_thread(
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
+) -> Sender<ClipboardRequest> {
+    let (clipboard_tx, clipboard_rx) = bounded::<ClipboardRequest>(4);
+    thread::Builder::new()
+        .name("clipboard-capture".into())
+        .spawn(move || {
+            while let Ok(req) = clipboard_rx.recv() {
+                if req.delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(req.delay_ms));
+                }
+                let content = if req.capture_content {
+                    let _pool = cidre::objc::AutoreleasePoolPage::push();
+                    get_clipboard().map(|s| {
+                        let truncated = truncate(&s, 1000);
+                        if req.apply_pii {
+                            remove_pii(&truncated)
+                        } else {
+                            truncated
+                        }
+                    })
+                } else {
+                    None
+                };
+                let event = clipboard_event(
+                    req.operation,
+                    content,
+                    req.start,
+                    &current_app,
+                    &current_window,
+                );
+                if let Err(err) = req.tx.try_send(event) {
+                    debug!(?err, "clipboard worker dropped event");
+                }
+            }
+        })
+        .ok();
+    clipboard_tx
+}
+
+fn clipboard_event(
+    operation: char,
+    content: Option<String>,
+    start: Instant,
+    current_app: &Arc<ArcSwap<Option<String>>>,
+    current_window: &Arc<ArcSwap<Option<String>>>,
+) -> UiEvent {
+    UiEvent {
+        id: None,
+        timestamp: Utc::now(),
+        relative_ms: start.elapsed().as_millis() as u64,
+        data: EventData::Clipboard { operation, content },
+        app_name: current_app.load().as_ref().clone(),
+        window_title: current_window.load().as_ref().clone(),
+        browser_url: None,
+        element: None,
+        frame_id: None,
+    }
+}
+
+/// Poll interval for the clipboard fallback. 750ms balances detection
+/// latency against wakeups; `changeCount` is cheap and does not read
+/// clipboard contents.
+const CLIPBOARD_POLL_INTERVAL_MS: u64 = 750;
+
+/// Granularity at which the poller's sleep checks the stop flag. Capping
+/// at 100ms bounds shutdown latency — without this, the recorder takes up
+/// to a full `CLIPBOARD_POLL_INTERVAL_MS` to exit on stop because
+/// `thread::sleep` is uninterruptible. Choose the smaller of the two so
+/// short test intervals don't get rounded up.
+const CLIPBOARD_STOP_CHECK_GRANULARITY_MS: u64 = 100;
+
+/// Operation marker for poll-detected clipboard mutations — distinguishes
+/// these from event-tap-driven 'c' (copy) / 'x' (cut) / 'v' (paste). The
+/// poller can't tell which gesture caused the change, only that one did.
+const CLIPBOARD_OP_POLLED: char = 'p';
+
+/// Polling loop that watches the pasteboard change count and fires a
+/// `ClipboardRequest` whenever the pasteboard changes.
+///
+/// Used as a fallback when the CGEventTap thread can't run (Input
+/// Monitoring not granted) and as a belt-and-suspenders trigger while the
+/// tap is running. It intentionally checks only `changeCount`; the worker
+/// reads text later only if clipboard content storage is enabled.
+///
+/// Behavior difference vs. the event-tap path: copying identical text
+/// twice usually increments the pasteboard count and fires twice here.
+/// That is what we want for workflow capture: the user's clipboard action
+/// is a semantic checkpoint even if the bytes are identical.
+fn run_clipboard_poller(
+    stop: Arc<AtomicBool>,
+    tx: Sender<UiEvent>,
+    config: UiCaptureConfig,
+    start: Instant,
+    current_app: Arc<ArcSwap<Option<String>>>,
+    current_window: Arc<ArcSwap<Option<String>>>,
+) {
+    // Seed with the current pasteboard generation so we don't fire an event for
+    // pre-existing content copied before launching the recorder.
+    let mut last_seen = get_clipboard_change_count();
+    while !stop.load(Ordering::Relaxed) {
+        // Interruptible sleep: bounded by CLIPBOARD_STOP_CHECK_GRANULARITY_MS
+        // so a stop signal mid-interval doesn't strand the thread for the
+        // full poll interval. Worst-case shutdown latency = granularity.
+        let interval = std::time::Duration::from_millis(CLIPBOARD_POLL_INTERVAL_MS);
+        let slice = std::time::Duration::from_millis(CLIPBOARD_STOP_CHECK_GRANULARITY_MS);
+        let mut waited = std::time::Duration::ZERO;
+        while waited < interval {
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let remaining = interval - waited;
+            let nap = remaining.min(slice);
+            thread::sleep(nap);
+            waited += nap;
+        }
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(current) = get_clipboard_change_count() else {
+            continue;
+        };
+
+        if last_seen == Some(current) {
+            continue;
+        }
+
+        if last_seen.is_none() {
+            last_seen = Some(current);
+            continue;
+        }
+
+        last_seen = Some(current);
+        debug!("clipboard change-count poller detected a pasteboard mutation");
+        let content = if config.capture_clipboard_content {
+            let _pool = cidre::objc::AutoreleasePoolPage::push();
+            get_clipboard().map(|s| {
+                let truncated = truncate(&s, 1000);
+                if config.apply_pii_removal {
+                    remove_pii(&truncated)
+                } else {
+                    truncated
+                }
+            })
+        } else {
+            None
+        };
+        let event = clipboard_event(
+            CLIPBOARD_OP_POLLED,
+            content,
+            start,
+            &current_app,
+            &current_window,
+        );
+        if let Err(err) = tx.try_send(event) {
+            debug!(?err, "clipboard poller dropped event");
+        } else {
+            debug!("clipboard poller emitted event");
+        }
+    }
+}
+
+fn get_clipboard_change_count() -> Option<i64> {
+    let _pool = cidre::objc::AutoreleasePoolPage::push();
+    let pasteboard = NSPasteboard::generalPasteboard();
+    Some(pasteboard.changeCount() as i64)
 }
 
 // ============================================================================
@@ -404,45 +692,27 @@ fn run_event_tap(
 
     // Single worker thread for clipboard capture — avoids spawning a thread per
     // Cmd+C/X and avoids blocking the event tap callback on Cmd+V.
-    let (clipboard_tx, clipboard_rx) = bounded::<ClipboardRequest>(4);
-    thread::Builder::new()
-        .name("clipboard-capture".into())
-        .spawn(move || {
-            while let Ok(req) = clipboard_rx.recv() {
-                if req.delay_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(req.delay_ms));
-                }
-                let content = if req.capture_content {
-                    let _pool = cidre::objc::AutoreleasePoolPage::push();
-                    get_clipboard().map(|s| {
-                        let truncated = truncate(&s, 1000);
-                        if req.apply_pii {
-                            remove_pii(&truncated)
-                        } else {
-                            truncated
-                        }
-                    })
-                } else {
-                    None
-                };
-                let event = UiEvent {
-                    id: None,
-                    timestamp: Utc::now(),
-                    relative_ms: req.start.elapsed().as_millis() as u64,
-                    data: EventData::Clipboard {
-                        operation: req.operation,
-                        content,
-                    },
-                    app_name: None,
-                    window_title: None,
-                    browser_url: None,
-                    element: None,
-                    frame_id: None,
-                };
-                let _ = req.tx.try_send(event);
-            }
-        })
-        .ok();
+    let clipboard_tx = spawn_clipboard_worker_thread(current_app.clone(), current_window.clone());
+    if config.capture_clipboard {
+        let poller_stop = stop.clone();
+        let poller_tx = tx.clone();
+        let poller_config = config.clone();
+        let poller_app = current_app.clone();
+        let poller_window = current_window.clone();
+        thread::Builder::new()
+            .name("clipboard-poller".into())
+            .spawn(move || {
+                run_clipboard_poller(
+                    poller_stop,
+                    poller_tx,
+                    poller_config,
+                    start,
+                    poller_app,
+                    poller_window,
+                );
+            })
+            .ok();
+    }
 
     let state = Box::leak(Box::new(TapState {
         tx,
@@ -700,21 +970,23 @@ extern "C" fn tap_callback(
 
             // Record key events for shortcuts
             if mods.any_modifier() {
-                let event = UiEvent {
-                    id: None,
-                    timestamp,
-                    relative_ms: t,
-                    data: EventData::Key {
-                        key_code: keycode,
-                        modifiers: mods.0,
-                    },
-                    app_name,
-                    window_title,
-                    browser_url: None,
-                    element: None,
-                    frame_id: None,
-                };
-                let _ = state.tx.try_send(event);
+                if state.config.capture_keystrokes {
+                    let event = UiEvent {
+                        id: None,
+                        timestamp,
+                        relative_ms: t,
+                        data: EventData::Key {
+                            key_code: keycode,
+                            modifiers: mods.0,
+                        },
+                        app_name,
+                        window_title,
+                        browser_url: None,
+                        element: None,
+                        frame_id: None,
+                    };
+                    let _ = state.tx.try_send(event);
+                }
             } else if state.config.capture_text {
                 // Aggregate into text buffer
                 if let Some(c) = keycode_to_char(keycode, mods) {
@@ -737,6 +1009,22 @@ extern "C" fn tap_callback(
                     };
                     let _ = state.tx.try_send(event);
                 }
+            } else if state.config.capture_keystrokes {
+                let event = UiEvent {
+                    id: None,
+                    timestamp,
+                    relative_ms: t,
+                    data: EventData::Key {
+                        key_code: keycode,
+                        modifiers: mods.0,
+                    },
+                    app_name,
+                    window_title,
+                    browser_url: None,
+                    element: None,
+                    frame_id: None,
+                };
+                let _ = state.tx.try_send(event);
             }
         }
 
@@ -1053,6 +1341,7 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
             "Unknown".to_string()
         }
     })?;
+    let bounds = get_element_bounds(&elem);
 
     // Try multiple attributes to get the element name/label
     // Different elements use different attributes for their label
@@ -1079,7 +1368,7 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
             value: None,
             description: None,
             automation_id: None,
-            bounds: None,
+            bounds,
         });
     }
 
@@ -1104,7 +1393,33 @@ fn get_element_at_position(x: f64, y: f64, config: &UiCaptureConfig) -> Option<E
         }),
         description: description.map(|s| truncate(&s, 200)),
         automation_id: None,
-        bounds: None,
+        bounds,
+    })
+}
+
+fn get_element_bounds(elem: &ax::UiElement) -> Option<ElementBounds> {
+    let pos = elem.attr_value(ax::attr::pos()).ok().and_then(|v| {
+        if v.get_type_id() == ax::Value::type_id() {
+            let ax_val: &ax::Value = unsafe { std::mem::transmute(&*v) };
+            ax_val.cg_point().map(|p| (p.x, p.y))
+        } else {
+            None
+        }
+    })?;
+    let size = elem.attr_value(ax::attr::size()).ok().and_then(|v| {
+        if v.get_type_id() == ax::Value::type_id() {
+            let ax_val: &ax::Value = unsafe { std::mem::transmute(&*v) };
+            ax_val.cg_size().map(|s| (s.width, s.height))
+        } else {
+            None
+        }
+    })?;
+
+    Some(ElementBounds {
+        x: pos.0,
+        y: pos.1,
+        width: size.0,
+        height: size.1,
     })
 }
 
@@ -1155,6 +1470,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
             "Unknown".to_string()
         }
     })?;
+    let bounds = get_element_bounds(elem);
 
     // Get element name/label
     let name = get_string_attr(elem, ax::attr::title())
@@ -1169,7 +1485,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
             value: None,
             description: None,
             automation_id: None,
-            bounds: None,
+            bounds,
         });
     }
 
@@ -1198,7 +1514,7 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
         }),
         description: None,
         automation_id: None,
-        bounds: None,
+        bounds,
     })
 }
 
@@ -1222,12 +1538,16 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
 // The dead-man-switch below is kept as defense-in-depth: even with main-
 // thread dispatch, a future macOS regression or a bug in AppKit/arboard
 // could still SIGSEGV the read. SIGSEGV can't be caught in-process, so we
-// write a marker file before each read and delete it after. On startup, if
-// the marker exists, we know the previous run crashed mid-read and we
-// disable clipboard capture permanently for this install. The user can
-// re-enable by deleting `~/.screenpipe/clipboard-disabled-after-crash`.
+// write an inflight marker before each read and delete it after. On startup,
+// if the marker exists, the previous run crashed mid-read: we disable
+// clipboard capture for THIS session only and retry next launch. A
+// persistent crash will be obvious in logs (every other launch fails) and
+// addressable, rather than silently killing the feature forever.
 const CLIPBOARD_INFLIGHT_FILE: &str = "clipboard-read-inflight";
-const CLIPBOARD_DISABLED_FILE: &str = "clipboard-disabled-after-crash";
+// Legacy marker from a previous design that permanently disabled clipboard
+// capture after a single crash and required `rm` to recover. We auto-delete
+// it on startup so upgraded installs recover without manual intervention.
+const CLIPBOARD_LEGACY_DISABLED_FILE: &str = "clipboard-disabled-after-crash";
 
 static CLIPBOARD_DISABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -1237,26 +1557,22 @@ fn check_clipboard_crash_marker() {
     CLIPBOARD_CRASH_CHECK.call_once(|| {
         let dir = screenpipe_core::paths::default_screenpipe_data_dir();
         let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
-        let disabled = dir.join(CLIPBOARD_DISABLED_FILE);
+        let legacy_disabled = dir.join(CLIPBOARD_LEGACY_DISABLED_FILE);
 
-        if disabled.exists() {
-            CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!(
-                "clipboard capture disabled — prior NSPasteboard crash detected. \
-                 delete {} to re-enable",
-                disabled.display()
+        if legacy_disabled.exists() {
+            let _ = std::fs::remove_file(&legacy_disabled);
+            tracing::info!(
+                "clipboard capture: cleared legacy permanent-disable marker; \
+                 clipboard reads will resume this session"
             );
-            // Best-effort cleanup of any stale inflight marker
-            let _ = std::fs::remove_file(&inflight);
-        } else if inflight.exists() {
-            // Previous run died mid-clipboard read — promote to permanent disable.
+        }
+
+        if inflight.exists() {
             CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
-            let _ = std::fs::write(&disabled, "");
             let _ = std::fs::remove_file(&inflight);
             tracing::warn!(
-                "clipboard capture disabled for this session — previous run crashed \
-                 during NSPasteboard read. delete {} to re-enable",
-                disabled.display()
+                "clipboard capture disabled for this session — previous run \
+                 crashed during NSPasteboard read. will retry on next launch."
             );
         }
     });
@@ -1309,7 +1625,13 @@ fn truncate(s: &str, max: usize) -> String {
 // ============================================================================
 
 fn keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
-    layout_keycode_to_char(keycode, mods).or_else(|| us_keycode_to_char(keycode, mods))
+    // macOS 26.5 asserts if Text Input Source APIs are called from the event-tap thread.
+    let layout_char = if unsafe { pthread_main_np() != 0 } {
+        layout_keycode_to_char(keycode, mods)
+    } else {
+        None
+    };
+    layout_char.or_else(|| us_keycode_to_char(keycode, mods))
 }
 
 fn layout_keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {

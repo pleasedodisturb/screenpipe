@@ -10,7 +10,7 @@ import { Switch } from "@/components/ui/switch";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Sparkles } from "lucide-react";
+import { Rocket, Moon, Sun, Monitor, FlaskConical, ExternalLink, Layers, RefreshCw, MessageSquare, Sparkles } from "lucide-react";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
@@ -19,15 +19,68 @@ import { getVersion } from "@tauri-apps/api/app";
 import { commands } from "@/lib/utils/tauri";
 import { UpdateBanner } from "@/components/update-banner";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import {
+  DEFAULT_ENTERPRISE_APP_UPDATE_POLICY,
+  describeEnterpriseUpdateMode,
+  normalizeEnterpriseAppUpdatePolicy,
+} from "@ee/lib/app-update-policy";
 
 export default function GeneralSettings() {
   const isEnterprise = useIsEnterpriseBuild();
   const { settings, updateSettings } = useSettings();
   const { toast } = useToast();
   const [currentVersion, setCurrentVersion] = useState<string | null>(null);
-  const [availableVersions, setAvailableVersions] = useState<string[]>([]);
-  const [isRollingBack, setIsRollingBack] = useState(false);
-  const [showVersions, setShowVersions] = useState(false);
+  const [isCheckingForUpdate, setIsCheckingForUpdate] = useState(false);
+
+  const handleCheckForUpdates = async () => {
+    setIsCheckingForUpdate(true);
+    try {
+      const pendingRes = await commands.getPendingUpdate();
+      if (pendingRes.status === "ok" && pendingRes.data) {
+        const pending = pendingRes.data;
+        if (pending.auth_required) {
+          toast({
+            title: "update available",
+            description: `v${pending.version} is available — sign in to download it`,
+          });
+          return;
+        }
+
+        if (pending.downloaded) {
+          toast({
+            title: "update ready",
+            description: `v${pending.version} is ready — restart to update`,
+          });
+          return;
+        }
+
+        toast({
+          title: "update found",
+          description: `v${pending.version} is still downloading in the background`,
+        });
+        return;
+      }
+
+      const res = await commands.triggerUpdateCheck();
+      if (res.status === "error") throw new Error(res.error);
+      const updateFound = res.data;
+      toast({
+        title: updateFound ? "update found" : "you're up to date",
+        description: updateFound
+          ? "downloading in the background — banner will appear when ready"
+          : `running latest version${currentVersion ? ` (v${currentVersion})` : ""}`,
+      });
+    } catch (e: any) {
+      toast({
+        title: "update check failed",
+        description: e?.toString() || "please try again later",
+        variant: "destructive",
+      });
+    } finally {
+      setIsCheckingForUpdate(false);
+    }
+  };
 
   useEffect(() => {
     getVersion().then(setCurrentVersion).catch(() => {});
@@ -39,46 +92,61 @@ export default function GeneralSettings() {
     }
   };
 
-  const fetchVersions = async () => {
-    if (availableVersions.length > 0) {
-      setShowVersions(!showVersions);
-      return;
-    }
+  const handleAutoStartChange = async (checked: boolean) => {
+    handleSettingsChange({ autoStartEnabled: checked });
     try {
-      const { arch, type: osType } = await import("@tauri-apps/plugin-os").then(m => ({ arch: m.arch(), type: m.type() }));
-      let targetArch = "darwin-aarch64";
-      if (osType === "macos") targetArch = arch === "x86_64" ? "darwin-x86_64" : "darwin-aarch64";
-      else if (osType === "windows") targetArch = "windows-x86_64";
-
-      const resp = await fetch(`https://screenpi.pe/api/app-update/versions/${targetArch}`);
-      if (!resp.ok) throw new Error("failed to fetch versions");
-      const data = await resp.json();
-      const versions = (data.versions || []).filter((v: string) => v !== currentVersion);
-      setAvailableVersions(versions);
-      setShowVersions(true);
+      await commands.setAutostart(checked);
+      toast({
+        title: checked ? "auto-start enabled" : "auto-start disabled",
+        description: checked
+          ? "screenpipe will launch when your computer starts"
+          : "screenpipe won't launch at startup",
+      });
     } catch (e: any) {
-      toast({ title: "failed to load versions", description: e?.toString(), variant: "destructive" });
+      handleSettingsChange({ autoStartEnabled: !checked });
+      toast({
+        title: "failed to update auto-start",
+        description: e?.toString() || "check system permissions and try again",
+        variant: "destructive",
+      });
     }
   };
+  const enterpriseAppUpdatePolicy = normalizeEnterpriseAppUpdatePolicy(
+    settings?.enterpriseAppUpdatePolicy || DEFAULT_ENTERPRISE_APP_UPDATE_POLICY
+  );
+  const enterpriseInstallMetadata = settings?.enterpriseInstallMetadata;
 
-  const handleRollback = async (version: string) => {
-    if (isRollingBack) return;
-    setIsRollingBack(true);
+  const getDesktopPlatform = async () => {
     try {
-      toast({
-        title: "downloading...",
-        description: `installing v${version}. this is at your own risk — db migrations are not reversed.`,
-        duration: 10000,
-      });
-      const result = await commands.rollbackToVersion(version);
-      if (result.status === "error") throw new Error(result.error);
+      const { arch, type: osType } = await import("@tauri-apps/plugin-os").then(m => ({ arch: m.arch(), type: m.type() }));
+      if (osType === "macos") return arch === "x86_64" ? "darwin-x86_64" : "darwin-aarch64";
+      if (osType === "windows") return "windows-x86_64";
+      if (osType === "linux") return "linux-x86_64";
+    } catch {
+      return null;
+    }
+    return null;
+  };
+
+  const handleOpenVersions = async () => {
+    const params = new URLSearchParams({ source: "desktop" });
+    if (currentVersion) params.set("app_version", currentVersion);
+
+    const platform = await getDesktopPlatform();
+    if (platform) params.set("platform", platform);
+
+    const path = isEnterprise ? "/enterprise" : "/account/versions";
+    if (isEnterprise) params.set("tab", "builds");
+    const url = `https://screenpipe.com${path}?${params.toString()}`;
+
+    try {
+      await openUrl(url);
     } catch (e: any) {
-      setIsRollingBack(false);
+      window.open(url, "_blank");
       toast({
-        title: "rollback failed",
-        description: e?.toString() || "unknown error",
+        title: "opened in browser",
+        description: e?.toString() || "check your browser for version downloads",
         variant: "destructive",
-        duration: 5000,
       });
     }
   };
@@ -108,9 +176,7 @@ export default function GeneralSettings() {
               <Switch
                 id="auto-start-toggle"
                 checked={settings?.autoStartEnabled ?? false}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({ autoStartEnabled: checked })
-                }
+                onCheckedChange={handleAutoStartChange}
                 className="ml-4"
               />
             </div>
@@ -126,12 +192,67 @@ export default function GeneralSettings() {
                   <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
                     <h3 className="text-sm font-medium text-foreground">Auto-update</h3>
-                    <p className="text-xs text-muted-foreground">Install updates automatically</p>
+                    <p className="text-xs text-muted-foreground">Restart automatically when an update is downloaded. Off: a "restart to update" banner appears instead.</p>
                   </div>
                 </div>
                 <Switch
                   id="auto-update-toggle"
-                  checked={settings?.autoUpdate ?? true}
+                  checked={settings?.autoUpdate ?? false}
+                  onCheckedChange={(checked) =>
+                    handleSettingsChange({ autoUpdate: checked })
+                  }
+                  className="ml-4"
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {!isEnterprise && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground">Check for updates</h3>
+                    <p className="text-xs text-muted-foreground">
+                      {currentVersion ? `Running v${currentVersion}` : "Look for a new version now"}
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleCheckForUpdates}
+                  disabled={isCheckingForUpdate}
+                  className="ml-4 h-8"
+                >
+                  {isCheckingForUpdate ? "checking..." : "check now"}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {isEnterprise && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="flex items-center space-x-2.5">
+                  <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground">App updates</h3>
+                    <p className="text-xs text-muted-foreground">
+                      {describeEnterpriseUpdateMode(enterpriseAppUpdatePolicy)}
+                      {enterpriseInstallMetadata?.managed ? " · managed device detected" : ""}
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  id="enterprise-auto-update-toggle"
+                  checked={settings?.autoUpdate ?? enterpriseAppUpdatePolicy.default_auto_update}
+                  disabled={!enterpriseAppUpdatePolicy.allow_employee_override}
                   onCheckedChange={(checked) =>
                     handleSettingsChange({ autoUpdate: checked })
                   }
@@ -195,55 +316,58 @@ export default function GeneralSettings() {
           </CardContent>
         </Card>
 
-        {!isEnterprise && (
-          <Card className="border-border bg-card">
-            <CardContent className="px-3 py-2.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center space-x-2.5">
-                  <Undo2 className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div>
-                    <h3 className="text-sm font-medium text-foreground">
-                      Version{currentVersion ? ` ${currentVersion}` : ""}
-                    </h3>
-                    <p className="text-xs text-muted-foreground">
-                      Install a previous version (at your own risk)
-                    </p>
-                  </div>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={fetchVersions}
-                  disabled={isRollingBack}
-                  className="ml-4 h-7 text-xs"
-                >
-                  {isRollingBack ? "installing..." : showVersions ? "hide" : "show versions"}
-                </Button>
-              </div>
-              {showVersions && availableVersions.length > 0 && (
-                <div className="mt-3 space-y-1 border-t pt-2">
-                  <p className="text-[10px] text-muted-foreground mb-2">
-                    ⚠️ database migrations are not reversed. use at your own risk.
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Auto-generate chat titles</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Name new chats with the AI after your first message. Turn off to save tokens.
                   </p>
-                  {availableVersions.map((v) => (
-                    <div key={v} className="flex items-center justify-between py-0.5">
-                      <span className="text-xs text-muted-foreground">v{v}</span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleRollback(v)}
-                        disabled={isRollingBack}
-                        className="h-6 text-[11px] px-2"
-                      >
-                        install
-                      </Button>
-                    </div>
-                  ))}
                 </div>
-              )}
-            </CardContent>
-          </Card>
-        )}
+              </div>
+              <Switch
+                id="auto-generate-chat-titles-toggle"
+                checked={settings?.autoGenerateChatTitles !== false}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ autoGenerateChatTitles: checked })
+                }
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <ExternalLink className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">
+                    Version{currentVersion ? ` ${currentVersion}` : ""}
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {isEnterprise
+                      ? "Open builds managed by your organization"
+                      : "Open recent stable versions on screenpipe.com"}
+                  </p>
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleOpenVersions}
+                className="ml-4 h-7 text-xs gap-1.5"
+              >
+                open
+                <ExternalLink className="h-3 w-3" />
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
 
       </div>
 
@@ -281,3 +405,4 @@ export default function GeneralSettings() {
     </div>
   );
 }
+

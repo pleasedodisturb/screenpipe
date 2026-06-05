@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+screenpipe captures accessibility trees, with OCR as fallback and conversations, and index them for AI consumption locally
+
+it provides the context layer to allow the upcoming singularity to maximize civilization economic growth  
+
 ## Product vision
 Read `VISION.md` before making product decisions, adding features, or changing UX. Stability over features. Activation over new capabilities. No feature creep.
 
@@ -22,15 +26,14 @@ Use `#` for Python, `//` for Rust/TS/JS/Swift. Keep it as the first comment in t
 - Use `bun` for JS/TS (not npm or pnpm)
 - Use `cargo` for Rust
 
-## Key Directories
-- `apps/screenpipe-app-tauri/` - Desktop app (Tauri + Next.js)
-- `crates/screenpipe-server/` - Core backend (Rust)
-- `crates/screenpipe-audio/` - Audio capture/transcription (Rust)
-- `crates/screenpipe-vision/` - Screen capture/accessibility text (OCR fallback) (Rust)
-
 ## Testing
 - `cargo test` for Rust
 - `bun test` for JS/TS
+- **Tauri TypeScript bindings** (from `apps/screenpipe-app-tauri/`):
+  - `bun run bindings:check` — fail if `lib/utils/tauri.ts` drifted from Rust surface
+  - `bun run bindings:generate` — regenerate `lib/utils/tauri.ts` after adding or changing commands
+  - Commands need **both** `#[tauri::command]` and `#[specta::specta]`; without the latter the command is silently excluded from `tauri.ts`
+  - Commands are auto-collected via the `tauri-helper` crate
 - **Regression checklist**: `TESTING.md` — must-read before changing window management, tray/dock, monitors, audio, or Apple Intelligence. Lists every edge case that has caused regressions with commit references.
 - regularly check ci/cd which runs automated tests to verify if we broke something or not
 

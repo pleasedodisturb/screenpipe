@@ -37,8 +37,133 @@ export interface MeetingAudioChunk {
   audioFilePath: string;
   speakerId: number | null;
   speakerName: string;
+  deviceType: string;
+  isInput: boolean;
   transcription: string;
   timestamp: string;
+  source?: "background" | "live";
+}
+
+interface MeetingTranscriptSegment {
+  id: number;
+  meetingId: number;
+  source?: "background" | "live";
+  provider: string;
+  model?: string | null;
+  itemId: string;
+  deviceName: string;
+  deviceType: string;
+  audioTranscriptionId?: number | null;
+  audioChunkId?: number | null;
+  audioFilePath?: string | null;
+  speakerId?: number | null;
+  speakerName?: string | null;
+  transcript: string;
+  capturedAt: string;
+}
+
+function timestampMs(iso: string): number {
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function isGenericMeetingTitle(title: string | null | undefined, meetingApp: string | null | undefined): boolean {
+  const normalizedTitle = title?.trim().toLowerCase();
+  if (!normalizedTitle) return true;
+  if (["untitled", "untitled meeting", "meeting"].includes(normalizedTitle)) {
+    return true;
+  }
+
+  const normalizedApp = meetingApp?.trim().toLowerCase();
+  if (normalizedApp && normalizedTitle === normalizedApp) {
+    return true;
+  }
+
+  return false;
+}
+
+function formatMeetingLabelTime(iso: string): string {
+  return new Date(iso)
+    .toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+    .replace(",", "");
+}
+
+export function buildMeetingSummarizeDisplayLabel(meeting: MeetingRecord): string {
+  const title = meeting.title?.trim();
+  if (!isGenericMeetingTitle(title, meeting.meeting_app) && title) {
+    return `Summarize meeting: ${title}`;
+  }
+
+  const app = meeting.meeting_app?.trim();
+  const formattedTime = formatMeetingLabelTime(meeting.meeting_start);
+  if (app && app.toLowerCase() !== "manual") {
+    return `Summarize ${app} meeting: ${formattedTime}`;
+  }
+
+  return `Summarize meeting: ${formattedTime}`;
+}
+
+function sortAudioChunks(chunks: MeetingAudioChunk[]): MeetingAudioChunk[] {
+  return [...chunks].sort((a, b) => {
+    const byTime = timestampMs(a.timestamp) - timestampMs(b.timestamp);
+    if (byTime !== 0) return byTime;
+    const rank = (source?: string) => (source === "live" ? 0 : 1);
+    const bySource = rank(a.source) - rank(b.source);
+    if (bySource !== 0) return bySource;
+    return a.audioChunkId - b.audioChunkId;
+  });
+}
+
+interface SpeakerTurn {
+  speakerName: string;
+  /** Timestamp of the first chunk in this turn — used for display. */
+  timestamp: string;
+  /** Timestamp of the most recent chunk merged in — used to gate further
+   *  merging. Comparing against the first chunk would let arbitrarily long
+   *  turns swallow new turns as long as adjacent chunks stay close. */
+  lastTimestamp: string;
+  text: string;
+}
+
+/**
+ * Collapse a sorted chunk stream into speaker turns. The live engine writes
+ * one row per ~2-3 s VAD chunk; without grouping, a 30-minute meeting becomes
+ * 500+ single-word lines that drown the summarize prompt. Two consecutive
+ * chunks fold into the same turn when they share a speaker label and the gap
+ * between them is under 10 s. The 10 s window is long enough to bridge a
+ * thinking pause, short enough to start a new turn after a real exchange.
+ */
+function groupConsecutiveSpeakerTurns(
+  chunks: MeetingAudioChunk[],
+): SpeakerTurn[] {
+  const MAX_GAP_MS = 10_000;
+  const turns: SpeakerTurn[] = [];
+  for (const c of chunks) {
+    const speakerName = c.speakerName ?? "";
+    const text = c.transcription.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const last = turns[turns.length - 1];
+    const gap = last
+      ? timestampMs(c.timestamp) - timestampMs(last.lastTimestamp)
+      : Infinity;
+    if (last && last.speakerName === speakerName && gap < MAX_GAP_MS) {
+      last.text = `${last.text} ${text}`;
+      last.lastTimestamp = c.timestamp;
+    } else {
+      turns.push({
+        speakerName,
+        timestamp: c.timestamp,
+        lastTimestamp: c.timestamp,
+        text,
+      });
+    }
+  }
+  return turns;
 }
 
 export interface SpeakerSummary {
@@ -96,7 +221,7 @@ export async function fetchActivitySummary(
   const { start, end } = rangeFor(meeting);
   try {
     const res = await localFetch(
-      `/activity-summary?start_time=${encodeURIComponent(start)}&end_time=${encodeURIComponent(end)}`,
+      `/activity-summary?start_time=${encodeURIComponent(start)}&end_time=${encodeURIComponent(end)}&include_memories=false&include_snippets=false&include_recording=false&include_guidance=false`,
     );
     if (!res.ok) return null;
     return (await res.json()) as ActivitySummary;
@@ -232,6 +357,11 @@ export function pathFromUrl(url: string): string {
 interface SummarizeInput {
   meeting: MeetingRecord;
   context: MeetingContext;
+  transcript?: MeetingAudioChunk[] | null;
+  /** Image data URLs extracted from the user's meeting note and attached to
+   * the chat turn. Used only to tell the model that placeholders in `notes:`
+   * have corresponding images. */
+  noteImages?: string[] | null;
   /** Replace the built-in directive with the body of a user-chosen summary
    * pipe (e.g. one selected from the Meeting summary pipe picker). The
    * meeting id is prepended so the pipe body doesn't have to look it up. */
@@ -247,6 +377,8 @@ interface SummarizeInput {
 export function buildEnrichedSummarizePrompt({
   meeting,
   context,
+  transcript,
+  noteImages,
   directiveOverride,
 }: SummarizeInput): string {
   const start = new Date(meeting.meeting_start);
@@ -261,9 +393,18 @@ export function buildEnrichedSummarizePrompt({
   ];
   if (meeting.title) meetingLines.push(`title: ${meeting.title}`);
   if (meeting.attendees) meetingLines.push(`attendees: ${meeting.attendees}`);
-  if (meeting.note) meetingLines.push(`notes: ${meeting.note}`);
+  if (meeting.note) {
+    meetingLines.push(`notes: ${replaceNoteImageDataUrlsWithPlaceholders(meeting.note)}`);
+  }
 
   const sections: string[] = [`meeting:\n${meetingLines.join("\n")}`];
+  const attachedNoteImageCount =
+    noteImages?.length ?? extractImageDataUrlsFromMarkdown(meeting.note).length;
+  if (attachedNoteImageCount > 0) {
+    sections.push(
+      `meeting note images:\n${attachedNoteImageCount} image${attachedNoteImageCount === 1 ? "" : "s"} from the user's notes are attached to this chat message. use them as part of the meeting-note context when summarizing.`,
+    );
+  }
 
   const a = context.activity;
   if (a) {
@@ -298,7 +439,10 @@ export function buildEnrichedSummarizePrompt({
       );
     }
 
-    if (a.audio_summary.top_transcriptions.length > 0) {
+    if (
+      !transcript?.length &&
+      a.audio_summary.top_transcriptions.length > 0
+    ) {
       const lines = a.audio_summary.top_transcriptions.slice(0, 8).map((t) => {
         const ts = formatTimeShort(t.timestamp);
         const txt = t.transcription.replace(/\s+/g, " ").trim().slice(0, 240);
@@ -307,6 +451,14 @@ export function buildEnrichedSummarizePrompt({
       });
       sections.push(`top transcript fragments:\n${lines.join("\n")}`);
     }
+  }
+
+  const transcriptText = renderTranscript(transcript ?? null, null);
+  if (transcriptText) {
+    const segmentCount = transcript?.length ?? 0;
+    sections.push(
+      `meeting transcript (chronological${segmentCount > 0 ? `, ${segmentCount} segments` : ""}):\n${transcriptText}`,
+    );
   }
 
   if (context.clipboardCount > 0) {
@@ -322,6 +474,39 @@ export function buildEnrichedSummarizePrompt({
     : buildMeetingSummarizeInstructions(meeting.id, { followUpAsk: true });
 
   return `${directive}\n\n${sections.join("\n\n")}`;
+}
+
+export function extractImageDataUrlsFromMarkdown(
+  markdown: string | null | undefined,
+  limit = 8,
+): string[] {
+  if (!markdown) return [];
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  for (const match of markdown.matchAll(markdownImageDataUrlRegex())) {
+    const url = match[2];
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+    if (urls.length >= limit) break;
+  }
+  return urls;
+}
+
+function replaceNoteImageDataUrlsWithPlaceholders(markdown: string): string {
+  let index = 0;
+  return markdown.replace(markdownImageDataUrlRegex(), (_match, alt: string) => {
+    index += 1;
+    const label = alt.trim();
+    return label
+      ? `[attached image ${index}: ${label}]`
+      : `[attached image ${index}]`;
+  });
+}
+
+function markdownImageDataUrlRegex(): RegExp {
+  return /!\[([^\]]*)\]\(\s*(data:image\/[^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/gi;
 }
 
 /**
@@ -344,9 +529,11 @@ export function buildMeetingSummarizeInstructions(
     `search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items.`,
     ``,
     `meeting id: ${meetingId}`,
+    `primary transcript source: GET "http://localhost:3030/meetings/${meetingId}/transcript" and use each row's "transcript", "speakerName", "capturedAt", and "source" fields. sort rows by capturedAt before summarizing.`,
+    `fallback transcript source: /search?content_type=audio for the meeting time window. audio rows use content.transcription (not content.text); content.text may be missing for audio and should not be treated as an empty transcript.`,
     `if your summary is worth saving, append it to the meeting note (and refresh the title in the same call) via:`,
     `  curl -s -X PATCH "http://localhost:3030/meetings/${meetingId}" \\`,
-    `    -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" \\`,
+    `    -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \\`,
     `    -H "Content-Type: application/json" \\`,
     `    -d '{"title": "<NEW_TITLE_OR_OMIT>", "note": "<EXISTING_NOTE>\\n\\n## Summary\\n<YOUR_SUMMARY>"}'`,
     `replace <EXISTING_NOTE> with the meeting's current notes (shown above as "notes:" — empty string if none) so you don't overwrite the user's work; just append your summary under a "## Summary" heading. for the title: if the current "title:" is missing, generic ("untitled", "meeting", just the app name) or doesn't capture what actually happened, replace it with a 5-8 word plain-english title (no quotes, no "meeting about…" prefix) — otherwise omit the field so a user-set title is left alone. if there's nothing useful to summarize (empty transcript, irrelevant audio), say so out loud and skip the PATCH — don't write a placeholder.`,
@@ -493,15 +680,14 @@ function renderTranscript(
   activity: ActivitySummary | null,
 ): string {
   if (full && full.length > 0) {
-    return full
-      .map((c) => {
-        const ts = formatTimeShort(c.timestamp);
+    return groupConsecutiveSpeakerTurns(sortAudioChunks(full))
+      .map((g) => {
+        const ts = formatTimeShort(g.timestamp);
         const sp =
-          c.speakerName && c.speakerName !== "unknown"
-            ? `[${c.speakerName}] `
+          g.speakerName && g.speakerName !== "unknown"
+            ? `[${g.speakerName}] `
             : "";
-        const txt = c.transcription.replace(/\s+/g, " ").trim();
-        return `- ${ts} ${sp}${txt}`;
+        return `- ${ts} ${sp}${g.text}`;
       })
       .join("\n");
   }
@@ -596,6 +782,7 @@ interface SearchAudioItem {
     transcription?: string;
     timestamp?: string;
     file_path?: string;
+    device_type?: string;
     speaker?: { id?: number; name?: string } | null;
   };
 }
@@ -611,9 +798,12 @@ export async function fetchMeetingAudio(
   startIso: string,
   endIso: string,
   cap = 1000,
+  meetingId?: number,
 ): Promise<MeetingAudioChunk[]> {
+  const routedRows = await fetchRoutedMeetingTranscript(meetingId, cap);
+
   const out: MeetingAudioChunk[] = [];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   const pageSize = 200;
   let offset = 0;
   for (let page = 0; page < 10 && out.length < cap; page++) {
@@ -629,16 +819,23 @@ export async function fetchMeetingAudio(
         const c = item.content;
         if (!c) continue;
         const id = c.chunk_id;
-        if (typeof id !== "number" || seen.has(id)) continue;
+        if (typeof id !== "number") continue;
         if (!c.transcription || !c.timestamp || !c.file_path) continue;
-        seen.add(id);
+        const rowKey = `${id}:${c.timestamp}:${c.transcription}`;
+        if (seen.has(rowKey)) continue;
+        const deviceType = c.device_type ?? "";
+        const isInput = deviceType.toLowerCase() === "input";
+        seen.add(rowKey);
         out.push({
           audioChunkId: id,
           audioFilePath: c.file_path,
-          speakerId: c.speaker?.id ?? null,
-          speakerName: c.speaker?.name ?? "unknown",
+          speakerId: isInput ? null : c.speaker?.id ?? null,
+          speakerName: isInput ? "me" : c.speaker?.name ?? "",
+          deviceType,
+          isInput,
           transcription: c.transcription,
           timestamp: c.timestamp,
+          source: "background",
         });
       }
       if (items.length < pageSize) break;
@@ -647,8 +844,75 @@ export async function fetchMeetingAudio(
       break;
     }
   }
-  out.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  return mergeMeetingAudioChunks(routedRows, out, cap);
+}
+
+function mergeMeetingAudioChunks(
+  liveRows: MeetingAudioChunk[],
+  backgroundRows: MeetingAudioChunk[],
+  cap: number,
+): MeetingAudioChunk[] {
+  const merged = sortAudioChunks([...liveRows, ...backgroundRows]);
+  const seen = new Set<string>();
+  const out: MeetingAudioChunk[] = [];
+
+  for (const chunk of merged) {
+    // /search returns DeviceType as "Input"/"Output" (PascalCase enum), while
+    // /meetings/:id/transcript returns the raw DB column "input"/"output".
+    // Lowercase both so the same chunk pulled from both endpoints collapses.
+    const key = [
+      Math.round(timestampMs(chunk.timestamp) / 1000),
+      chunk.deviceType.toLowerCase(),
+      chunk.speakerName,
+      chunk.transcription.replace(/\s+/g, " ").trim().toLowerCase(),
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(chunk);
+    if (out.length >= cap) break;
+  }
+
   return out;
+}
+
+async function fetchRoutedMeetingTranscript(
+  meetingId: number | undefined,
+  cap: number,
+): Promise<MeetingAudioChunk[]> {
+  if (typeof meetingId !== "number" || !Number.isFinite(meetingId)) return [];
+
+  try {
+    const res = await localFetch(`/meetings/${meetingId}/transcript`);
+    if (!res.ok) return [];
+    const body = (await res.json()) as MeetingTranscriptSegment[];
+    return body
+      .slice(0, cap)
+      .filter((segment) => segment.transcript?.trim() && segment.capturedAt)
+      .map((segment) => {
+        const deviceType = segment.deviceType ?? "";
+        const isInput = deviceType.toLowerCase() === "input";
+        const source = segment.source ?? "live";
+        return {
+          audioChunkId:
+            typeof segment.audioChunkId === "number"
+              ? segment.audioChunkId
+              : -segment.id,
+          audioFilePath: segment.audioFilePath ?? "",
+          speakerId: isInput ? null : segment.speakerId ?? null,
+          speakerName: isInput
+            ? "me"
+            : segment.speakerName?.trim() || "speaker",
+          deviceType,
+          isInput,
+          transcription: segment.transcript,
+          timestamp: segment.capturedAt,
+          source,
+        };
+      })
+      .sort((a, b) => timestampMs(a.timestamp) - timestampMs(b.timestamp));
+  } catch {
+    return [];
+  }
 }
 
 /**

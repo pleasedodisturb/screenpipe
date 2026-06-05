@@ -112,12 +112,173 @@ fn get_target_arch() -> &'static str {
 pub fn is_source_build(_app: &tauri::AppHandle) -> bool {
     // The official-build feature is only enabled during CI releases
     // Source builds will not have this feature enabled
-    !cfg!(feature = "official-build")
+    !cfg!(feature = "official-build") && !cfg!(feature = "enterprise-build")
 }
 
 /// Enterprise build: updates are managed by IT (Intune/RoboPack), not in-app.
 pub fn is_enterprise_build(_app: &tauri::AppHandle) -> bool {
     cfg!(feature = "enterprise-build")
+}
+
+fn enterprise_app_update_policy(app: &tauri::AppHandle) -> Option<serde_json::Value> {
+    SettingsStore::get(app)
+        .ok()
+        .flatten()
+        .and_then(|settings| settings.extra.get("enterpriseAppUpdatePolicy").cloned())
+}
+
+fn enterprise_update_mode(app: &tauri::AppHandle) -> Option<String> {
+    enterprise_app_update_policy(app)
+        .and_then(|policy| {
+            policy
+                .get("mode")
+                .and_then(|mode| mode.as_str())
+                .map(str::to_string)
+        })
+        .map(|mode| mode.to_lowercase())
+}
+
+fn enterprise_updates_managed_locally(app: &tauri::AppHandle) -> bool {
+    let metadata = crate::enterprise_install_metadata::get_enterprise_install_metadata();
+    match enterprise_update_mode(app).as_deref() {
+        Some("screenpipe") => false,
+        Some("auto_detect") => metadata.managed,
+        Some("mdm") | Some("manual") => true,
+        // Missing/unknown policy → behave like a new org with the consumer
+        // banner flow. Existing orgs are explicitly pinned to "manual" via
+        // the website migration so they hit the arm above, not this one.
+        _ => false,
+    }
+}
+
+/// Snapshot of a pending update, exposed to the frontend via
+/// `get_pending_update`. The banner queries this on mount so it can hydrate
+/// state even when the `update-available` event fires before React mounts.
+#[derive(Clone, serde::Serialize, specta::Type)]
+pub struct PendingUpdateSnapshot {
+    pub version: String,
+    pub body: String,
+    /// True once the bundle is downloaded and the app is ready to restart.
+    pub downloaded: bool,
+    /// True when download failed with 401/403 — user must sign in.
+    pub auth_required: bool,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Restart gate (#3622)
+//
+// Every code path that culminates in `process::exit` — the auto-update
+// restart, banner-triggered relaunch, rollback restart — must wait for
+// `ServerCore::start` to reach the "ready" phase first. Otherwise the OS
+// runs onnxruntime's C++ static destructors while `AudioManager::new` is
+// still mid-`create_session` on the server worker thread, and the global
+// DataTypeRegistry gets torn down under the still-running PlannerImpl,
+// segfaulting at 0x2c8. Stack: #3557. Sentry can't see this crash because
+// the Rust SDK dies before the event ships.
+//
+// `await_restart_gate` is the single internal entry point; the
+// `await_safe_restart` Tauri command exposes it to the frontend banner.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Outcome of `await_restart_gate`. Callers branch on this rather than a
+/// bool so an "errored" startup is never confused with a "ready" one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestartGate {
+    /// Boot reached the "ready" phase — safe to call `process::exit` /
+    /// `app.restart()` / `download_and_install` on Windows.
+    Proceed,
+    /// Boot reached the "error" phase. Restarting won't fix it; defer
+    /// and let the user investigate the boot failure first.
+    Errored,
+    /// Boot was still pending when the timeout elapsed. Defer; the next
+    /// restart trigger (next periodic check, user action) will retry.
+    DeferPending,
+}
+
+impl RestartGate {
+    pub fn proceed(self) -> bool {
+        matches!(self, RestartGate::Proceed)
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            RestartGate::Proceed => "proceed",
+            RestartGate::Errored => "errored",
+            RestartGate::DeferPending => "pending",
+        }
+    }
+}
+
+/// Cap for the auto-update restart wait. Production boot is well under a
+/// minute even on cold installs; a 5-minute cap covers slow first-time
+/// model downloads and large DB migrations without holding the CheckGuard
+/// forever on a stuck startup.
+const AUTO_UPDATE_GATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// Frontend (banner) cap. Shorter than the internal one because the user
+/// is actively waiting after a click — better to surface "still starting,
+/// try again" than to block the click indefinitely.
+const BANNER_GATE_TIMEOUT_SECS: u64 = 60;
+
+/// Wait for boot to reach "ready" or "error", with timeout. Logs the
+/// outcome with `label` so deferrals are searchable in support logs.
+pub async fn await_restart_gate(timeout: Duration, label: &str) -> RestartGate {
+    let outcome = crate::health::wait_for_boot_ready(timeout).await;
+    match outcome {
+        crate::health::BootReadiness::Ready => RestartGate::Proceed,
+        crate::health::BootReadiness::Errored => {
+            warn!(
+                "{}: boot phase is 'error' — deferring restart (won't help) (#3622)",
+                label
+            );
+            RestartGate::Errored
+        }
+        crate::health::BootReadiness::Pending => {
+            warn!(
+                "{}: boot phase still pending after {}s — deferring restart to avoid \
+                 onnxruntime teardown race (#3622). current phase: {}",
+                label,
+                timeout.as_secs(),
+                crate::health::get_boot_phase_snapshot().phase
+            );
+            RestartGate::DeferPending
+        }
+    }
+}
+
+/// Frontend-callable gate. The banner awaits this before calling
+/// `downloadAndInstall` (Windows: triggers process::exit internally) or
+/// `relaunch`. Returns one of `"proceed"`, `"errored"`, or `"pending"`
+/// — frontend toasts on the latter two.
+#[tauri::command]
+#[specta::specta]
+pub async fn await_safe_restart(timeout_secs: Option<u64>) -> String {
+    let cap = Duration::from_secs(timeout_secs.unwrap_or(BANNER_GATE_TIMEOUT_SECS));
+    await_restart_gate(cap, "banner-triggered restart")
+        .await
+        .as_str()
+        .to_string()
+}
+
+fn auto_update_enabled_from_settings(settings: Result<Option<SettingsStore>, String>) -> bool {
+    settings
+        .ok()
+        .flatten()
+        .map(|settings| settings.auto_update)
+        .unwrap_or(false)
+}
+
+fn load_auto_update_enabled(app: &tauri::AppHandle) -> bool {
+    let settings = SettingsStore::get(app);
+    match &settings {
+        Ok(Some(settings)) => debug!("auto-update setting: {}", settings.auto_update),
+        Ok(None) => warn!("settings missing during update check; auto-update disabled"),
+        Err(err) => warn!(
+            "failed to read settings during update check; auto-update disabled: {}",
+            err
+        ),
+    }
+    auto_update_enabled_from_settings(settings)
 }
 
 pub struct UpdatesManager {
@@ -127,6 +288,11 @@ pub struct UpdatesManager {
     /// None for enterprise builds (no in-app update UI).
     update_menu_item: Option<MenuItem<Wry>>,
     update_installed: Arc<Mutex<bool>>,
+    /// Latest pending update info, mirrored to the frontend on demand. None
+    /// until an update is detected; populated before download, then flipped
+    /// to downloaded=true once the bundle lands. Survives webview-mount
+    /// races that would otherwise lose the `update-available` event.
+    pending_update: Arc<Mutex<Option<PendingUpdateSnapshot>>>,
     /// Prevents concurrent check_for_updates calls (boot check + periodic race)
     is_checking: AtomicBool,
 }
@@ -152,6 +318,7 @@ impl UpdatesManager {
             interval: Duration::from_secs(interval_minutes * 60),
             update_available: Arc::new(Mutex::new(false)),
             update_installed: Arc::new(Mutex::new(false)),
+            pending_update: Arc::new(Mutex::new(None)),
             app: app.clone(),
             update_menu_item,
             is_checking: AtomicBool::new(false),
@@ -179,9 +346,13 @@ impl UpdatesManager {
         }
         let _guard = CheckGuard(&self.is_checking);
 
-        // Enterprise: updates managed by IT (Intune/RoboPack), no in-app check
-        if is_enterprise_build(&self.app) {
-            info!("enterprise build, updates managed by IT");
+        // Enterprise: default to IT-managed updates unless the dashboard policy
+        // explicitly allows the Screenpipe updater for this install context.
+        if is_enterprise_build(&self.app) && enterprise_updates_managed_locally(&self.app) {
+            info!(
+                "enterprise build, updates managed outside app (mode={:?})",
+                enterprise_update_mode(&self.app)
+            );
             return Result::Ok(false);
         }
 
@@ -219,7 +390,11 @@ impl UpdatesManager {
         );
         // Build updater with auth header so paid users can download from R2
         let mut builder = self.app.updater_builder();
-        if let Ok(Some(settings)) = SettingsStore::get(&self.app) {
+        if is_enterprise_build(&self.app) {
+            if let Some(license_key) = crate::commands::get_enterprise_license_key() {
+                builder = builder.header("X-License-Key", license_key)?;
+            }
+        } else if let Ok(Some(settings)) = SettingsStore::get(&self.app) {
             if let Some(ref token) = settings.user.token {
                 builder = builder.header("Authorization", format!("Bearer {}", token))?;
             }
@@ -250,18 +425,18 @@ impl UpdatesManager {
         }
         if let Ok(Some(update)) = check_result {
             *self.update_available.lock().await = true;
-
-            // Emit "update-downloading" immediately so user sees feedback
-            let download_info = serde_json::json!({
-                "version": update.version,
-                "body": update.body.clone().unwrap_or_default(),
-                "stage": "downloading",
+            *self.pending_update.lock().await = Some(PendingUpdateSnapshot {
+                version: update.version.clone(),
+                body: update.body.clone().unwrap_or_default(),
+                downloaded: false,
+                auth_required: false,
             });
-            let _ = self.app.emit("update-downloading", download_info);
+
+            let auto_update = load_auto_update_enabled(&self.app);
 
             if let Some(ref item) = self.update_menu_item {
-                item.set_enabled(false)?;
-                item.set_text("Downloading latest version of screenpipe")?;
+                item.set_enabled(true)?;
+                item.set_text(&format!("Update available: v{}", update.version))?;
             }
 
             {
@@ -294,98 +469,238 @@ impl UpdatesManager {
                 });
             }
 
-            // Download and install on all platforms
-            {
-                #[cfg(target_os = "windows")]
-                {
-                    // Windows: stop screenpipe before replacing the binary
-                    if let Err(err) =
-                        stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()).await
-                    {
-                        error!("Failed to stop recording before update: {}", err);
-                    }
-                }
-                let app_handle = self.app.clone();
-                let update_version = update.version.clone();
-                let menu_item = self.update_menu_item.clone();
-                let mut downloaded: u64 = 0;
-                let mut last_pct: u8 = 0;
-                let download_result = update
-                    .download_and_install(
-                        move |chunk_len, content_len| {
-                            downloaded += chunk_len as u64;
-                            let pct = content_len
-                                .map(|total| ((downloaded as f64 / total as f64) * 100.0) as u8)
-                                .unwrap_or(0);
-                            // Only emit every 5% to avoid flooding
-                            if pct >= last_pct + 5 || pct == 100 {
-                                last_pct = pct;
-                                let progress = serde_json::json!({
-                                    "version": update_version,
-                                    "downloaded": downloaded,
-                                    "total": content_len,
-                                    "percent": pct,
-                                });
-                                let _ = app_handle.emit("update-download-progress", progress);
-                                info!("update download: {}%", pct);
-                            }
-                            if let Some(ref m) = menu_item {
-                                let _ = m.set_text(&format!("Downloading update... {}%", pct));
-                            }
-                        },
-                        || {},
-                    )
-                    .await;
+            // Windows quirk: the Tauri updater's download_and_install launches
+            // the NSIS/MSI installer and calls std::process::exit(0) at the end
+            // (see tauri-plugin-updater install_inner on Windows). Unlike macOS
+            // where it just stages files in place, calling it on Windows IS the
+            // install — there's no way to "silently pre-download" without
+            // triggering the restart. When auto_update is off we must defer to
+            // the user's banner click; the frontend handler in
+            // update-banner.tsx re-checks and runs downloadAndInstall itself.
+            #[cfg(target_os = "windows")]
+            if !auto_update {
+                info!(
+                    "auto-update disabled on windows; deferring installer to user banner click (v{})",
+                    update.version
+                );
 
-                match download_result {
-                    Ok(_) => {
-                        *self.update_installed.lock().await = true;
-                        if let Some(ref item) = self.update_menu_item {
-                            item.set_enabled(true)?;
-                            item.set_text("Restart to update")?;
-                        }
-                    }
-                    Err(e) => {
-                        let err_str = e.to_string();
-                        if err_str.contains("401")
-                            || err_str.contains("403")
-                            || err_str.contains("Unauthorized")
-                            || err_str.contains("Forbidden")
-                        {
-                            warn!("update download requires authentication: {}", err_str);
-                            let _ = self.app.emit(
-                                "update-auth-required",
-                                serde_json::json!({
-                                    "version": update.version,
-                                    "message": "sign in to get the latest update",
-                                }),
-                            );
-                            let app_notif = self.app.clone();
-                            let version_str = update.version.clone();
-                            // std::thread::spawn (not spawn_blocking) to escape tokio runtime context entirely.
-                            // notify_rust on Linux internally calls block_on for D-Bus, which panics
-                            // if any tokio runtime exists on the current thread — even blocking threads.
-                            let _ = std::thread::spawn(move || {
-                                let _ = app_notif
-                                    .notification()
-                                    .builder()
-                                    .title("screenpipe update available")
-                                    .body(format!(
-                                        "v{} is ready — sign in to download",
-                                        version_str
-                                    ))
-                                    .show();
-                            });
-                            if let Some(ref item) = self.update_menu_item {
-                                item.set_enabled(true)?;
-                                item.set_text("Sign in to update")?;
-                            }
-                            return Ok(false);
-                        }
-                        return Err(e.into());
-                    }
+                *self.update_installed.lock().await = true;
+                if let Some(snap) = self.pending_update.lock().await.as_mut() {
+                    snap.downloaded = true;
+                }
+                if let Some(ref item) = self.update_menu_item {
+                    item.set_enabled(true)?;
+                    item.set_text("Restart to update")?;
+                }
+
+                save_pre_update_version(&self.app, update.body.clone());
+
+                let update_info = serde_json::json!({
+                    "version": update.version,
+                    "body": update.body.clone().unwrap_or_default()
+                });
+                if let Err(e) = self.app.emit("update-available", update_info) {
+                    error!("Failed to emit update-available event: {}", e);
+                }
+
+                let app_notif = self.app.clone();
+                let version_str = update.version.clone();
+                std::thread::spawn(move || {
+                    let _ = app_notif
+                        .notification()
+                        .builder()
+                        .title("screenpipe update ready")
+                        .body(format!("v{} ready — restart to update", version_str))
+                        .show();
+                });
+
+                return Result::Ok(true);
+            }
+
+            // Always download in the background. auto_update only controls
+            // whether we restart automatically after — the banner is the user's
+            // "restart now" trigger when auto_update is off.
+            let download_info = serde_json::json!({
+                "version": update.version,
+                "body": update.body.clone().unwrap_or_default(),
+                "stage": "downloading",
+            });
+            let _ = self.app.emit("update-downloading", download_info);
+
+            if let Some(ref item) = self.update_menu_item {
+                item.set_enabled(false)?;
+                item.set_text("Downloading latest version of screenpipe")?;
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                // Windows: stop screenpipe before replacing the binary
+                if let Err(err) =
+                    stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()).await
+                {
+                    error!("Failed to stop recording before update: {}", err);
                 }
             }
+
+            // Retry transient download failures with exponential backoff.
+            // Auth errors (401/403) short-circuit out of the loop — see error arm.
+            let retry_delays = [
+                Duration::from_secs(30),
+                Duration::from_secs(120),
+                Duration::from_secs(300),
+            ];
+            let download_result = {
+                let mut attempt: usize = 0;
+                loop {
+                    let app_handle = self.app.clone();
+                    let update_version = update.version.clone();
+                    let menu_item = self.update_menu_item.clone();
+                    let mut downloaded: u64 = 0;
+                    let mut last_pct: u8 = 0;
+                    let result = update
+                        .download_and_install(
+                            move |chunk_len, content_len| {
+                                downloaded += chunk_len as u64;
+                                let pct = content_len
+                                    .map(|total| ((downloaded as f64 / total as f64) * 100.0) as u8)
+                                    .unwrap_or(0);
+                                // Only emit every 5% to avoid flooding
+                                if pct >= last_pct + 5 || pct == 100 {
+                                    last_pct = pct;
+                                    let progress = serde_json::json!({
+                                        "version": update_version,
+                                        "downloaded": downloaded,
+                                        "total": content_len,
+                                        "percent": pct,
+                                    });
+                                    let _ = app_handle.emit("update-download-progress", progress);
+                                    info!("update download: {}%", pct);
+                                }
+                                if let Some(ref m) = menu_item {
+                                    let _ = m.set_text(&format!("Downloading update... {}%", pct));
+                                }
+                            },
+                            || {},
+                        )
+                        .await;
+
+                    match &result {
+                        Ok(_) => break result,
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            // Auth errors won't recover from a retry — bail out and let
+                            // the error arm below emit the sign-in banner.
+                            let is_auth = err_str.contains("401")
+                                || err_str.contains("403")
+                                || err_str.contains("Unauthorized")
+                                || err_str.contains("Forbidden");
+                            let next_delay = retry_delays.get(attempt).copied();
+                            if is_auth || next_delay.is_none() {
+                                break result;
+                            }
+                            let delay = next_delay.unwrap();
+                            warn!(
+                                "update download attempt {} failed: {} — retrying in {}s",
+                                attempt + 1,
+                                err_str,
+                                delay.as_secs()
+                            );
+                            if let Some(ref item) = self.update_menu_item {
+                                let _ = item.set_text(&format!(
+                                    "Update download failed — retrying in {}s",
+                                    delay.as_secs()
+                                ));
+                            }
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                        }
+                    }
+                }
+            };
+
+            match download_result {
+                Ok(_) => {
+                    *self.update_installed.lock().await = true;
+                    if let Some(snap) = self.pending_update.lock().await.as_mut() {
+                        snap.downloaded = true;
+                    }
+                    if let Some(ref item) = self.update_menu_item {
+                        item.set_enabled(true)?;
+                        item.set_text("Restart to update")?;
+                    }
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("401")
+                        || err_str.contains("403")
+                        || err_str.contains("Unauthorized")
+                        || err_str.contains("Forbidden")
+                    {
+                        warn!("update download requires authentication: {}", err_str);
+                        if let Some(snap) = self.pending_update.lock().await.as_mut() {
+                            snap.auth_required = true;
+                        }
+                        let _ = self.app.emit(
+                            "update-auth-required",
+                            serde_json::json!({
+                                "version": update.version,
+                                "message": "sign in to get the latest update",
+                            }),
+                        );
+                        let app_notif = self.app.clone();
+                        let version_str = update.version.clone();
+                        std::thread::spawn(move || {
+                            let _ = app_notif
+                                .notification()
+                                .builder()
+                                .title("screenpipe update available")
+                                .body(format!("v{} is ready — sign in to download", version_str))
+                                .show();
+                        });
+                        if let Some(ref item) = self.update_menu_item {
+                            item.set_enabled(true)?;
+                            item.set_text("Sign in to update")?;
+                        }
+                        return Ok(false);
+                    }
+                    // Generic failure (network/disk/server). Clear latched state
+                    // so the periodic loop and tray can retry without an app
+                    // restart, and tell the user what happened.
+                    warn!("update download failed after retries: {}", err_str);
+                    *self.update_available.lock().await = false;
+                    *self.pending_update.lock().await = None;
+                    if let Some(ref item) = self.update_menu_item {
+                        item.set_enabled(true)?;
+                        item.set_text("Update failed — click to retry")?;
+                    }
+                    let _ = self.app.emit(
+                        "update-failed",
+                        serde_json::json!({
+                            "version": update.version,
+                            "reason": err_str,
+                        }),
+                    );
+                    let app_notif = self.app.clone();
+                    let version_str = update.version.clone();
+                    std::thread::spawn(move || {
+                        let _ = app_notif
+                            .notification()
+                            .builder()
+                            .title("screenpipe update failed")
+                            .body(format!(
+                                "v{} couldn't download — open screenpipe to retry",
+                                version_str
+                            ))
+                            .show();
+                    });
+                    return Err(e.into());
+                }
+            }
+
+            // Stash the current version so the "what's new" notification can fire
+            // after restart — needs to happen here because banner-driven restarts
+            // bypass the auto_update path below.
+            save_pre_update_version(&self.app, update.body.clone());
 
             // Emit event to frontend for in-app banner (visible if window is open)
             let update_info = serde_json::json!({
@@ -396,53 +711,43 @@ impl UpdatesManager {
                 error!("Failed to emit update-available event: {}", e);
             }
 
-            // Native OS notification — visible even when window is closed
-            let auto_update = SettingsStore::get(&self.app)
-                .ok()
-                .flatten()
-                .map(|s| s.auto_update)
-                .unwrap_or(true);
-
-            // std::thread::spawn (not spawn_blocking) to escape tokio runtime context entirely.
-            // notify_rust on Linux internally calls block_on for D-Bus, which panics
-            // if any tokio runtime exists on the current thread — even blocking threads.
             let app_notif = self.app.clone();
             let version_str = update.version.clone();
             std::thread::spawn(move || {
-                if auto_update {
-                    if let Err(e) = app_notif
-                        .notification()
-                        .builder()
+                let notification = app_notif.notification().builder();
+                let result = if auto_update {
+                    notification
                         .title("screenpipe updating")
                         .body(format!("v{} downloaded — restarting now", version_str))
                         .show()
-                    {
-                        error!("failed to send update notification: {}", e);
-                    }
                 } else {
-                    if let Err(e) = app_notif
-                        .notification()
-                        .builder()
-                        .title("screenpipe update available")
-                        .body(format!(
-                            "v{} is ready — open screenpipe to update",
-                            version_str
-                        ))
+                    notification
+                        .title("screenpipe update ready")
+                        .body(format!("v{} downloaded — restart to update", version_str))
                         .show()
-                    {
-                        error!("failed to send update notification: {}", e);
-                    }
+                };
+                if let Err(e) = result {
+                    error!("failed to send update notification: {}", e);
                 }
             });
 
-            // Auto-update: if enabled and update is downloaded, restart automatically
-            // This ensures users get updates even if tray icon is hidden (e.g., behind notch)
             if auto_update && *self.update_installed.lock().await {
                 info!(
                     "auto-update enabled, restarting to apply update v{}",
                     update.version
                 );
-                // Emit event so the frontend can display a countdown/warning
+
+                // #3622: gate process::exit on boot-ready to avoid the ORT teardown
+                // race. In the common case boot is already ready and this returns
+                // immediately. See `await_restart_gate` for the full rationale.
+                let label = format!("auto-update v{}", update.version);
+                if !await_restart_gate(AUTO_UPDATE_GATE_TIMEOUT, &label)
+                    .await
+                    .proceed()
+                {
+                    return Result::Ok(true);
+                }
+
                 let _ = self.app.emit(
                     "update-restarting",
                     serde_json::json!({
@@ -450,97 +755,14 @@ impl UpdatesManager {
                         "delay_secs": 30,
                     }),
                 );
-                // Save current version + release notes so next boot can show "what's new"
-                save_pre_update_version(&self.app, update.body.clone());
-                // Give user 30 seconds to finish what they're doing before restarting.
-                // Previous 5-second delay was too aggressive and interrupted fullscreen
-                // apps (games, presentations) without adequate warning.
                 tokio::time::sleep(Duration::from_secs(30)).await;
                 if let Err(err) =
                     stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()).await
                 {
                     error!("Failed to stop recording before auto-update: {}", err);
                 }
-                // Signal ExitRequested handler to allow clean exit (not prevent_exit)
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
                 self.app.restart();
-            }
-
-            if show_dialog {
-                let (tx, rx) = oneshot::channel();
-                let update_dialog = self
-                    .app
-                    .dialog()
-                    .message("update available")
-                    .title("screenpipe update")
-                    .buttons(MessageDialogButtons::OkCancelCustom(
-                        "update now".to_string(),
-                        "later".to_string(),
-                    ));
-
-                update_dialog.show(move |answer| {
-                    let _ = tx.send(answer);
-                });
-
-                if rx.await? {
-                    #[cfg(target_os = "windows")]
-                    {
-                        if let Some(ref item) = self.update_menu_item {
-                            item.set_enabled(false)?;
-                            item.set_text("Downloading latest version of screenpipe")?;
-                        }
-
-                        if let Err(err) =
-                            stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone())
-                                .await
-                        {
-                            error!("Failed to stop recording: {}", err);
-                        }
-
-                        let menu_item_win = self.update_menu_item.clone();
-                        let mut dl: u64 = 0;
-                        let mut lp: u8 = 0;
-                        update
-                            .download_and_install(
-                                move |chunk_len, content_len| {
-                                    dl += chunk_len as u64;
-                                    let pct = content_len
-                                        .map(|t| ((dl as f64 / t as f64) * 100.0) as u8)
-                                        .unwrap_or(0);
-                                    if pct >= lp + 5 || pct == 100 {
-                                        lp = pct;
-                                        if let Some(ref m) = menu_item_win {
-                                            let _ = m.set_text(&format!(
-                                                "Downloading update... {}%",
-                                                pct
-                                            ));
-                                        }
-                                    }
-                                },
-                                || {},
-                            )
-                            .await?;
-                        *self.update_installed.lock().await = true;
-
-                        if let Some(ref item) = self.update_menu_item {
-                            item.set_enabled(true)?;
-                            item.set_text("Restart to update")?;
-                        }
-                    }
-                    // Proceed with the update
-                    save_pre_update_version(&self.app, update.body.clone());
-
-                    #[cfg(not(target_os = "windows"))]
-                    {
-                        if let Err(err) =
-                            stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone())
-                                .await
-                        {
-                            error!("Failed to stop recording: {}", err);
-                        }
-                    }
-                    self.update_screenpipe();
-                }
             }
 
             return Result::Ok(true);
@@ -566,8 +788,14 @@ impl UpdatesManager {
         self.update_menu_item.as_ref()
     }
 
-    pub fn update_screenpipe(&self) -> Option<Error> {
-        self.app.restart();
+    pub async fn has_update_installed(&self) -> bool {
+        *self.update_installed.lock().await
+    }
+
+    /// Read the current pending update snapshot, for the frontend banner to
+    /// hydrate when its listener mounts late and misses the event.
+    pub async fn pending_update_snapshot(&self) -> Option<PendingUpdateSnapshot> {
+        self.pending_update.lock().await.clone()
     }
 
     /// Show dialog explaining auto-updates are not available for source builds
@@ -619,7 +847,7 @@ impl UpdatesManager {
                 // Don't show dialog for periodic checks - only for manual checks
                 if let Err(e) = self.check_for_updates(false).await {
                     // warn, not error — see updater check() note above.
-                warn!("Failed to check for updates: {}", e);
+                    warn!("Failed to check for updates: {}", e);
                 }
             }
         }
@@ -722,6 +950,34 @@ fn check_whats_new(app: &tauri::AppHandle) {
     });
 }
 
+/// Hydrate the frontend banner state on mount. The `update-available` event
+/// is broadcast once when the download completes — if the React app isn't
+/// mounted yet (boot race) or the listener lives on a route the user hasn't
+/// visited yet, that event is lost. The banner calls this command on mount
+/// to pick up state it may have missed.
+#[specta::specta]
+#[tauri::command]
+pub async fn get_pending_update(
+    state: tauri::State<'_, Arc<UpdatesManager>>,
+) -> Result<Option<PendingUpdateSnapshot>, ()> {
+    Ok(state.pending_update_snapshot().await)
+}
+
+/// User-initiated update check from Settings → General. Returns:
+/// - `Ok(true)`  when an update was found (banner will appear after download).
+/// - `Ok(false)` when already up to date or the build can't auto-update.
+/// - `Err(String)` when the check itself failed (network, server, etc.).
+#[specta::specta]
+#[tauri::command]
+pub async fn trigger_update_check(
+    state: tauri::State<'_, Arc<UpdatesManager>>,
+) -> Result<bool, String> {
+    state
+        .check_for_updates(false)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub fn start_update_check(
     app: &tauri::AppHandle,
     interval_minutes: u64,
@@ -761,4 +1017,37 @@ pub fn start_update_check(
     });
 
     Ok(updates_manager)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_update_setting_respects_false() {
+        let mut settings = SettingsStore::default();
+        settings.auto_update = false;
+
+        assert!(!auto_update_enabled_from_settings(Ok(Some(settings))));
+    }
+
+    #[test]
+    fn auto_update_setting_respects_true() {
+        let mut settings = SettingsStore::default();
+        settings.auto_update = true;
+
+        assert!(auto_update_enabled_from_settings(Ok(Some(settings))));
+    }
+
+    #[test]
+    fn auto_update_setting_fails_closed_when_missing() {
+        assert!(!auto_update_enabled_from_settings(Ok(None)));
+    }
+
+    #[test]
+    fn auto_update_setting_fails_closed_when_unreadable() {
+        assert!(!auto_update_enabled_from_settings(Err(
+            "store unavailable".to_string()
+        )));
+    }
 }

@@ -6,6 +6,26 @@ import { $ } from 'bun'
 import fs from 'fs/promises'
 import path from 'path'
 
+export async function downloadFile(url, destination, { retries = 5, timeoutMs = 30000 } = {}) {
+	let lastError;
+
+	for (let attempt = 1; attempt <= retries; attempt++) {
+		try {
+			console.log(`downloading ${url} -> ${destination} (${attempt}/${retries})`);
+			await $`curl -fsSL --max-time ${Math.floor(timeoutMs / 1000)} --connect-timeout 15 -o ${destination} ${url}`;
+			return;
+		} catch (error) {
+			lastError = error;
+			await fs.rm(destination, { force: true }).catch(() => {});
+			if (attempt < retries) {
+				await new Promise((resolve) => setTimeout(resolve, Math.min(30000, 2000 * attempt)));
+			}
+		}
+	}
+
+	throw lastError;
+}
+
 export async function findWget() {
 	const possiblePaths = [
 		'C:\\ProgramData\\chocolatey\\bin\\wget.exe',

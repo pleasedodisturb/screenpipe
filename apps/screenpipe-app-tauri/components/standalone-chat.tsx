@@ -4,7 +4,7 @@
 "use client";
 
 import * as React from "react";
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   mountAgentEventBus,
@@ -18,18 +18,22 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Shield, ShieldCheck, Sparkles, Plug } from "lucide-react";
+import { Loader2, Send, Square, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Calendar, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Sparkles, Plug, CornerDownRight } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { PipeContextBanner } from "@/components/chat/pipe-context-banner";
+import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { BrowserSidebar } from "@/components/browser-sidebar";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
-import { PipeAIIcon, PipeAIIconLarge } from "@/components/pipe-ai-icon";
+import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import { MemoizedReactMarkdown } from "@/components/markdown";
-import { VideoComponent } from "@/components/rewind/video";
-import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
-import { convertFileSrc } from "@tauri-apps/api/core";
+import {
+  MemoizedReactMarkdown,
+  chatUrlTransform,
+  openScreenpipeViewerLink,
+  rewriteLocalMarkdownLinksForChat,
+} from "@/components/markdown";
+import { ChatCodeBlock } from "@/components/ui/chat-code-block";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
 import remarkGfm from "remark-gfm";
@@ -39,11 +43,34 @@ import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { save as saveDialog, open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readFile } from "@tauri-apps/plugin-fs";
+import {
+  extractDocument,
+  docsToPromptText,
+  isSupportedDocExt,
+  extFromName,
+  DOC_PICKER_EXTENSIONS,
+  type ExtractedDoc,
+} from "@/lib/pi/extract-document";
+
+// Per-message attachment metadata. We deliberately do NOT carry the
+// extracted text here — that lives inside `content` (it's already there
+// because sendMessage folds it in for the model). The renderer reads
+// this metadata to draw an attachment card above the user
+// bubble (icon + filename + char count), keeping the bubble itself
+// clean. See the ChatMessage user-bubble render path (`attachmentsRow`).
+export type ChatAttachment = {
+  name: string;
+  ext: string;
+  charCount: number;
+  truncated: boolean;
+};
 import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
 import { useChatConversations } from "@/components/hooks/use-chat-conversations";
 import { useChatStore } from "@/lib/stores/chat-store";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 import { statusForEvent } from "@/lib/stores/pi-event-router";
+import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
@@ -57,13 +84,78 @@ import {
   buildAppMentionSuggestions,
   normalizeAppTag,
   formatShortcutDisplay,
+  extractConversationHistorySyncUserText,
+  isInjectedTitleSourcePrompt,
+  isConversationHistorySyncPrompt,
+  type ChatLoadConversationPayload,
+  shouldHandleChatLoadConversationForWindow,
+  shouldHandleChatPrefillForWindow,
 } from "@/lib/chat-utils";
-import { useAutoSuggestions } from "@/lib/hooks/use-auto-suggestions";
-import { SummaryCards } from "@/components/chat/summary-cards";
+import { sanitizeToolCallXml } from "@/lib/utils/sanitize-tool-call-xml";
+import { useAutoSuggestions, type Suggestion } from "@/lib/hooks/use-auto-suggestions";
+import { SummaryCards, type ConnectionSetupSuggestion } from "@/components/chat/summary-cards";
 import { type CustomTemplate } from "@/lib/summary-templates";
+import {
+  buildDailyLimitMessage,
+  classifyQuotaError,
+  buildRateLimitMessage,
+  parseRateLimitWaitSeconds,
+  PI_MAX_RATE_LIMIT_RETRIES,
+} from "@/lib/chat/quota-errors";
+import { buildSystemPrompt, buildConnectionsContext } from "@/lib/chat/system-prompt";
+import {
+  classifyCurl,
+  endpointFamily,
+  summarizeToolResult,
+  formatToolResult,
+  sanitizeCommand,
+  curlBodyJson,
+  curlMethod,
+  trunc,
+  sqlTables,
+  urlsInCommand,
+  isLocalScreenpipeUrl,
+  firstExternalWebTarget,
+  type WebTargetPresentation,
+} from "@/lib/chat/tool-presentation";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { localFetch, getApiBaseUrl } from "@/lib/api";
+import { CONNECTIONS_UPDATED_EVENT } from "@/lib/connections-events";
+import {
+  computeChatCitationPlan,
+  formatSourceCitationsMarkdown,
+  sourceCitationsFromMessage,
+  type SourceCitation,
+} from "@/lib/source-citations";
 import { getFaviconUrl } from "@/components/rewind/timeline/favicon-utils";
+import {
+  formatSteerShortcut,
+  getComposerPrimaryAction,
+  isComposerSteerShortcut,
+  isQueuedItemCancelShortcut,
+  isQueuedItemSteerShortcut,
+  normalizeQueueEventPayload,
+} from "@/lib/chat-queue-controls";
+
+const MermaidDiagram = React.lazy(() =>
+  import("@/components/rewind/mermaid-diagram").then((mod) => ({
+    default: mod.MermaidDiagram,
+  }))
+);
+
+function MermaidDiagramBlock({ chart }: { chart: string }) {
+  return (
+    <React.Suspense
+      fallback={
+        <div className="my-4 text-xs text-muted-foreground">
+          rendering diagram...
+        </div>
+      }
+    >
+      <MermaidDiagram chart={chart} />
+    </React.Suspense>
+  );
+}
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
 
@@ -75,6 +167,392 @@ interface MentionSuggestion {
 }
 
 const APP_SUGGESTION_LIMIT = 10;
+const STREAM_RENDER_THROTTLE_MS = 80;
+const EMPTY_QUEUED_PROMPTS: PiQueuedPrompt[] = [];
+const FOLLOW_UP_GENERATION_DELAY_MS = 10_000;
+const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
+const CHAT_RAIL_CLASS = "max-w-4xl mx-auto w-full";
+const CONNECTION_SUGGESTION_LIMIT = 3;
+const VISIBLE_SUGGESTION_LIMIT = 2;
+
+type ConnectedIntegration = {
+  id: string;
+  name: string;
+  icon?: string;
+  category?: string;
+  description?: string;
+};
+
+type ConnectionListItem = ConnectedIntegration & { connected: boolean };
+type ActivityAppItem = { name: string; count: number; app_name?: string };
+
+function normalizeConnectionForPlatform<T extends ConnectedIntegration>(connection: T, isWindows: boolean): T {
+  if (isWindows && connection.id === "apple-calendar") {
+    return {
+      ...connection,
+      name: "Windows Calendar",
+      icon: "windows-calendar",
+    };
+  }
+  return connection;
+}
+
+function connectionMentionTag(connection: ConnectedIntegration, isWindows: boolean) {
+  if (isWindows && connection.id === "apple-calendar") return "@windows-calendar";
+  return `@${connection.id}`;
+}
+
+type PreviewCalendarEvent = {
+  title?: string;
+  start?: string;
+  attendees?: string[];
+  isAllDay?: boolean;
+  is_all_day?: boolean;
+};
+
+const CONNECTION_READ_HINTS = [
+  "read",
+  "query",
+  "search",
+  "access",
+  "list",
+  "fetch",
+  "get ",
+  "events",
+  "notes",
+  "transcripts",
+  "tickets",
+  "issues",
+  "contacts",
+  "deals",
+  "recordings",
+];
+
+function connectionCanSupportReadSuggestion(connection: ConnectedIntegration): boolean {
+  const haystack = `${connection.id} ${connection.name} ${connection.category ?? ""} ${connection.description ?? ""}`.toLowerCase();
+  if (connection.category?.toLowerCase() === "browser") return true;
+  if (haystack.includes("calendar")) return true;
+  return CONNECTION_READ_HINTS.some((hint) => haystack.includes(hint));
+}
+
+function compactSuggestionPart(text: string, max = 48): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= max) return clean;
+  return `${clean.slice(0, max - 3).trim()}...`;
+}
+
+function personNameFromAttendee(attendee: string): string | null {
+  const raw = attendee.split("<")[0].trim() || attendee.split("@")[0].trim();
+  const local = raw.includes("@") ? raw.split("@")[0] : raw;
+  const parts = local
+    .replace(/[._-]+/g, " ")
+    .split(/\s+/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .filter((p) => !["me", "you", "no-reply", "noreply", "calendar"].includes(p.toLowerCase()));
+  if (parts.length === 0) return null;
+  return parts
+    .slice(0, 2)
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
+}
+
+function uniqueCompactList(items: string[], maxItems = 4): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const item of items) {
+    const key = item.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(item);
+    if (result.length >= maxItems) break;
+  }
+  return result;
+}
+
+function isTomorrow(date: Date): boolean {
+  const tomorrow = new Date();
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  return (
+    date.getFullYear() === tomorrow.getFullYear() &&
+    date.getMonth() === tomorrow.getMonth() &&
+    date.getDate() === tomorrow.getDate()
+  );
+}
+
+function joinNames(names: string[]): string {
+  if (names.length <= 2) return names.join(" and ");
+  return `${names.slice(0, -1).join(", ")}, and ${names[names.length - 1]}`;
+}
+
+async function fetchCalendarPreviewSuggestion(connection: ConnectedIntegration): Promise<Suggestion | null> {
+  const lower = `${connection.id} ${connection.name}`.toLowerCase();
+  const endpoint = lower.includes("google")
+    ? "/connections/google-calendar/events?hours_back=0&hours_ahead=48"
+    : "/connections/calendar/events?hours_back=0&hours_ahead=48";
+
+  try {
+    const res = await localFetch(endpoint);
+    if (!res.ok) return null;
+    const body = await res.json();
+    const rawEvents: PreviewCalendarEvent[] = Array.isArray(body) ? body : body.data ?? [];
+    const events = rawEvents
+      .filter((event) => event.start && !(event.isAllDay ?? event.is_all_day))
+      .map((event) => ({ ...event, startDate: new Date(event.start as string) }))
+      .filter((event) => Number.isFinite(event.startDate.getTime()) && event.startDate.getTime() >= Date.now() - 30 * 60 * 1000)
+      .sort((a, b) => a.startDate.getTime() - b.startDate.getTime());
+    if (events.length === 0) return null;
+
+    const tomorrowEvents = events.filter((event) => isTomorrow(event.startDate));
+    const chosen = (tomorrowEvents.length > 0 ? tomorrowEvents : events).slice(0, 3);
+    const names = uniqueCompactList(
+      chosen.flatMap((event) => (event.attendees ?? []).map(personNameFromAttendee).filter((name): name is string => Boolean(name))),
+      4
+    );
+    const titles = uniqueCompactList(
+      chosen.map((event) => event.title?.trim()).filter((title): title is string => Boolean(title && title !== "(No title)")),
+      2
+    );
+    const descriptor = names.length >= 2
+      ? `${joinNames(names)} call briefs`
+      : titles.length > 0
+        ? `${compactSuggestionPart(titles[0], 42)} brief`
+        : "meeting briefs";
+    const day = tomorrowEvents.length > 0 ? "tomorrow's" : "upcoming";
+
+    return {
+      text: `Prep ${day} ${descriptor} from ${connection.name}`,
+      preview: titles.length > 0 ? titles.join(", ") : `uses ${connection.name}`,
+      priority: 1,
+      connectionIcon: connection.icon || connection.id,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function cleanEmailSubject(subject: string): string {
+  return compactSuggestionPart(
+    subject
+      .replace(/^\s*(re|fwd?):\s*/i, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+    48
+  );
+}
+
+async function fetchGmailPreviewSuggestion(connection: ConnectedIntegration): Promise<Suggestion | null> {
+  try {
+    const query = encodeURIComponent("newer_than:14d (invite OR kickoff OR prep OR meeting)");
+    const listRes = await localFetch(`/connections/gmail/messages?maxResults=3&q=${query}`);
+    if (!listRes.ok) return null;
+    const listBody = await listRes.json();
+    const firstId = listBody?.data?.messages?.[0]?.id;
+    if (!firstId) return null;
+
+    const detailRes = await localFetch(`/connections/gmail/messages/${encodeURIComponent(firstId)}`);
+    if (!detailRes.ok) return null;
+    const detailBody = await detailRes.json();
+    const subject = detailBody?.data?.subject || detailBody?.data?.snippet;
+    if (!subject) return null;
+
+    return {
+      text: `Turn "${cleanEmailSubject(String(subject))}" into concrete prep notes`,
+      preview: `from ${connection.name}`,
+      priority: 2,
+      connectionIcon: connection.icon || connection.id,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchConnectionPreviewSuggestions(connections: ConnectedIntegration[]): Promise<Suggestion[]> {
+  const tasks = connections.map((connection) => {
+    const lower = `${connection.id} ${connection.name}`.toLowerCase();
+    if (lower.includes("calendar")) return fetchCalendarPreviewSuggestion(connection);
+    if (lower.includes("gmail")) return fetchGmailPreviewSuggestion(connection);
+    return Promise.resolve(null);
+  });
+  const suggestions = await Promise.all(tasks);
+  return suggestions.filter((suggestion): suggestion is Suggestion => Boolean(suggestion));
+}
+
+function suggestionForConnection(connection: ConnectedIntegration): Suggestion | null {
+  if (!connectionCanSupportReadSuggestion(connection)) return null;
+
+  const id = normalizeAppKey(connection.id);
+  const name = connection.name || connection.id;
+  const lower = `${id} ${name}`.toLowerCase();
+  const base: Pick<Suggestion, "connectionIcon" | "preview" | "priority"> = {
+    connectionIcon: connection.icon || connection.id,
+    preview: `uses ${name}`,
+    priority: 2,
+  };
+
+  if (lower.includes("calendar")) {
+    return { ...base, text: `Prep upcoming meeting briefs from ${name}`, priority: 1 };
+  }
+  if (lower.includes("gmail") || lower.includes("email") || lower.includes("outlook") || lower.includes("microsoft365") || lower.includes("microsoft 365")) {
+    return { ...base, text: `Turn recent ${name} invites into concrete prep notes` };
+  }
+  if (lower.includes("docs") || lower.includes("sheets") || lower.includes("notion") || lower.includes("obsidian") || lower.includes("logseq")) {
+    return { ...base, text: `Turn recent ${name} files into a prep sheet` };
+  }
+  if (lower.includes("linear") || lower.includes("github") || lower.includes("jira") || lower.includes("trello") || lower.includes("asana") || lower.includes("clickup") || lower.includes("monday")) {
+    return { ...base, text: `Find open tasks tied to this work in ${name}` };
+  }
+  if (lower.includes("sentry")) {
+    return { ...base, text: `Find the issue driving recent ${name} events` };
+  }
+  if (lower.includes("posthog")) {
+    return { ...base, text: `Find the trend behind recent ${name} activity` };
+  }
+  if (lower.includes("hubspot") || lower.includes("salesforce") || lower.includes("intercom") || lower.includes("zendesk") || lower.includes("pipedrive")) {
+    return { ...base, text: `Prep customer call briefs from ${name}` };
+  }
+  if (lower.includes("zoom") || lower.includes("granola") || lower.includes("fireflies") || lower.includes("otter") || lower.includes("bee") || lower.includes("limitless")) {
+    return { ...base, text: `Pull recent meeting briefs from ${name}` };
+  }
+  if (connection.category?.toLowerCase() === "browser" || lower.includes("browser")) {
+    return { ...base, text: `Read the current page with ${name}` };
+  }
+  if (lower.includes("stripe") || lower.includes("quickbooks") || lower.includes("brex")) {
+    return { ...base, text: `Summarize recent ${name} data for this work` };
+  }
+
+  return { ...base, text: `Search ${name} for context on this work` };
+}
+
+function mergeConnectionSuggestions(
+  autoSuggestions: Suggestion[],
+  connections: ConnectedIntegration[],
+  previewSuggestions: Suggestion[] = [],
+  rotationSeed = 0
+): Suggestion[] {
+  const rotateVisible = (suggestions: Suggestion[]) => {
+    if (suggestions.length <= VISIBLE_SUGGESTION_LIMIT || rotationSeed <= 0) {
+      return suggestions.slice(0, VISIBLE_SUGGESTION_LIMIT);
+    }
+
+    const offset = rotationSeed % suggestions.length;
+    const rotated = [...suggestions.slice(offset), ...suggestions.slice(0, offset)];
+    return rotated.slice(0, VISIBLE_SUGGESTION_LIMIT);
+  };
+
+  const previewIcons = new Set(previewSuggestions.map((s) => s.connectionIcon).filter(Boolean));
+  const connectionSuggestions = connections
+    .filter((connection) => !previewIcons.has(connection.icon || connection.id))
+    .map(suggestionForConnection)
+    .filter((s): s is Suggestion => Boolean(s))
+    .slice(0, CONNECTION_SUGGESTION_LIMIT);
+
+  const combinedConnectionSuggestions = [...previewSuggestions, ...connectionSuggestions].slice(0, CONNECTION_SUGGESTION_LIMIT);
+  if (combinedConnectionSuggestions.length === 0) return rotateVisible(autoSuggestions);
+
+  const [first, ...rest] = autoSuggestions;
+  const merged = first
+    ? [first, ...combinedConnectionSuggestions, ...rest]
+    : combinedConnectionSuggestions;
+  const seen = new Set<string>();
+  const deduped = merged.filter((suggestion) => {
+    const key = suggestion.text.toLowerCase().replace(/\s+/g, " ").trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return rotateVisible(deduped);
+}
+
+function setupDescriptionForConnection(connection: ConnectionListItem): string {
+  const lower = `${connection.id} ${connection.name} ${connection.category ?? ""}`.toLowerCase();
+  if (lower.includes("gmail") || lower.includes("email")) return "Bring email into chat";
+  if (lower.includes("slack")) return "Search team threads";
+  if (lower.includes("github")) return "Use repos and issues";
+  if (lower.includes("linear") || lower.includes("jira")) return "Track project work";
+  if (lower.includes("calendar")) return "Prep from events";
+  if (lower.includes("notion") || lower.includes("docs") || lower.includes("obsidian")) return "Search your docs";
+  if (lower.includes("browser")) return "Read current pages";
+  return connection.description ? compactSuggestionPart(connection.description, 34) : "Add more context";
+}
+
+function buildConnectionSetupSuggestions(
+  connections: ConnectionListItem[],
+  appItems: ActivityAppItem[]
+): ConnectionSetupSuggestion[] {
+  const fallbackConnectionOrder = [
+    "gmail",
+    "slack",
+    "github",
+    "github-issues",
+    "linear",
+    "google-calendar",
+    "notion",
+    "google-docs",
+    "obsidian",
+    "jira",
+    "google-sheets",
+  ];
+
+  const fallbackRank = (connection: ConnectionListItem) => {
+    const keys = [connection.id, connection.icon, connection.name]
+      .filter((key): key is string => Boolean(key))
+      .map((key) => key.toLowerCase());
+    const index = fallbackConnectionOrder.findIndex((preferred) =>
+      keys.some((key) => key === preferred || key.includes(preferred))
+    );
+    return index === -1 ? fallbackConnectionOrder.length : index;
+  };
+
+  const activityAffinity = (connection: ConnectionListItem) => {
+    const connectionText = `${connection.id} ${connection.name} ${connection.category ?? ""}`.toLowerCase();
+    const connectionParts = connectionText.split(/[\s_-]+/).filter((part) => part.length > 3);
+
+    return appItems.reduce(
+      (match, item, index) => {
+        const appText = `${item.name} ${item.app_name ?? ""}`.toLowerCase();
+        if (!appText) return match;
+
+        const isMatch =
+          appText.includes(connection.id.toLowerCase()) ||
+          appText.includes(connection.name.toLowerCase()) ||
+          connectionParts.some((part) => appText.includes(part));
+
+        if (!isMatch) return match;
+
+        return {
+          count: match.count + item.count,
+          firstSeenIndex: Math.min(match.firstSeenIndex, index),
+        };
+      },
+      { count: 0, firstSeenIndex: Number.MAX_SAFE_INTEGER }
+    );
+  };
+
+  return connections
+    .filter((connection) => !connection.connected && connection.id !== "owned-default")
+    .map((connection) => {
+      return {
+        suggestion: {
+          id: connection.id,
+          title: `Connect ${connection.name || connection.id}`,
+          description: setupDescriptionForConnection(connection),
+          icon: connection.icon || connection.id,
+        },
+        activity: activityAffinity(connection),
+        fallbackRank: fallbackRank(connection),
+      };
+    })
+    .sort((a, b) =>
+      b.activity.count - a.activity.count ||
+      a.activity.firstSeenIndex - b.activity.firstSeenIndex ||
+      a.fallbackRank - b.fallbackRank ||
+      a.suggestion.title.localeCompare(b.suggestion.title)
+    )
+    .slice(0, 2)
+    .map((entry) => entry.suggestion);
+}
 
 interface Speaker {
   id: number;
@@ -98,187 +576,7 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
  * Extract tier info from gateway error JSON embedded in error strings and
  * return a user-facing message appropriate to their actual subscription tier.
  */
-function buildDailyLimitMessage(errorStr: string): string {
-  try {
-    const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
-    const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
-
-    if (isRateLimit) {
-      return "This model is temporarily rate-limited. Try again in a few seconds, or switch to a different model.";
-    }
-
-    if (isCostLimit) {
-      // Don't leak the raw dollar cap — that's our internal margin. Frame it
-      // as an account-wide budget so the user understands why it fired even
-      // when they "didn't use much" (background pipes consume it too).
-      return "You've hit today's AI usage limit. This is an account-wide budget — background pipes count too. Switch to a free model (gemini-3-flash, haiku) or check Settings → Pipes for chatty schedules.";
-    }
-
-    const tierMatch = errorStr.match(/"tier":\s*"([^"]+)"/);
-    const tier = tierMatch?.[1];
-
-    if (tier === "subscribed") {
-      return "You've hit your daily limit. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage.";
-    } else if (tier === "logged_in") {
-      return "You've used your free queries for today. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage, or upgrade to Pro.";
-    } else {
-      return "You've used your free queries for today. Sign in for more, or switch to a free model (Qwen3 Coder, Gemini Flash).";
-    }
-  } catch {
-    return "You've reached your daily limit. Try a free model like Qwen3 Coder or Gemini Flash.";
-  }
-}
-
-function classifyQuotaError(errorStr: string): "daily" | "rate" | "none" {
-  const normalized = errorStr.toLowerCase();
-  const isDailyLimit =
-    normalized.includes("credits_exhausted") ||
-    normalized.includes("daily_limit_exceeded") ||
-    normalized.includes("daily_cost_limit_exceeded");
-  if (isDailyLimit) {
-    return "daily";
-  }
-
-  const isRateLimit =
-    normalized.includes("429") ||
-    normalized.includes("rate limit") ||
-    normalized.includes("rate_limit") ||
-    normalized.includes("requests per minute") ||
-    normalized.includes("too many requests");
-  return isRateLimit ? "rate" : "none";
-}
-
-function buildRateLimitMessage(errorStr: string): string {
-  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-  const waitTime = waitMatch ? waitMatch[1] : "a moment";
-  const isPerMinuteRate = /rate limit exceeded|requests per minute/i.test(errorStr);
-  return isPerMinuteRate
-    ? `Rate limited — please wait ${waitTime} seconds and try again.`
-    : "Rate limited — try again in a moment or switch to a different model.";
-}
-
-/** Extract the gateway-reported tier from an error string, if present. */
 // Helper to get timezone offset string (e.g., "+1" or "-5")
-function getTimezoneOffsetString(): string {
-  const offsetMinutes = new Date().getTimezoneOffset();
-  const offsetHours = -offsetMinutes / 60; // Negate because getTimezoneOffset returns opposite sign
-  return offsetHours >= 0 ? `+${offsetHours}` : `${offsetHours}`;
-}
-
-// Build system prompt dynamically to ensure current time is accurate
-function buildSystemPrompt(): string {
-  const now = new Date();
-  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-  const offsetStr = getTimezoneOffsetString();
-
-  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them. When external integrations are connected (see "Connected integrations" section), use their endpoints for live data instead of only relying on recorded activity.
-
-# Voice and length — the most important rule
-
-Default to plain prose, like a friend texting back. Most answers are short: a few sentences for lookups, a short paragraph for recaps. Long answers only when the work itself is long or technical. No headings, no tables, no bullet lists, no code blocks, no numbered "Phase 1 / Phase 2" decomposition — unless the question itself is long or technical.
-
-Don't lecture. Skip "Why this matters", "the reusable pattern is", "in summary", "key takeaways". Answer the question and stop. No closing recap of what you just said.
-
-Hide the plumbing. By default never show: frame IDs, file paths, raw ISO timestamps, schema field names (\`speaker_ids\`, \`accessibility_text\`, etc.), API parameters (\`content_type\`, \`limit=\`), or process names ending in \`.exe\`. Translate to human terms — strip \`.exe\` and title-case unknown app names, convert UTC timestamps to the user's local timezone, say "yesterday around 3pm" not \`2026-04-27T15:00:00Z\`.
-
-# Flip to technical mode when the user signals it
-
-Match the user's energy. Go detailed/structured when any of these is true:
-- They pasted code, JSON, SQL, error traces, configs, or credentials
-- They wrote a numbered task list, a role prompt ("you are an X advisor"), or a multi-step instruction
-- Their words include "debug", "trace", "explain how", "show me the code", "step by step", "I'm building", "I'm optimizing", "outline", "table"
-- The earlier turns of this conversation were already technical
-
-In technical mode you can use headings, tables, code blocks, exact timestamps, file paths, and longer answers. Match the depth they brought — don't exceed it.
-
-# Ambiguous / one-word / typo input
-
-If the user sends "hi", "gih", "d", a single word, or an obvious typo, ask one short clarifying question. Don't launch a capability tour or read your own skills aloud.
-
-# Activity recaps (the most common request)
-
-When summarizing what the user did, write like a friend recapping their day. Connect windows, content, and audio into a short narrative. Name specific projects, people, files, URLs from the data. "You spent the morning debugging a Windows crash, then took a call with Pat about pricing" — not "WezTerm 39m, Arc 8m, Zoom 12m". Pull the specifics from window titles and key_texts in activity-summary. Cap at ~150 words unless the user asked for depth.
-
-# Acting on requests
-
-- Act immediately on clear intent. Don't ask to confirm what's obvious.
-- If a search returns empty, silently widen and retry. Don't enumerate possibilities or ask the user to choose.
-- Never say "no data found" after one filtered search — verify first with an unfiltered time-only search.
-
-# Connection write policy
-
-Never POST, PUT, or PATCH to a connection proxy unless the user explicitly asks you to create, write, or modify something in that service. For ambiguous requests, read first. Ask before writing.
-
-# Tool selection
-
-- "upcoming meetings / calendar events / what's on my calendar / schedule" → if a calendar integration is connected (google-calendar, apple-calendar), call its events endpoint first; only fall back to audio search if no calendar is connected
-- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param (for past meetings/calls captured by screenpipe)
-- "how long / time spent / which apps / most used" → activity-summary (not raw frame counts or SQL)
-- "what was on screen / what was I reading" → search with content_type: "all" or "accessibility"
-- "what was I doing" → activity-summary first; the windows field usually has enough without further searches
-
-# Local server auth
-
-The local screenpipe server (localhost:3030) requires a bearer token, exposed as env var SCREENPIPE_API_AUTH_KEY. Every curl to localhost:3030 must include \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`. Don't ask the user for a key — you already have it. On 401, retry without the header (auth is disabled on that install).
-
-# Search rules (DB has 600k+ rows)
-
-1. Always include start_time. Default: last 1–2 hours. Widen only when empty.
-2. First search: time only — no q, no app_name, no content_type. Scan results for real app_name values, then narrow. App names are case-sensitive ("Discord" vs "Discord.exe"). The q param searches captured text, not app names.
-3. limit=5–10 per call. Never >50.
-4. Cap at 10 search/API calls per user request, then summarize what you have.
-5. Multi-day queries: one day at a time.
-6. Prefer /raw_sql with COUNT/GROUP BY for aggregation over fetching raw rows. SELECT queries must include LIMIT (max 10000).
-
-# Showing media
-
-- Markdown only: \`![description](/path/to/file.mp4)\` or \`![description](/path/to/image.jpg)\`
-- Use the exact file_path / audio_file_path from results. Never construct or guess paths.
-- Verify the file exists (\`ls\` / \`Test-Path\`) before showing it. If missing, retry the search instead of rendering a broken player.
-
-# Deep links — sparingly
-
-Only when jumping to that exact moment is the answer the user wants. Not as decoration on every timestamp in a recap.
-- Frame: \`[10:30 AM — Chrome](screenpipe://frame/12345)\` — only with a real frame_id from results
-- Timeline (audio): \`[meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z)\` — exact timestamp from audio results
-Never fabricate frame IDs or timestamps.
-
-# Speakers (localhost:3030)
-
-- GET /speakers/unnamed?limit=10
-- GET /speakers/search?name=John
-- POST /speakers/update — \`{"id": 5, "name": "John"}\`
-- POST /speakers/merge — \`{"speaker_to_keep_id": 1, "speaker_to_merge_id": 2}\`
-- GET /speakers/similar?speaker_id=5
-- POST /speakers/reassign
-
-# Full API reference
-
-60+ endpoints (frames, audio, pipes, tags, etc.) at https://docs.screenpi.pe/llms-full.txt. Fetch when you need anything beyond /search, /activity-summary, or /speakers.
-
-# Rich rendering — only when it earns its space
-
-- Mermaid: \`\`\`mermaid blocks for flowcharts / sequences / timelines
-- App breakdown: \`\`\`app-stats blocks, one row per app as "App Name|minutes_decimal". Dedupe variants ("discord.exe" + "Discord" → one row with summed minutes)
-- Collapsible: \`<details><summary>label</summary>content</details>\` for optional / secondary info
-Don't reach for these on short answers.
-
-Current time: ${now.toISOString()}
-User's timezone: ${timezone} (UTC${offsetStr})
-User's local time: ${now.toLocaleString()}`;
-}
-
-function buildConnectionsContext(
-  connections: Array<{ id: string; name: string; category?: string; description?: string }>
-): string {
-  const withDesc = connections.filter((c) => c.description);
-  if (withDesc.length === 0) return "";
-  const entries = withDesc
-    .map((c) => `## ${c.name} (${c.id})\n${c.description}`)
-    .join("\n\n");
-  return `\n\n# Connected integrations\n\nThe user has connected the following external services. Use the endpoints listed under each to fetch live data when relevant. All endpoints are on http://localhost:3030 and require \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`.\n\n${entries}`;
-}
-
 interface SearchResult {
   type: "OCR" | "Audio" | "UI";
   content: {
@@ -302,6 +600,15 @@ interface ToolCall {
   isRunning: boolean;
 }
 
+function queuedSnapshotsEqual(a: PiQueuedPrompt[], b: PiQueuedPrompt[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].id !== b[i].id || a[i].preview !== b[i].preview) return false;
+  }
+  return true;
+}
+
 type ContentBlock =
   | { type: "text"; text: string }
   | { type: "tool"; toolCall: ToolCall }
@@ -312,18 +619,62 @@ interface Message {
   role: "user" | "assistant";
   content: string; // full text for copy/history
   displayContent?: string; // short label shown in chat (e.g. template name)
+  intent?: "steer";
+  turnIntentId?: string;
   images?: string[]; // base64 data URLs of attached images
+  attachments?: ChatAttachment[]; // non-image files extracted to text; rendered as cards above the bubble
   timestamp: number;
   contentBlocks?: ContentBlock[];
+  sourceCitations?: SourceCitation[];
   model?: string;
   provider?: string;
   retryPrompt?: string; // when set, renders a retry CTA on error messages
-  /** True between optimistic enqueue and the moment Pi's drain loop picks
-   *  the prompt up (`agent_start` for this turn). Drives a lighter visual
-   *  treatment so the user can tell at-a-glance which messages are still
-   *  waiting in line vs. already in-flight. Cleared by handleAgentStart. */
-  queued?: boolean;
+  interruptedBySteer?: boolean;
+  steeredResponse?: boolean;
+  workDurationMs?: number; // wall-clock work duration for coalesced pipe-run assistants
 }
+
+type QueuedDisplayPayload = {
+  preview: string;
+  images: string[];
+  attachments?: ChatAttachment[];
+  displayContent?: string;
+  optimisticUserId?: string;
+  turnIntentId?: string;
+};
+
+type OptimisticSteerPayload = {
+  id: string;
+  content: string;
+  turnIntentId?: string;
+};
+
+type TurnIntentRecord = {
+  id: string;
+  sessionId: string;
+  kind: "normal" | "queued" | "steer";
+  content: string;
+  preview: string;
+  displayedUserId?: string;
+  queueId?: string;
+  createdAt: number;
+  consumedAssistantId?: string;
+};
+
+type PendingSteerBatchItem = {
+  turnIntentId: string;
+  sessionId: string;
+  content: string;
+  originalUserMessage: string;
+  interruptedAssistantId?: string;
+  images: string[];
+  attachments?: ChatAttachment[];
+  displayContent?: string;
+  optimisticUserId: string;
+  createdAt: number;
+};
+
+const TURN_INTENT_LEDGER_TTL_MS = 10 * 60 * 1000;
 
 // Tool icons by name
 const TOOL_ICONS: Record<string, string> = {
@@ -436,297 +787,6 @@ function GridDissolveLoader({
 // can show "Searched ChatGPT 'foo'" instead of the raw curl URL. Pi's pipes
 // emit these as plain bash tool calls (no MCP), with the app name encoded as
 // app_name=X in the query string — see crates/screenpipe-core/assets/pipes/.
-interface SearchInfo {
-  appName?: string;
-  windowName?: string;
-  query?: string;
-  contentType?: string;
-}
-function parseSearchCommand(cmd: string): SearchInfo | null {
-  if (!cmd) return null;
-  const m = cmd.match(/https?:\/\/[^\s'"`]+\/search\?[^\s'"`]+/);
-  if (!m) return null;
-  try {
-    const url = new URL(m[0]);
-    if (!url.pathname.endsWith("/search")) return null;
-    const sp = url.searchParams;
-    const out: SearchInfo = {
-      appName: sp.get("app_name") || undefined,
-      windowName: sp.get("window_name") || undefined,
-      query: sp.get("q") || undefined,
-      contentType: sp.get("content_type") || undefined,
-    };
-    if (!out.appName && !out.windowName && !out.query && !out.contentType) return null;
-    return out;
-  } catch {
-    return null;
-  }
-}
-
-// Reads the JSON payload from a `-d '<json>'` (or --data / --data-raw)
-// argument of a curl command. Single-quoted is the common shape in pi's
-// pipes; double-quoted with backslash-escaped inner quotes is the fallback.
-function curlBodyJson(cmd: string): any | null {
-  let m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+'((?:[^'\\]|\\.)*)'/s);
-  let raw = m ? m[1] : null;
-  if (!raw) {
-    m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+"((?:[^"\\]|\\.)*)"/s);
-    raw = m ? m[1].replace(/\\"/g, '"') : null;
-  }
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch {}
-  try { return JSON.parse(raw.replace(/\\'/g, "'")); } catch {}
-  return null;
-}
-
-function curlMethod(cmd: string): string {
-  if (/(^|\s)(?:-I|--head)(?=\s|$)/i.test(cmd)) return "HEAD";
-  const m = cmd.match(/(?:-X|--request)\s+([A-Z]+)/i);
-  return m ? m[1].toUpperCase() : "GET";
-}
-
-function trunc(s: string, n: number): string {
-  return s.length > n ? s.slice(0, n) + "…" : s;
-}
-
-function sqlTables(sql: string): string[] {
-  const out = new Set<string>();
-  const re = /(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(sql)) !== null) out.add(m[1].toLowerCase());
-  return Array.from(out);
-}
-
-function sqlVerb(sql: string): string {
-  const s = sql.trim().toUpperCase();
-  if (s.startsWith("SELECT")) {
-    if (/^\s*SELECT\s+COUNT\s*\(/i.test(sql.trim())) return "Counted";
-    return "Queried";
-  }
-  if (s.startsWith("WITH")) return "Queried";
-  if (s.startsWith("INSERT")) return "Inserted into";
-  if (s.startsWith("UPDATE")) return "Updated";
-  if (s.startsWith("DELETE")) return "Deleted from";
-  return "Ran SQL on";
-}
-
-type WebTargetKind = "fetch" | "navigate" | "eval";
-
-interface WebTargetPresentation {
-  url: string;
-  domain: string;
-  label: string;
-  kind: WebTargetKind;
-}
-
-interface CurlPresentation {
-  label: string;
-  appName?: string;
-  connectionIconName?: string;
-  webTarget?: WebTargetPresentation;
-}
-
-function parseUrlCandidate(raw: string): URL | null {
-  let candidate = raw;
-  for (let i = 0; i < 4; i++) {
-    try {
-      return new URL(candidate);
-    } catch {
-      candidate = candidate.replace(/[),.;\]}]+$/, "");
-    }
-  }
-  return null;
-}
-
-function urlsInCommand(cmd: string): URL[] {
-  return Array.from(cmd.matchAll(/https?:\/\/[^\s'"`<>]+/g))
-    .map((m) => parseUrlCandidate(m[0]))
-    .filter((url): url is URL => Boolean(url));
-}
-
-function isLocalScreenpipeUrl(url: URL): boolean {
-  return (url.hostname === "localhost" || url.hostname === "127.0.0.1") && url.port === "3030";
-}
-
-function domainForUrl(url: URL): string {
-  return url.hostname.replace(/^www\./i, "");
-}
-
-function displayWebUrl(url: URL): string {
-  const domain = domainForUrl(url);
-  const path = `${url.pathname}${url.search}`;
-  return path && path !== "/" ? trunc(`${domain}${path}`, 48) : domain;
-}
-
-function webTargetFromUrl(url: URL, kind: WebTargetKind): WebTargetPresentation | null {
-  if (isLocalScreenpipeUrl(url)) return null;
-  return {
-    url: url.toString(),
-    domain: domainForUrl(url),
-    label: displayWebUrl(url),
-    kind,
-  };
-}
-
-function webTargetFromUrlString(raw: string, kind: WebTargetKind): WebTargetPresentation | null {
-  const url = parseUrlCandidate(raw);
-  return url ? webTargetFromUrl(url, kind) : null;
-}
-
-function firstExternalWebTarget(cmd: string, kind: WebTargetKind): WebTargetPresentation | null {
-  for (const url of urlsInCommand(cmd)) {
-    const target = webTargetFromUrl(url, kind);
-    if (target) return target;
-  }
-  return null;
-}
-
-function externalCurlLabel(method: string, target: WebTargetPresentation): string {
-  if (method === "GET") return `Fetched ${target.domain}`;
-  if (method === "HEAD") return `Checked ${target.domain}`;
-  if (method === "POST") return `Posted to ${target.domain}`;
-  return `${method} ${target.domain}`;
-}
-
-// Maps pi's bash curl calls to the local screenpipe API into a human label.
-// Pi only emits raw curl (no MCP), so the action lives in the URL + body —
-// every endpoint family pi actually uses (sampled from ~/.pi/agent/sessions)
-// gets its own rewrite here. Unknown endpoints fall back to "<METHOD> <path>".
-function classifyCurl(cmd: string): CurlPresentation | null {
-  if (!cmd) return null;
-
-  const search = parseSearchCommand(cmd);
-  if (search) {
-    const target = search.appName || search.windowName || search.contentType || "recordings";
-    const q = search.query ? ` "${trunc(search.query, 40)}"` : "";
-    return { label: `Searched ${target}${q}`, appName: search.appName || search.windowName };
-  }
-
-  const method = curlMethod(cmd);
-  const urls = urlsInCommand(cmd);
-  const url = urls.find(isLocalScreenpipeUrl);
-  if (!url) {
-    const target = firstExternalWebTarget(cmd, "fetch");
-    if (!target || !/\bcurl\b/i.test(cmd)) return null;
-    return { label: externalCurlLabel(method, target), webTarget: target };
-  }
-
-  const path = url.pathname.replace(/\/$/, "") || "/";
-
-  if (path === "/raw_sql") {
-    const body = curlBodyJson(cmd);
-    const sql = body && typeof body.query === "string" ? body.query : null;
-    if (!sql) return { label: "Ran SQL" };
-    const tables = sqlTables(sql);
-    const verb = sqlVerb(sql);
-    if (tables.length === 0) return { label: verb };
-    if (tables.length === 1) return { label: `${verb} ${tables[0]}` };
-    return { label: `${verb} ${tables.slice(0, 2).join(" + ")}${tables.length > 2 ? " +…" : ""}` };
-  }
-
-  if (path === "/activity-summary") return { label: "Activity summary" };
-
-  if (path === "/memories") {
-    if (method === "POST") return { label: "Saved memory" };
-    return { label: "Listed memories" };
-  }
-  const memMatch = path.match(/^\/memories\/(\w+)$/);
-  if (memMatch) {
-    const id = memMatch[1];
-    if (method === "PATCH" || method === "PUT") return { label: `Updated memory #${id}` };
-    if (method === "DELETE") return { label: `Deleted memory #${id}` };
-    return { label: `Got memory #${id}` };
-  }
-
-  if (path === "/meetings") return { label: "Listed meetings" };
-  const meetingMatch = path.match(/^\/meetings\/(\w+)$/);
-  if (meetingMatch) {
-    const id = meetingMatch[1];
-    if (method === "PATCH" || method === "PUT") {
-      const body = curlBodyJson(cmd);
-      const hasTitle = body && typeof body.title === "string" && body.title.length > 0;
-      const hasNote = body && typeof body.note === "string" && body.note.length > 0;
-      if (hasTitle && hasNote) return { label: `Renamed + summarized meeting #${id}` };
-      if (hasNote) return { label: `Summarized meeting #${id}` };
-      if (hasTitle) return { label: `Renamed meeting #${id}` };
-      return { label: `Updated meeting #${id}` };
-    }
-    if (method === "DELETE") return { label: `Deleted meeting #${id}` };
-    return { label: `Got meeting #${id}` };
-  }
-
-  if (path === "/speakers/similar") {
-    const name = url.searchParams.get("name") || url.searchParams.get("speaker_name");
-    return { label: name ? `Found similar speakers for "${trunc(name, 30)}"` : "Found similar speakers" };
-  }
-  if (path === "/speakers/merge") return { label: "Merged speakers" };
-  if (path === "/speakers/search") {
-    const q = url.searchParams.get("name") || url.searchParams.get("q");
-    return { label: q ? `Searched speakers "${trunc(q, 30)}"` : "Searched speakers" };
-  }
-  if (path === "/speakers/unnamed") return { label: "Listed unnamed speakers" };
-  if (path.startsWith("/speakers/")) {
-    const id = path.split("/")[2];
-    if (method === "PATCH" || method === "PUT") return { label: `Renamed speaker #${id}` };
-    return { label: `Got speaker #${id}` };
-  }
-
-  if (path === "/connections/browsers/owned-default/navigate") {
-    const body = curlBodyJson(cmd);
-    if (body && typeof body.url === "string") {
-      const target = webTargetFromUrlString(body.url, "navigate");
-      if (target) return { label: `Opened ${target.domain} in agent browser`, webTarget: target };
-    }
-    return { label: "Navigated agent browser" };
-  }
-  if (path === "/connections/browsers/owned-default/eval") {
-    const body = curlBodyJson(cmd);
-    if (body && typeof body.url === "string") {
-      const target = webTargetFromUrlString(body.url, "eval");
-      if (target) return { label: `Ran JS on ${target.domain}`, webTarget: target };
-    }
-    return { label: "Ran JS in agent browser" };
-  }
-  if (path.startsWith("/connections/browsers/")) return { label: "Agent browser action" };
-
-  if (path === "/connections") {
-    return { label: "Listed connections", connectionIconName: "connections" };
-  }
-  if (path.startsWith("/connections/")) {
-    const name = path.split("/")[2];
-    if (method === "DELETE") {
-      return { label: `Removed ${name} connection`, connectionIconName: name };
-    }
-    if (method === "POST" || method === "PATCH" || method === "PUT") {
-      return { label: `Configured ${name} connection`, connectionIconName: name };
-    }
-    return { label: `${name} connection`, connectionIconName: name };
-  }
-
-  if (path === "/pipes") {
-    if (method === "POST") return { label: "Installed pipe" };
-    return { label: "Listed pipes" };
-  }
-  const pipeMatch = path.match(/^\/pipes\/([^/]+)(?:\/(.+))?$/);
-  if (pipeMatch) {
-    const name = pipeMatch[1];
-    const sub = pipeMatch[2];
-    if (sub === "executions") return { label: `${name}: recent runs` };
-    if (sub === "run" || method === "POST") return { label: `Ran pipe ${name}` };
-    if (method === "PATCH" || method === "PUT") return { label: `Configured pipe ${name}` };
-    if (method === "DELETE") return { label: `Removed pipe ${name}` };
-    return { label: `Pipe ${name}` };
-  }
-
-  if (path === "/frames/export") return { label: "Exported video" };
-  if (path === "/health") return { label: "Health check" };
-  if (path === "/list-monitors") return { label: "Listed monitors" };
-  if (path === "/list-audio-devices") return { label: "Listed audio devices" };
-  if (path === "/tags") return { label: "Listed tags" };
-
-  return { label: `${method} ${path}` };
-}
-
 function extractAppFromToolCall(toolCall: ToolCall): string | undefined {
   if (toolCall.toolName === "bash") {
     return classifyCurl(String(toolCall.args?.command ?? ""))?.appName;
@@ -758,11 +818,12 @@ function friendlyToolLabel(toolCall: ToolCall): string {
       if (result) return result.label;
       // Fallback for non-API curls / arbitrary shell — strip the auth-header
       // boilerplate so the truncation surfaces the meaningful tail, not the
-      // 80-char "-H Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" header.
+      // 80-char "-H Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" header.
+      // Matches both the canonical and deprecated alias name.
       const stripped = cmd
         .replace(/^\s*curl\s+/, "curl ")
         .replace(/\s-s\s+/g, " ")
-        .replace(/\s-H\s+['"]Authorization:\s*Bearer\s+\$?SCREENPIPE_API_AUTH_KEY['"]\s*/g, " ")
+        .replace(/\s-H\s+['"]Authorization:\s*Bearer\s+\$?SCREENPIPE_(LOCAL_API|API_AUTH)_KEY['"]\s*/g, " ")
         .replace(/\s-H\s+['"]Content-Type:\s*application\/json['"]\s*/g, " ")
         .replace(/\s+/g, " ")
         .trim();
@@ -785,6 +846,194 @@ function friendlyToolLabel(toolCall: ToolCall): string {
   }
 }
 
+interface ToolDetailField {
+  label: string;
+  value: string;
+}
+
+interface BashToolDetailsPresentation {
+  title: string;
+  eyebrow: string;
+  fields: ToolDetailField[];
+  resultSummary?: string;
+  rawCommand: string;
+  rawResult?: string;
+}
+
+function bashToolDetailsPresentation(toolCall: ToolCall): BashToolDetailsPresentation | null {
+  const command = String(toolCall.args.command ?? "");
+  if (!command) return null;
+
+  const classified = classifyCurl(command);
+  const method = curlMethod(command);
+  const localUrl = urlsInCommand(command).find(isLocalScreenpipeUrl);
+  const fields: ToolDetailField[] = [];
+
+  if (!localUrl) {
+    const target = firstExternalWebTarget(command, "fetch");
+    if (!target || !classified) return null;
+    fields.push({ label: "domain", value: target.domain });
+    fields.push({ label: "method", value: method });
+    return {
+      title: classified.label,
+      eyebrow: "Web request",
+      fields,
+      resultSummary: summarizeToolResult(toolCall.result, "web"),
+      rawCommand: command,
+      rawResult: toolCall.result,
+    };
+  }
+
+  const path = localUrl.pathname.replace(/\/$/, "") || "/";
+  fields.push({ label: "endpoint", value: path });
+  fields.push({ label: "method", value: method });
+
+  const sp = localUrl.searchParams;
+  const addParam = (label: string, key: string) => {
+    const value = sp.get(key);
+    if (value) fields.push({ label, value: trunc(value, 80) });
+  };
+
+  addParam("query", "q");
+  addParam("content", "content_type");
+  addParam("app", "app_name");
+  addParam("window", "window_name");
+  addParam("limit", "limit");
+
+  const body = curlBodyJson(command);
+  if (path === "/raw_sql" && body && typeof body.query === "string") {
+    const tables = sqlTables(body.query);
+    if (tables.length > 0) fields.push({ label: "tables", value: tables.join(", ") });
+  }
+
+  if (path.startsWith("/connections/")) {
+    const connection = path.split("/")[2];
+    if (connection) fields.push({ label: "connection", value: connection });
+  }
+
+  return {
+    title: classified?.label ?? `${method} ${path}`,
+    eyebrow: endpointFamily(path),
+    fields,
+    resultSummary: summarizeToolResult(toolCall.result, path),
+    rawCommand: command,
+    rawResult: toolCall.result,
+  };
+}
+
+function BashToolDetails({ toolCall }: { toolCall: ToolCall }) {
+  const details = bashToolDetailsPresentation(toolCall);
+  if (!details) {
+    return (
+      <div className="py-1.5">
+        <ToolCodeBlock code={sanitizeCommand(String(toolCall.args.command ?? ""))} language="shell" />
+      </div>
+    );
+  }
+
+  const formattedResult = formatToolResult(details.rawResult);
+
+  return (
+    <div className="py-1.5 space-y-2">
+      <div className="rounded-md border border-border/50 bg-muted/20 px-2.5 py-2">
+        <div className="mb-1 flex min-w-0 items-center gap-1.5">
+          <span className="shrink-0 rounded border border-border/50 px-1.5 py-0.5 text-[10px] font-mono uppercase leading-none text-muted-foreground">
+            {details.eyebrow}
+          </span>
+          {details.resultSummary && (
+            <span className="min-w-0 truncate text-[11px] text-muted-foreground">
+              {details.resultSummary}
+            </span>
+          )}
+        </div>
+        <div className="text-sm font-medium text-foreground/85">{details.title}</div>
+        {details.fields.length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-1">
+            {details.fields.map((field) => (
+              <span
+                key={`${field.label}:${field.value}`}
+                className="max-w-full rounded border border-border/40 bg-background/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
+              >
+                <span className="text-muted-foreground/60">{field.label}</span>{" "}
+                <span className="text-foreground/70">{field.value}</span>
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <details className="group rounded-md border border-border/30 bg-background/40 px-2 py-1.5">
+        <summary className="cursor-pointer select-none text-[10px] font-mono uppercase tracking-wide text-muted-foreground/70 transition-colors hover:text-foreground/70">
+          technical details
+        </summary>
+        <div className="mt-2 space-y-2">
+          <ToolCodeBlock label="command" code={sanitizeCommand(details.rawCommand)} language="shell" />
+          {formattedResult && <ToolCodeBlock label="response" code={formattedResult} language="json" />}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function ToolCodeBlock({
+  code,
+  language,
+  label,
+}: {
+  code: string;
+  language: "shell" | "json";
+  label?: string;
+}) {
+  return (
+    <div className="min-w-0">
+      {label && <div className="mb-1 text-[10px] font-mono uppercase text-muted-foreground/50">{label}</div>}
+      <pre className="max-h-[220px] max-w-full overflow-auto rounded border border-border/30 bg-muted/20 p-2 text-xs leading-relaxed">
+        <code className="font-mono">
+          {language === "json" ? <HighlightedJson code={code} /> : <HighlightedShell code={code} />}
+        </code>
+      </pre>
+    </div>
+  );
+}
+
+function HighlightedShell({ code }: { code: string }) {
+  const parts = code.split(/(\s+|https?:\/\/[^\s"']+|-[A-Za-z-]+|\$[A-Z0-9_]+)/g).filter(Boolean);
+  return (
+    <>
+      {parts.map((part, index) => {
+        const className = /^https?:\/\//.test(part)
+          ? "text-cyan-700 dark:text-cyan-300"
+          : /^-[A-Za-z-]+$/.test(part)
+            ? "text-purple-700 dark:text-purple-300"
+            : /^\$[A-Z0-9_]+$/.test(part)
+              ? "text-amber-700 dark:text-amber-300"
+              : part === "curl"
+                ? "text-foreground"
+                : "text-muted-foreground";
+        return <span key={`${part}-${index}`} className={className}>{part}</span>;
+      })}
+    </>
+  );
+}
+
+function HighlightedJson({ code }: { code: string }) {
+  const parts = code.split(/("(?:\\.|[^"\\])*"\s*:|"(?:\\.|[^"\\])*"|true|false|null|-?\d+(?:\.\d+)?)/g).filter(Boolean);
+  return (
+    <>
+      {parts.map((part, index) => {
+        const className = /^".*"\s*:$/s.test(part)
+          ? "text-purple-700 dark:text-purple-300"
+          : /^"/s.test(part)
+            ? "text-emerald-700 dark:text-emerald-300"
+            : /^(true|false|null|-?\d)/.test(part)
+              ? "text-amber-700 dark:text-amber-300"
+              : "text-muted-foreground";
+        return <span key={`${part}-${index}`} className={className}>{part}</span>;
+      })}
+    </>
+  );
+}
+
 // Render friendly expanded details instead of raw JSON
 function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
   if (toolCall.toolName === "edit" && toolCall.args.old_string && toolCall.args.new_string) {
@@ -800,13 +1049,7 @@ function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
     );
   }
   if (toolCall.toolName === "bash" && toolCall.args.command) {
-    return (
-      <div className="py-1.5">
-        <pre className="whitespace-pre-wrap break-words text-foreground/70 text-xs font-mono max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full">
-          {toolCall.args.command}
-        </pre>
-      </div>
-    );
+    return <BashToolDetails toolCall={toolCall} />;
   }
   const entries = Object.entries(toolCall.args).filter(([k]) => k !== "path" && k !== "command");
   if (entries.length === 0) return null;
@@ -893,7 +1136,7 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
             >
               <div className="border-l border-border ml-0 pl-3 mt-1 mb-1">
                 <FriendlyToolDetails toolCall={toolCall} />
-                {toolCall.result !== undefined && (
+                {toolCall.result !== undefined && toolCall.toolName !== "bash" && (
                   <div className="mt-1 pt-1 border-t border-border/50">
                     <pre className={cn(
                       "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full text-xs font-mono",
@@ -1023,6 +1266,7 @@ const STATIC_APP_ICONS: Record<string, string> = {
   bee: "/images/bee.png",
   airtable: "/images/airtable.png",
   apple: "/images/apple.svg",
+  "apple-calendar": "/images/apple.svg",
   "apple intelligence": "/images/apple-intelligence.png",
   screenpipe: "/images/screenpipe.png",
 };
@@ -1098,6 +1342,9 @@ function ConnectionToolIcon({ name }: { name: string }) {
   const key = normalizeAppKey(name);
   if (key === "connections") {
     return <Plug className="w-3.5 h-3.5 text-foreground/70" aria-label="connections" />;
+  }
+  if (key === "windows-calendar") {
+    return <Calendar className="w-3.5 h-3.5 text-muted-foreground" aria-label="Windows Calendar" />;
   }
   if (key === "gmail") {
     return (
@@ -1176,15 +1423,22 @@ function AppStatsBlock({ content }: { content: string }) {
 
 // Markdown renderer for text blocks
 function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
+  // Assistant messages occasionally contain raw tool-call XML the model emitted
+  // as text — rewrite it to a fenced code block so rehypeRaw doesn't collapse
+  // the unknown tags and bleed the args into the prose. See sanitize-tool-call-xml.ts.
+  const renderText = rewriteLocalMarkdownLinksForChat(
+    isUser ? text : sanitizeToolCallXml(text),
+  );
   return (
     <MemoizedReactMarkdown
       className={cn(
         "prose prose-sm max-w-full break-words overflow-hidden [word-break:break-word]",
         isUser
-          ? "prose-invert dark:prose dark:text-background"
+          ? "text-foreground dark:prose-invert"
           : "dark:prose-invert"
       )}
       remarkPlugins={[remarkGfm]}
+      urlTransform={chatUrlTransform}
       rehypePlugins={[rehypeRaw]}
       components={{
         p({ children }) {
@@ -1218,15 +1472,16 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
           );
         },
         a({ href, children, ...props }) {
-          const isMediaLink = href?.toLowerCase().match(/\.(mp4|mp3|wav|webm)$/);
-          if (isMediaLink && href) {
-            return <VideoComponent filePath={href} className="my-2" />;
-          }
-
-          if (href?.startsWith("screenpipe://timeline") || href?.startsWith("screenpipe://frame")) {
-            const handleTimelineClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
+          if (
+            href?.startsWith("screenpipe://timeline") ||
+            href?.startsWith("screenpipe://frame") ||
+            href?.startsWith("screenpipe://view")
+          ) {
+            const handleScreenpipeLinkClick = async (e: React.MouseEvent<HTMLAnchorElement>) => {
               e.preventDefault();
               try {
+                if (await openScreenpipeViewerLink(href)) return;
+
                 if (href.startsWith("screenpipe://frame")) {
                   const frameId = href.split("frame/")[1]?.replace(/^\//, "");
                   if (frameId) {
@@ -1247,14 +1502,14 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
                   }
                 }
               } catch (error) {
-                console.error("Failed to navigate to timeline:", error);
+                console.error("Failed to open screenpipe link:", error);
               }
             };
 
             return (
               <a
                 href="#"
-                onClick={handleTimelineClick}
+                onClick={handleScreenpipeLinkClick}
                 className="underline underline-offset-2 text-blue-500 hover:text-blue-400 cursor-pointer inline"
                 {...props}
               >
@@ -1269,39 +1524,6 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
             </a>
           );
         },
-        img({ src, alt, ...props }) {
-          if (!src) return null;
-          if (src.toLowerCase().endsWith(".mp4")) {
-            return <VideoComponent filePath={src} className="my-2" />;
-          }
-          // try asset protocol for local paths, fall back to http serve
-          let imgSrc = src;
-          if (src.startsWith("/")) {
-            try {
-              imgSrc = convertFileSrc(src);
-            } catch {
-              imgSrc = `${getApiBaseUrl()}/experimental/frames/from-file?path=${encodeURIComponent(src)}`;
-            }
-          }
-          return (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={imgSrc}
-              alt={alt || ""}
-              className="max-w-full h-auto rounded-md my-2 border border-border"
-              loading="lazy"
-              onError={(e) => {
-                // fallback: if asset protocol fails, try convertFileSrc or raw path
-                const target = e.currentTarget;
-                if (src.startsWith("/") && !target.dataset.retried) {
-                  target.dataset.retried = "1";
-                  target.src = convertFileSrc(src);
-                }
-              }}
-              {...props}
-            />
-          );
-        },
         pre({ children, ...props }) {
           return (
             <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 p-3 my-2 text-xs max-w-full not-prose" {...props}>
@@ -1311,29 +1533,20 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
         code({ className, children, ...props }) {
           const content = String(children).replace(/\n$/, "");
-          const isMedia = content.trim().toLowerCase().match(/\.(mp4|mp3|wav|webm)$/);
-          const match = /language-(\w+)/.exec(className || "");
+          const match = /language-([^\s]+)/.exec(className || "");
           const language = match?.[1] || "";
           const isCodeBlock = className?.includes("language-");
 
           if (language === "mermaid") {
-            return <MermaidDiagram chart={content} />;
+            return <MermaidDiagramBlock chart={content} />;
           }
 
           if (language === "app-stats") {
             return <AppStatsBlock content={content} />;
           }
 
-          if (isMedia) {
-            return <VideoComponent filePath={content.trim()} className="my-2" />;
-          }
-
           if (isCodeBlock) {
-            return (
-              <code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-200" {...props}>
-                {content}
-              </code>
-            );
+            return <ChatCodeBlock language={language} value={content} />;
           }
 
           return (
@@ -1344,7 +1557,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
       }}
     >
-      {text}
+      {renderText}
     </MemoizedReactMarkdown>
   );
 }
@@ -1353,7 +1566,8 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
 type GroupedBlock =
   | { type: "text"; text: string; key: number }
   | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number; key: number }
-  | { type: "tool-group"; toolCalls: ToolCall[]; key: number };
+  | { type: "tool-group"; toolCalls: ToolCall[]; key: number }
+  | { type: "work-group"; toolCalls: ToolCall[]; durationMs: number; key: number };
 
 function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
   const result: GroupedBlock[] = [];
@@ -1381,6 +1595,74 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
   return result;
 }
 
+function collapseHiddenWorkGroups(grouped: GroupedBlock[], hideThinkingBlocks: boolean): GroupedBlock[] {
+  // Run always: collapsing consecutive tool-groups into a single
+  // "Worked for X min" rail is useful regardless of the thinking-block
+  // visibility setting. `hideThinkingBlocks` only controls whether
+  // thinking blocks get absorbed into the work-group (true) or shown
+  // as separate pills (false).
+
+  const out: GroupedBlock[] = [];
+  let pendingToolCalls: ToolCall[] = [];
+  let pendingDurationMs = 0;
+  let pendingToolGroupCount = 0;
+  let pendingKey: number | null = null;
+
+  const flushPending = () => {
+    if (pendingToolCalls.length === 0) {
+      pendingDurationMs = 0;
+      pendingToolGroupCount = 0;
+      pendingKey = null;
+      return;
+    }
+
+    const key = pendingKey ?? out.length;
+    if (pendingToolGroupCount > 1 || pendingToolCalls.length >= 3) {
+      out.push({
+        type: "work-group",
+        toolCalls: [...pendingToolCalls],
+        durationMs: pendingDurationMs,
+        key,
+      });
+    } else {
+      out.push({ type: "tool-group", toolCalls: [...pendingToolCalls], key });
+    }
+
+    pendingToolCalls = [];
+    pendingDurationMs = 0;
+    pendingToolGroupCount = 0;
+    pendingKey = null;
+  };
+
+  for (const group of grouped) {
+    if (group.type === "tool-group") {
+      pendingKey ??= group.key;
+      pendingToolCalls.push(...group.toolCalls);
+      pendingToolGroupCount++;
+      continue;
+    }
+
+    if (group.type === "thinking") {
+      if (hideThinkingBlocks) {
+        pendingDurationMs += group.durationMs ?? 0;
+        pendingKey ??= group.key;
+        continue;
+      }
+      // Show thinking pills inline — flush pending tool work first so
+      // ordering is preserved and the thinking pill renders separately.
+      flushPending();
+      out.push(group);
+      continue;
+    }
+
+    flushPending();
+    out.push(group);
+  }
+
+  flushPending();
+  return out;
+}
+
 // Build natural-language summary of completed tool calls
 function buildToolSummary(toolCalls: ToolCall[]): string {
   const counts: Record<string, number> = {};
@@ -1399,7 +1681,29 @@ function buildToolSummary(toolCalls: ToolCall[]): string {
   return parts.join(", ");
 }
 
-function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: ToolCall[]; defaultExpanded?: boolean }) {
+function formatWorkDuration(durationMs: number): string {
+  if (!durationMs || durationMs <= 0) return "Worked";
+  const seconds = Math.max(1, Math.round(durationMs / 1000));
+  if (seconds < 60) return "Worked for <1 min";
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return `Worked for ${minutes} min${minutes === 1 ? "" : "s"}`;
+}
+
+function toolCallRenderKey(toolCall: ToolCall, index: number): string {
+  return `${toolCall.id || toolCall.toolName || "tool"}:${index}`;
+}
+
+function ToolCallGroup({
+  toolCalls,
+  defaultExpanded = false,
+  summaryOverride,
+  hideCount = false,
+}: {
+  toolCalls: ToolCall[];
+  defaultExpanded?: boolean;
+  summaryOverride?: string;
+  hideCount?: boolean;
+}) {
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
 
   const hasRunning = toolCalls.some((tc) => tc.isRunning);
@@ -1407,7 +1711,7 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
   const allDone = !hasRunning;
   const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
   const total = toolCalls.length;
-  const summary = allDone ? buildToolSummary(toolCalls) : "";
+  const summary = allDone ? (summaryOverride || buildToolSummary(toolCalls)) : "";
 
   // Auto-expand while running, auto-collapse when done (user can override).
   // `defaultExpanded` keeps the group open even when done — used for
@@ -1423,8 +1727,8 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
         className="w-full flex items-center gap-2 py-1 text-left min-w-0 group"
       >
         {/* Status indicator */}
-        <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
-          {hasRunning ? (
+        {!hideCount && hasRunning && (
+          <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
             <motion.span
               className="inline-block"
               animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
@@ -1432,10 +1736,8 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
             >
               [{doneCount}/{total}]
             </motion.span>
-          ) : (
-            <span>[{total}]</span>
-          )}
-        </span>
+          </span>
+        )}
 
         {/* Summary text */}
         <span className="truncate flex-1 text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
@@ -1467,7 +1769,7 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
             <div className="pl-1 pt-1">
               {toolCalls.map((tc, i) => (
                 <motion.div
-                  key={tc.id}
+                  key={toolCallRenderKey(tc, i)}
                   initial={{ opacity: 0, x: -8 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ duration: 0.15, delay: i * 0.03 }}
@@ -1487,14 +1789,37 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
 }
 
 // Renders message content with interleaved text and tool call blocks
-function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
+function MessageContent({
+  message,
+  deferSourceFooter = false,
+  onImageClick,
+  onRetry,
+}: {
+  message: Message;
+  deferSourceFooter?: boolean;
+  onImageClick?: (images: string[], index: number) => void;
+  onRetry?: (prompt: string) => void;
+}) {
   const isUser = message.role === "user";
   const { settings } = useSettings();
   const hideThinkingBlocks = settings?.hideThinkingBlocks ?? true;
+  const sourceCitations = isUser ? [] : sourceCitationsFromMessage(message);
+  const sourceFooter = !deferSourceFooter && sourceCitations.length > 0 ? (
+    <SourceCitationFooter citations={sourceCitations} />
+  ) : null;
+
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
+  const isErrorMessage = !isUser && (
+    !!message.retryPrompt ||
+    message.content.startsWith("Error:") ||
+    message.content.includes("Something went wrong") ||
+    message.content.includes("crashed") ||
+    message.content.includes("failed after retries")
+  );
 
   // Retry CTA — shown at the bottom of error messages that have a retryPrompt
   const retryCta = !isUser && message.retryPrompt ? (
-    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3">
+    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3 flex-wrap">
       <button
         type="button"
         onClick={() => onRetry?.(message.retryPrompt!)}
@@ -1504,6 +1829,24 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
         Try again
       </button>
       <span className="text-xs text-muted-foreground">or edit your message above</span>
+      <button
+        type="button"
+        onClick={() => openFeedback(`AI error in chat: ${message.content.slice(0, 300)}`)}
+        className="ml-auto flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-muted-foreground transition-colors"
+      >
+        report issue
+      </button>
+    </div>
+  ) : isErrorMessage ? (
+    <div className="mt-2 flex items-center gap-1.5">
+      <span className="text-xs text-destructive/60">still happening?</span>
+      <button
+        type="button"
+        onClick={() => openFeedback(`AI error in chat: ${message.content.slice(0, 300)}`)}
+        className="text-xs text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
+      >
+        report issue
+      </button>
     </div>
   ) : null;
 
@@ -1511,6 +1854,7 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
   // Group consecutive tool blocks into collapsible containers
   if (message.contentBlocks && message.contentBlocks.length > 0) {
     const grouped = groupContentBlocks(message.contentBlocks);
+    const displayGroups = collapseHiddenWorkGroups(grouped, hideThinkingBlocks);
     // When the message has no rendered prose (no text block — common for
     // pipe-run executions whose entire output is thinking + tool calls),
     // expand thinking blocks by default. Otherwise the collapsed
@@ -1520,7 +1864,7 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
     const hasText = grouped.some((g) => g.type === "text");
     return (
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
-        {grouped.map((group) => {
+        {displayGroups.map((group) => {
           if (group.type === "text") {
             return <MarkdownBlock key={`text-${group.key}`} text={group.text} isUser={isUser} />;
           }
@@ -1536,46 +1880,310 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
           if (group.type === "tool-group") {
             return <ToolCallGroup key={`tools-${group.key}`} toolCalls={group.toolCalls} defaultExpanded={!hasText} />;
           }
+          if (group.type === "work-group") {
+            // Fall back to message-level workDurationMs when the
+            // grouping pass collected no thinking-block duration (e.g.
+            // pipe runs whose agent emits no thinking deltas — the
+            // parser captures wall-clock time on the ChatMessage).
+            const durationMs = group.durationMs > 0 ? group.durationMs : (message.workDurationMs ?? 0);
+            return (
+              <ToolCallGroup
+                key={`work-${group.key}`}
+                toolCalls={group.toolCalls}
+                defaultExpanded={!hasText}
+                summaryOverride={formatWorkDuration(durationMs)}
+                hideCount={hasText}
+              />
+            );
+          }
           return null;
         })}
+        {sourceFooter}
         {retryCta}
       </div>
     );
   }
 
-  // Render attached image thumbnails for user messages — larger, ChatGPT-style; click to open viewer
-  const imageThumbs = isUser && message.images && message.images.length > 0 ? (
-    <div className="flex gap-2 flex-wrap">
-      {message.images.map((img, i) => (
+  // Unified attachment row — docs (PDF/DOCX/…) + image thumbnails share
+  // ONE flex container so the strip reads as a single row regardless of
+  // attachment mix. The previous design rendered docs and images as two
+  // sibling <div>s, which produced a fragmented two-row strip whenever
+  // a user attached one of each kind. Both card types are 80px tall so
+  // the row baselines line up cleanly.
+  const hasDocs = isUser && (message.attachments?.length ?? 0) > 0;
+  const hasImages = isUser && (message.images?.length ?? 0) > 0;
+  const attachmentsRow = (hasDocs || hasImages) ? (
+    <div className="flex gap-2 flex-wrap items-stretch">
+      {hasDocs && message.attachments!.map((doc, i) => {
+        const badge = attachmentBadge(doc.ext);
+        return (
+          <div
+            key={`doc-${doc.name}-${i}`}
+            title={`${doc.name} — ${doc.charCount.toLocaleString()} chars${doc.truncated ? " (truncated)" : ""}`}
+            className="flex items-center gap-2.5 h-20 max-w-[260px] rounded-xl border border-border/50 bg-muted/40 px-3 shadow-sm"
+          >
+            <div className={`shrink-0 w-11 h-11 rounded-lg flex items-center justify-center text-[10px] font-semibold tracking-tight ${badge.tint}`}>
+              {badge.label}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-xs font-medium text-foreground">{doc.name}</div>
+              <div className="truncate text-[10px] text-muted-foreground">
+                {doc.charCount.toLocaleString()} chars{doc.truncated ? " • truncated" : ""}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+      {hasImages && message.images!.map((img, i) => (
         <button
-          key={i}
+          key={`img-${i}`}
           type="button"
           onClick={() => onImageClick?.(message.images ?? [], i)}
-          className="rounded-lg border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="rounded-xl border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={img} alt={`Attached ${i + 1}`} className="max-w-[200px] max-h-[160px] min-h-[80px] w-full object-cover cursor-pointer" />
+          <img src={img} alt={`Attached ${i + 1}`} className="h-20 w-20 min-h-20 min-w-20 object-cover cursor-pointer" />
         </button>
       ))}
     </div>
   ) : null;
 
   // Fallback: plain text message (user messages, non-Pi assistant messages)
-  // For user messages with a display label, show the short label with expand toggle
+  // For user messages with a display label, show the short label with expand toggle.
+  //
+  // When the message has document attachments, the "fullContent" we'd
+  // expand to contains the raw `<attached file: ...>` payload — that's
+  // a model-input artifact, not something the user wants to read. The
+  // attachment cards above already disclose what was attached, so we
+  // suppress the expansion chevron in that case (label-only bubble).
   if (isUser && message.displayContent) {
     return (
       <div className="space-y-2">
-        {imageThumbs}
-        <CollapsibleUserMessage label={message.displayContent} fullContent={message.content} />
+        {attachmentsRow}
+        {hasDocs
+          ? <div className="text-sm font-medium">{message.displayContent}</div>
+          : <CollapsibleUserMessage label={message.displayContent} fullContent={message.content} />}
       </div>
     );
   }
+  // Strip raw "Error:" prefix that leaks from backend — show only the human part
+  const displayText = !isUser && message.content.startsWith("Error: ")
+    ? message.content.slice("Error: ".length)
+    : message.content;
+
   return (
     <div className="space-y-2">
-      {imageThumbs}
-      <MarkdownBlock text={message.content} isUser={isUser} />
+      {attachmentsRow}
+      <MarkdownBlock text={displayText} isUser={isUser} />
+      {sourceFooter}
       {retryCta}
     </div>
+  );
+}
+
+// Per-extension presentation for attachment cards. Kept tiny on purpose —
+// the goal is recognition at a glance, not pixel-perfect filetype branding.
+function attachmentBadge(ext: string): { label: string; tint: string } {
+  const e = ext.toLowerCase();
+  if (e === "pdf") return { label: "PDF", tint: "bg-red-500/15 text-red-600 dark:text-red-400" };
+  if (e === "docx" || e === "doc") return { label: "DOC", tint: "bg-blue-500/15 text-blue-600 dark:text-blue-400" };
+  if (e === "xlsx" || e === "xls" || e === "csv" || e === "tsv") return { label: e.toUpperCase(), tint: "bg-green-500/15 text-green-600 dark:text-green-400" };
+  if (e === "md" || e === "markdown") return { label: "MD", tint: "bg-purple-500/15 text-purple-600 dark:text-purple-400" };
+  if (e === "json") return { label: "JSON", tint: "bg-amber-500/15 text-amber-600 dark:text-amber-400" };
+  return { label: (e || "FILE").toUpperCase().slice(0, 4), tint: "bg-muted text-muted-foreground" };
+}
+
+
+
+function getMessageIntentLabel(message: Message): string | null {
+  if (message.role === "assistant" && (message.intent === "steer" || message.steeredResponse)) {
+    return "Steered conversation";
+  }
+  return null;
+}
+
+function isPlaceholderConversationTitle(value?: string | null): boolean {
+  if (!value) return true;
+  const normalized = value.trim().toLowerCase();
+  return normalized === "" || normalized === "new chat" || normalized === "untitled";
+}
+
+function isSteeredAssistantMessage(message: Message): boolean {
+  return message.role === "assistant" && (message.intent === "steer" || message.steeredResponse === true);
+}
+
+function hasRenderableAssistantBody(message: Message): boolean {
+  if (message.role !== "assistant") return false;
+  if (message.content && message.content !== "Processing...") return true;
+  return Boolean(message.contentBlocks?.length);
+}
+
+function isNormalUserMessage(message: Message): boolean {
+  return message.role === "user" && message.intent !== "steer";
+}
+
+type ChatRenderItem =
+  | {
+      type: "message";
+      message: Message;
+      hideWhenCollapsedBy?: string;
+      hideIntentLabelWhenCollapsedBy?: string;
+      showActionsWhenExpandedBy?: string;
+    }
+  | {
+      type: "collapsed-steer-work";
+      id: string;
+      rootUser: Message;
+      hiddenAssistants: Message[];
+      segmentMessages: Message[];
+    };
+
+function buildCollapsedSteerRenderItems(
+  messages: Message[],
+  options: { canCollapseSteerWork: boolean }
+): ChatRenderItem[] {
+  const items: ChatRenderItem[] = [];
+
+  for (let i = 0; i < messages.length; i += 1) {
+    const root = messages[i];
+    if (!root || !isNormalUserMessage(root)) {
+      items.push({ type: "message", message: root });
+      continue;
+    }
+
+    let end = i + 1;
+    while (end < messages.length && !isNormalUserMessage(messages[end])) {
+      end += 1;
+    }
+
+    const segment = messages.slice(i, end);
+    const steerUsers = segment.filter((message) => message.role === "user" && message.intent === "steer");
+    if (steerUsers.length === 0 || !options.canCollapseSteerWork) {
+      items.push(...segment.map((message) => ({ type: "message" as const, message })));
+      i = end - 1;
+      continue;
+    }
+
+    const latestSteer = steerUsers[steerUsers.length - 1];
+    const latestSteerIndex = segment.findIndex((message) => message.id === latestSteer?.id);
+    const assistants = segment.filter((message) => message.role === "assistant");
+    const finalAssistant =
+      (latestSteer?.turnIntentId
+        ? [...assistants].reverse().find((message) => message.turnIntentId === latestSteer.turnIntentId && hasRenderableAssistantBody(message))
+        : undefined) ??
+      [...segment.slice(Math.max(0, latestSteerIndex + 1))]
+        .reverse()
+        .find((message) => message.role === "assistant" && hasRenderableAssistantBody(message)) ??
+      [...assistants].reverse().find(hasRenderableAssistantBody) ??
+      assistants[assistants.length - 1];
+    const hasCompletedLatestSteerResponse = Boolean(
+      finalAssistant &&
+      finalAssistant.content !== "Processing..." &&
+      hasRenderableAssistantBody(finalAssistant)
+    );
+    if (!hasCompletedLatestSteerResponse) {
+      items.push(...segment.map((message) => ({ type: "message" as const, message })));
+      i = end - 1;
+      continue;
+    }
+    const hiddenAssistantIds = new Set(
+      assistants
+        .filter((message) => message.id !== finalAssistant?.id)
+        .map((message) => message.id)
+    );
+    const hiddenAssistants = assistants.filter((message) => hiddenAssistantIds.has(message.id));
+    const collapsedWorkId = `collapsed-steer-${root.id}`;
+
+    items.push({ type: "message", message: root });
+    let collapsedWorkInserted = false;
+    const pushCollapsedWork = () => {
+      if (collapsedWorkInserted || hiddenAssistants.length === 0) return;
+      items.push({
+        type: "collapsed-steer-work",
+        id: collapsedWorkId,
+        rootUser: root,
+        hiddenAssistants,
+        segmentMessages: segment,
+      });
+      collapsedWorkInserted = true;
+    };
+
+    for (const message of segment.slice(1)) {
+      if (hiddenAssistantIds.has(message.id)) {
+        pushCollapsedWork();
+        items.push({
+          type: "message",
+          message,
+          hideWhenCollapsedBy: collapsedWorkId,
+        });
+        continue;
+      }
+      const isFinalAssistant = message.id === finalAssistant?.id;
+      items.push({
+        type: "message",
+        message,
+        hideIntentLabelWhenCollapsedBy: isFinalAssistant && hiddenAssistants.length > 0
+          ? collapsedWorkId
+          : undefined,
+        showActionsWhenExpandedBy: message.role === "user" && message.intent === "steer" && hiddenAssistants.length > 0
+          ? collapsedWorkId
+          : undefined,
+      });
+    }
+    pushCollapsedWork();
+
+    i = end - 1;
+  }
+
+  return items;
+}
+
+function collapsedSteerWorkDuration(item: Extract<ChatRenderItem, { type: "collapsed-steer-work" }>): string {
+  const timestamps = item.segmentMessages
+    .map((message) => message.timestamp)
+    .filter((timestamp) => Number.isFinite(timestamp));
+  if (timestamps.length < 2) return "Worked";
+  const durationMs = Math.max(...timestamps) - Math.min(...timestamps);
+  if (durationMs <= 0) return "Worked";
+  const seconds = Math.max(1, Math.round(durationMs / 1000));
+  if (seconds < 60) return `Worked for ${seconds}s`;
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  return `Worked for ${minutes} min${minutes === 1 ? "" : "s"}`;
+}
+
+function CollapsedSteerWorkRow({
+  item,
+  expanded,
+  onToggle,
+}: {
+  item: Extract<ChatRenderItem, { type: "collapsed-steer-work" }>;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const label = collapsedSteerWorkDuration(item);
+
+  return (
+    <motion.div
+      key={item.id}
+      initial={{ opacity: 0, y: 10 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0, y: -10 }}
+      transition={{ duration: 0.2 }}
+      className="relative flex min-w-0 justify-start"
+      data-testid="chat-collapsed-steer-work"
+    >
+      <div className="group/message flex flex-col items-start w-full min-w-0">
+        <button
+          type="button"
+          onClick={onToggle}
+          className="inline-flex items-center gap-1 py-0.5 text-left text-muted-foreground/70 hover:text-muted-foreground transition-colors"
+        >
+          <span className="text-xs leading-none">{label}</span>
+          {expanded ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        </button>
+        <div className="mt-0.5 w-full border-t border-border/20" />
+      </div>
+    </motion.div>
   );
 }
 
@@ -1591,14 +2199,14 @@ function CollapsibleUserMessage({ label, fullContent }: { label: string; fullCon
             setExpanded(!expanded);
           }}
           onMouseUp={(e) => e.stopPropagation()}
-          className="shrink-0 p-0.5 rounded hover:bg-background/20 text-background/60 hover:text-background/90 transition-colors"
+          className="shrink-0 p-0.5 rounded hover:bg-muted-foreground/10 text-muted-foreground hover:text-foreground transition-colors"
           title={expanded ? "Collapse prompt" : "Show full prompt"}
         >
           {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
         </button>
       </div>
       {expanded && (
-        <div className="mt-2 pt-2 border-t border-background/20 text-xs opacity-80 whitespace-pre-wrap break-words">
+        <div className="mt-2 pt-2 border-t border-border/50 text-xs text-muted-foreground whitespace-pre-wrap break-words">
           {fullContent}
         </div>
       )}
@@ -1627,6 +2235,7 @@ function ChatTitleMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1641,16 +2250,27 @@ function ChatTitleMenu({
   const storeTitle = useChatStore((s) =>
     conversationId ? s.sessions[conversationId]?.title : undefined
   );
+  const streamingTitle = useChatStore((s) =>
+    conversationId ? s.sessions[conversationId]?.streamingTitle : undefined
+  );
   const session = useChatStore((s) =>
     conversationId ? s.sessions[conversationId] : undefined
   );
   const isPinned = session?.pinned ?? false;
-  const firstUserMsg = messages.find((m) => m.role === "user");
-  const derivedTitle = firstUserMsg?.content?.slice(0, 50);
+  const firstUserMsg = messages.find(
+    (m) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
+  );
+  const derivedTitle = firstUserMsg
+    ? deriveFallbackConversationTitle(firstUserMsg)
+    : undefined;
+  const hasMessages = messages.length > 0;
   const title =
-    storeTitle && storeTitle !== "new chat" && storeTitle !== "untitled"
-      ? storeTitle
-      : derivedTitle || "";
+    streamingTitle ||
+    (storeTitle &&
+      !isPlaceholderConversationTitle(storeTitle) &&
+      !isConversationHistorySyncPrompt(storeTitle)
+        ? storeTitle
+        : derivedTitle || (hasMessages ? "untitled" : ""));
 
   // No conversation id OR no real content → don't render. The "+ New"
   // button on the right is enough; no point showing actions for a
@@ -1690,7 +2310,10 @@ function ChatTitleMenu({
   };
   const handleDelete = async () => {
     setOpen(false);
-    if (!confirm("Delete this chat? This cannot be undone.")) return;
+    setConfirmingDelete(true);
+  };
+  const confirmDelete = async () => {
+    setConfirmingDelete(false);
     try {
       await deleteConversation(conversationId);
       useChatStore.getState().actions.drop(conversationId);
@@ -1770,6 +2393,24 @@ function ChatTitleMenu({
           Delete
         </button>
       </PopoverContent>
+      <Dialog open={confirmingDelete} onOpenChange={setConfirmingDelete}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>delete chat</DialogTitle>
+            <p className="text-sm text-muted-foreground">
+              Delete this chat? This cannot be undone.
+            </p>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmingDelete(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={() => void confirmDelete()}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Popover>
   );
 }
@@ -1787,7 +2428,7 @@ export function StandaloneChat({
   hideInlineHistory?: boolean;
 } = {}) {
   const { settings, updateSettings, isSettingsLoaded, reloadStore } = useSettings();
-  const { isMac } = usePlatform();
+  const { isMac, isWindows, isLoading: isPlatformLoading } = usePlatform();
   // Drop the macOS traffic-light reservation when the window is fullscreen
   // (the buttons hide). Only relevant in standalone mode (no parent
   // className) — the embedded variant is below the host's chrome anyway.
@@ -1798,9 +2439,54 @@ export function StandaloneChat({
   // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
-  const [connections, setConnections] = useState<
-    Array<{ id: string; name: string; category?: string; description?: string }>
-  >([]);
+  const [connections, setConnections] = useState<ConnectedIntegration[]>([]);
+  const [allConnectionItems, setAllConnectionItems] = useState<ConnectionListItem[]>([]);
+  const [connectionPreviewSuggestions, setConnectionPreviewSuggestions] = useState<Suggestion[]>([]);
+  const [suggestionRefreshSeed, setSuggestionRefreshSeed] = useState(0);
+  const connectionSetupSuggestions = React.useMemo(
+    () => buildConnectionSetupSuggestions(allConnectionItems, appItems),
+    [allConnectionItems, appItems]
+  );
+  const refreshConnectionState = React.useCallback(async () => {
+    if (isPlatformLoading) return;
+    try {
+      const res = await localFetch("/connections");
+      if (!res.ok) return;
+      const json = (await res.json()) as { data?: ConnectionListItem[] };
+      const allConnections = (json.data ?? []).map((connection) =>
+        normalizeConnectionForPlatform(connection, isWindows)
+      );
+      const connectedConnections = allConnections
+        .filter((connection) => connection.connected)
+        .map((connection) => ({
+          id: connection.id,
+          name: connection.name,
+          icon: connection.icon,
+          category: connection.category,
+          description: connection.description,
+        }));
+
+      setAllConnectionItems(allConnections);
+      setConnections(connectedConnections);
+    } catch {
+      // silent — connection-aware UI simply won't surface stale data
+    }
+  }, [isPlatformLoading, isWindows]);
+  const visibleSuggestionSignature = React.useMemo(
+    () =>
+      [...autoSuggestions, ...connectionPreviewSuggestions]
+        .map((s) => `${s.text}|${s.preview ?? ""}|${s.connectionIcon ?? ""}|${s.priority ?? ""}`)
+        .join("\n"),
+    [autoSuggestions, connectionPreviewSuggestions]
+  );
+  const connectionAwareSuggestions = React.useMemo(
+    () => mergeConnectionSuggestions(autoSuggestions, connections, connectionPreviewSuggestions, suggestionRefreshSeed),
+    [autoSuggestions, connections, connectionPreviewSuggestions, suggestionRefreshSeed]
+  );
+
+  useEffect(() => {
+    setSuggestionRefreshSeed(0);
+  }, [visibleSuggestionSignature]);
   // Watch the input section's width so suggestion chips can collapse into
   // a popover on narrow chat columns.
   useEffect(() => {
@@ -1814,49 +2500,53 @@ export function StandaloneChat({
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const res = await localFetch("/connections");
-        if (!res.ok) return;
-        const json = (await res.json()) as {
-          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
-        };
-        const list = (json.data ?? [])
-          .filter((c) => c.connected)
-          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
-        if (!cancelled) setConnections(list);
-      } catch {
-        // silent — filter just won't surface connections, no UI regression
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    void refreshConnectionState();
+  }, [refreshConnectionState]);
 
   // Re-fetch connections whenever the window becomes visible — picks up any
   // integrations connected in Settings while the chat was open.
   useEffect(() => {
-    const fetchConnections = async () => {
-      try {
-        const res = await localFetch("/connections");
-        if (!res.ok) return;
-        const json = (await res.json()) as {
-          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
-        };
-        const list = (json.data ?? [])
-          .filter((c) => c.connected)
-          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
-        setConnections(list);
-      } catch { /* silent */ }
-    };
     const onVisible = () => {
-      if (document.visibilityState === "visible") fetchConnections();
+      if (document.visibilityState === "visible") void refreshConnectionState();
     };
+    const onFocus = () => void refreshConnectionState();
     document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
-  }, []);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener(CONNECTIONS_UPDATED_EVENT, onFocus);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener(CONNECTIONS_UPDATED_EVENT, onFocus);
+    };
+  }, [refreshConnectionState]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (connections.length === 0) {
+      setConnectionPreviewSuggestions([]);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    fetchConnectionPreviewSuggestions(connections).then((suggestions) => {
+      if (!cancelled) setConnectionPreviewSuggestions(suggestions);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connections]);
+
+  const refreshVisibleSuggestions = useCallback(() => {
+    setSuggestionRefreshSeed((seed) => seed + 1);
+    void refreshSuggestions();
+
+    if (connections.length === 0) return;
+    void fetchConnectionPreviewSuggestions(connections).then((suggestions) => {
+      setConnectionPreviewSuggestions(suggestions);
+    });
+  }, [connections, refreshSuggestions]);
 
   // Custom summary templates (persisted in settings)
   const [customTemplates, setCustomTemplates] = useState<CustomTemplate[]>([]);
@@ -1886,15 +2576,24 @@ export function StandaloneChat({
   };
 
   const [input, setInput] = useState("");
+  // Mirror `input` into a ref so the chat-switch logic in
+  // useChatConversations can snapshot the outgoing composer text
+  // without needing it as a dep (which would re-bind handlers every
+  // keystroke). Same pattern as attachedDocsRef / pendingDocsRef below.
+  const inputValueRef = useRef<string>("");
+  useEffect(() => { inputValueRef.current = input; }, [input]);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [expandedSteerWorkIds, setExpandedSteerWorkIds] = useState<Set<string>>(() => new Set());
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [streamedCharCount, setStreamedCharCount] = useState(0);
   // Prompts the user has queued while a previous one is still streaming.
   // Sourced from rust via the `pi-queue-changed` event — single source of
   // truth lives in `pi_command_queue.rs`. Cleared as soon as the drain loop
   // pulls a queued item and writes it to stdin (it's then in-flight).
-  const [queuedPrompts, setQueuedPrompts] = useState<PiQueuedPrompt[]>([]);
+  const [queuedPromptsBySession, setQueuedPromptsBySession] = useState<Record<string, PiQueuedPrompt[]>>({});
+  const queuedDisplayBySessionRef = useRef<Record<string, Record<string, QueuedDisplayPayload>>>({});
+  const [queuedActionPromptId, setQueuedActionPromptId] = useState<string | null>(null);
+  const queuedScrollRef = useRef<HTMLDivElement | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
   // Cursor-style inline edit: click a sent user message to tweak and resend
@@ -1909,6 +2608,23 @@ export function StandaloneChat({
   // handler can distinguish a real click (enter edit mode) from a drag-
   // select (let the browser select text — don't swallow it).
   const pendingEditDownXYRef = useRef<{ x: number; y: number } | null>(null);
+
+  const enterEditMode = (message: Message, caretPos?: number) => {
+    setEditDraft(message.content);
+    pendingCaretRef.current = caretPos ?? message.content.length;
+    setEditingMessageId(message.id);
+  };
+
+  const commitEditedMessage = (message: Message, draft: string) => {
+    const trimmed = draft.trim();
+    setEditingMessageId(null);
+    pendingCaretRef.current = null;
+    if (!trimmed || trimmed === message.content) return;
+    const idx = messages.findIndex((m) => m.id === message.id);
+    if (idx === -1) return;
+    setMessages((prev) => prev.slice(0, idx));
+    sendMessage(trimmed, message.displayContent);
+  };
 
   // Given a click on a rendered message bubble, compute the character offset
   // into `content` that corresponds to where the user clicked. Falls back to
@@ -1957,6 +2673,8 @@ export function StandaloneChat({
   const [renameValue, setRenameValue] = useState("");
   const [deletingConvId, setDeletingConvId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
+  const pendingPresetRef = useRef<AIPreset | null>(null);
+  const isStreamingRef = useRef(false);
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
@@ -1968,6 +2686,8 @@ export function StandaloneChat({
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const stickToBottomRef = useRef(true);
+  const autoScrollFrameRef = useRef<number | null>(null);
   // Tracks the input section's width so we can collapse the auto-suggestion
   // chips into a popover when the chat column is narrow (e.g. when the
   // BrowserSidebar opens and squeezes the chat). Updated by a ResizeObserver
@@ -1984,8 +2704,41 @@ export function StandaloneChat({
   const [prefillFrameId, setPrefillFrameId] = useState<number | null>(null);
   const [isPreparingPrefill, setIsPreparingPrefill] = useState(false);
   const [pastedImages, setPastedImages] = useState<string[]>([]); // Base64 data URLs
+  // Mirror for the per-conversation draft snapshot — see inputValueRef.
+  const pastedImagesRef = useRef<string[]>([]);
+  useEffect(() => { pastedImagesRef.current = pastedImages; }, [pastedImages]);
+  const [attachedDocs, setAttachedDocs] = useState<ExtractedDoc[]>([]); // extracted text from non-image files
+  // ref mirror so send paths read the latest docs without widening their deps arrays
+  const attachedDocsRef = useRef<ExtractedDoc[]>([]);
+  useEffect(() => { attachedDocsRef.current = attachedDocs; }, [attachedDocs]);
+  // Docs that are currently being extracted. Rendered in the composer
+  // chip row with a spinner badge, and the send button is disabled while
+  // any are pending — otherwise a user who hits send during the gap
+  // between drop and extraction-complete sends the message without the
+  // file attached. Name/ext are known up-front (from filename) so we can
+  // show a real label, not a generic "loading…".
+  type PendingDoc = { id: string; name: string; ext: string };
+  const [pendingDocs, setPendingDocs] = useState<PendingDoc[]>([]);
+  const pendingDocsRef = useRef<PendingDoc[]>([]);
+  useEffect(() => { pendingDocsRef.current = pendingDocs; }, [pendingDocs]);
+  // Single-shot stash of the attachment metadata for the NEXT user message
+  // about to be created by sendPiMessage / enqueuePiMessage. sendMessage
+  // populates this just before dispatching; the message-creation sites
+  // read-and-clear it. We don't carry attachments via the existing
+  // displayLabel string because that's already overloaded (it's the
+  // collapsed bubble label) and because each send path creates its own
+  // Message object — a ref keeps the surface area tiny vs. plumbing a
+  // new param through five call sites.
+  const pendingAttachmentsRef = useRef<ChatAttachment[]>([]);
+  function consumePendingAttachments(): ChatAttachment[] | undefined {
+    const list = pendingAttachmentsRef.current;
+    if (!list.length) return undefined;
+    pendingAttachmentsRef.current = [];
+    return list;
+  }
   const [imageViewer, setImageViewer] = useState<{ images: string[]; index: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const steerShortcutInFlightRef = useRef(false);
   const isEmbedded = !!className; // embedded in settings vs overlay panel
 
   // Pi agent state
@@ -1995,17 +2748,100 @@ export function StandaloneChat({
   const piStreamingTextRef = useRef<string>("");
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
+  const pendingNextPiUserIntentRef = useRef<"steer" | null>(null);
+  const pendingNextPiUserDisplayRef = useRef<QueuedDisplayPayload | null>(null);
+  const optimisticSteerRef = useRef<OptimisticSteerPayload | null>(null);
+  const turnIntentLedgerRef = useRef<TurnIntentRecord[]>([]);
+  const pendingSteerBatchRef = useRef<PendingSteerBatchItem[]>([]);
+  const pendingSteerFlushInFlightRef = useRef(false);
+  const steerAbortAtBoundaryRef = useRef(false);
+  const steerAbortInFlightRef = useRef(false);
+  const streamRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Last error text observed anywhere in the current Pi stream — used to surface
   // quota / credits_exhausted errors when agent_end arrives with no content and
   // no explicit stopReason=error on any message (some providers drop that flag).
   const piLastErrorRef = useRef<string | null>(null);
   const piStartInFlightRef = useRef(false);
+  const sendDispatchInFlightRef = useRef(false);
+  const forceQueueModeRef = useRef(false);
   const piFirstCallRetried = useRef(false);
+  // Per-turn 429 auto-retry budget; reset on each new user send + on success.
+  const piRateLimitRetries = useRef(0);
+  const sessionActivityLastEmitAtRef = useRef<Record<string, number>>({});
+  const sessionActivityLastSigRef = useRef<Record<string, string>>({});
   const piStoppedIntentionallyRef = useRef(false);
   const piIntentionallyStoppedPidsRef = useRef<Set<number>>(new Set());
+  const piActiveStopRequestedRef = useRef(false);
+
+  const normalizeTurnIntentText = (value: string) => value.replace(/\s+/g, " ").trim();
+
+  const turnIntentTextValuesMatch = (leftValue: string, rightValue: string) => {
+    const left = normalizeTurnIntentText(leftValue);
+    const right = normalizeTurnIntentText(rightValue);
+    if (!left || !right) return false;
+    return left === right;
+  };
+
+  const turnIntentMatchesText = (record: TurnIntentRecord, text: string) => {
+    return turnIntentTextValuesMatch(record.content, text) || turnIntentTextValuesMatch(record.preview, text);
+  };
+
+  const pruneTurnIntentLedger = () => {
+    const cutoff = Date.now() - TURN_INTENT_LEDGER_TTL_MS;
+    turnIntentLedgerRef.current = turnIntentLedgerRef.current.filter((record) => record.createdAt >= cutoff);
+  };
+
+  const registerTurnIntent = (record: TurnIntentRecord) => {
+    pruneTurnIntentLedger();
+    turnIntentLedgerRef.current = [
+      ...turnIntentLedgerRef.current.filter((item) => item.id !== record.id),
+      record,
+    ];
+  };
+
+  const removeTurnIntent = (id: string) => {
+    turnIntentLedgerRef.current = turnIntentLedgerRef.current.filter((record) => record.id !== id);
+  };
+
+  const findTurnIntentForUserStart = (
+    sessionId: string | null | undefined,
+    text: string,
+    display?: QueuedDisplayPayload | null,
+  ): TurnIntentRecord | null => {
+    if (!sessionId) return null;
+    pruneTurnIntentLedger();
+    const sessionTurnIntents = turnIntentLedgerRef.current.filter((record) => record.sessionId === sessionId);
+    const hasIncomingText = Boolean(normalizeTurnIntentText(text));
+    const displayPreviewMatchesIncoming = display?.preview
+      ? turnIntentTextValuesMatch(display.preview, text)
+      : false;
+    const canUseDisplayIdentity = Boolean(display && (!hasIncomingText || displayPreviewMatchesIncoming));
+    const recordMatchesIncoming = (record: TurnIntentRecord) =>
+      turnIntentMatchesText(record, text) ||
+      (displayPreviewMatchesIncoming && turnIntentMatchesText(record, display?.preview ?? ""));
+
+    const byDisplayId = canUseDisplayIdentity && display?.turnIntentId
+      ? sessionTurnIntents.find((record) => record.id === display.turnIntentId)
+      : null;
+    if (byDisplayId && recordMatchesIncoming(byDisplayId)) return byDisplayId;
+
+    const byOptimisticUser = canUseDisplayIdentity && display?.optimisticUserId
+      ? sessionTurnIntents.find((record) => record.displayedUserId === display.optimisticUserId)
+      : null;
+    if (byOptimisticUser && recordMatchesIncoming(byOptimisticUser)) return byOptimisticUser;
+
+    return sessionTurnIntents.find((record) => turnIntentMatchesText(record, text)) ?? null;
+  };
+
+  const markTurnIntentConsumed = (id: string, assistantId: string) => {
+    turnIntentLedgerRef.current = turnIntentLedgerRef.current.map((record) =>
+      record.id === id ? { ...record, consumedAssistantId: assistantId } : record
+    );
+  };
   const piPresetSwitchPromiseRef = useRef<Promise<void> | null>(null);
   const piCrashCountRef = useRef(0);
   const piLastCrashRef = useRef(0);
+  const piTerminationDedupRef = useRef<Record<string, number>>({});
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
   // Initial Pi session id. The chat panel's foreground bus registration
@@ -2043,7 +2879,7 @@ export function StandaloneChat({
   const lastUserMessageRef = useRef<string>("");
 
   // Ref to sendMessage so useEffect callbacks can call it without stale closures
-  const sendMessageRef = useRef<(msg: string, displayLabel?: string) => Promise<void>>();
+  const sendMessageRef = useRef<(msg: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>>();
   // Bypass guard for auto-send from chat-prefill (Pi confirmed running but React state stale)
   const autoSendBypassRef = useRef(false);
 
@@ -2065,6 +2901,78 @@ export function StandaloneChat({
   const [conversationId, setConversationId] = useState<string | null>(
     initialSessionIdRef.current,
   );
+  const currentQueueSessionId = conversationId ?? piSessionIdRef.current;
+  const queuedPrompts = useMemo(
+    () => queuedPromptsBySession[currentQueueSessionId] ?? EMPTY_QUEUED_PROMPTS,
+    [queuedPromptsBySession, currentQueueSessionId]
+  );
+
+  useEffect(() => {
+    void refreshConnectionState();
+  }, [conversationId, refreshConnectionState]);
+
+  // Drop any single-shot attachment metadata stashed for the previous
+  // chat's next-send when the user navigates away. Without this, a user
+  // who staged an attachment in chat A and switched to chat B before
+  // sending would have A's attachment metadata silently ride along on
+  // B's next message. Pairs with the composer-state clear inside
+  // loadConversation / startNewConversation.
+  useEffect(() => {
+    pendingAttachmentsRef.current = [];
+  }, [conversationId]);
+
+  // Mirror the live composer into the chat store so the CURRENT chat
+  // always has an up-to-date draft snapshot. This covers the case
+  // where the user closes/hides the panel (or quits Pi without
+  // switching first) — the draft survives because it's in the store,
+  // not just in React state. It also handles the "draft cleared after
+  // send" case for free: when sendMessage calls setInput("") etc.,
+  // the next mirror tick writes an empty draft, which the store action
+  // treats as "drop draft entirely". Debounced so per-keystroke writes
+  // don't churn the store. Skip when conversationId is null (brand-new
+  // chat with no session record yet — setComposerDraft would no-op).
+  useEffect(() => {
+    if (!conversationId) return;
+    const t = setTimeout(() => {
+      useChatStore.getState().actions.setComposerDraft(conversationId, {
+        input,
+        pastedImages,
+        attachedDocs,
+        pendingDocs,
+      });
+    }, 250);
+    return () => clearTimeout(t);
+  }, [conversationId, input, pastedImages, attachedDocs, pendingDocs]);
+
+  const cancelStreamingMessageRender = useCallback(() => {
+    if (streamRenderTimerRef.current) {
+      clearTimeout(streamRenderTimerRef.current);
+      streamRenderTimerRef.current = null;
+    }
+  }, []);
+
+  const renderStreamingMessageSnapshot = useCallback(() => {
+    const msgId = piMessageIdRef.current;
+    if (!msgId) return;
+    const content = piStreamingTextRef.current;
+    const contentBlocks = [...piContentBlocksRef.current];
+    setMessages((prev) =>
+      prev.map((m) => (m.id === msgId ? { ...m, content, contentBlocks } : m))
+    );
+  }, [setMessages]);
+
+  const flushStreamingMessageRender = useCallback(() => {
+    cancelStreamingMessageRender();
+    renderStreamingMessageSnapshot();
+  }, [cancelStreamingMessageRender, renderStreamingMessageSnapshot]);
+
+  const scheduleStreamingMessageRender = useCallback(() => {
+    if (streamRenderTimerRef.current) return;
+    streamRenderTimerRef.current = setTimeout(() => {
+      streamRenderTimerRef.current = null;
+      renderStreamingMessageSnapshot();
+    }, STREAM_RENDER_THROTTLE_MS);
+  }, [renderStreamingMessageSnapshot]);
 
   // Process an image file to base64
   // Resize image to max 1024px and compress as JPEG to keep base64 payload small
@@ -2134,7 +3042,18 @@ export function StandaloneChat({
     setIsLoading,
     setIsStreaming,
     setPastedImages,
+    setAttachedDocs,
+    setPendingDocs,
+    // Refs for the per-conversation composer draft snapshot/restore.
+    // Passing refs (not values) keeps the hook's deps stable so the
+    // event listeners inside don't churn on every keystroke.
+    inputValueRef,
+    pastedImagesRef,
+    attachedDocsRef,
+    pendingDocsRef,
     settings,
+    selectedPreset: activePreset ?? null,
+    inlineHistoryEnabled: !hideInlineHistory,
   });
 
   // Read an image file by path and append it to pastedImages (base64 data URL)
@@ -2165,23 +3084,90 @@ export function StandaloneChat({
     }
   }, [resizeImage]);
 
-  // Handle file picker
+  // Shared extraction lifecycle: register a pending chip immediately,
+  // run the (potentially multi-second) parser, then swap the pending
+  // chip for a resolved one in attachedDocs (or remove it on error /
+  // empty-result). Bytes-loader is a thunk so the caller can choose
+  // how to source the bytes (path read vs. File.arrayBuffer for paste).
+  const extractAndAttach = useCallback(async (
+    name: string,
+    loadBytes: () => Promise<Uint8Array>,
+  ) => {
+    const ext = extFromName(name);
+    if (!isSupportedDocExt(ext)) {
+      toast({ title: "unsupported file", description: `can't read .${ext || "?"} files`, variant: "destructive" });
+      return;
+    }
+    // Dedupe across both resolved and in-flight attachments. Without
+    // the pending check, double-drop of a slow PDF would queue two
+    // extractions and produce a duplicate chip.
+    if (
+      attachedDocsRef.current.some((d) => d.name === name) ||
+      pendingDocsRef.current.some((d) => d.name === name)
+    ) {
+      return;
+    }
+
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    setPendingDocs((prev) => [...prev, { id: pendingId, name, ext }]);
+
+    try {
+      const bytes = await loadBytes();
+      const doc = await extractDocument(name, bytes);
+      if (!doc.text.trim()) {
+        toast({ title: "no text found", description: `${name} looks empty or has no extractable text`, variant: "destructive" });
+        return;
+      }
+      // Insert under setPendingDocs's removal so the chip transitions
+      // in-place from "loading" to "loaded" inside a single render.
+      setAttachedDocs((prev) => prev.some((d) => d.name === name) ? prev : [...prev, doc]);
+    } catch (err) {
+      console.error("failed to extract attached doc:", err);
+      toast({ title: "couldn't read file", description: err instanceof Error ? err.message : String(err), variant: "destructive" });
+    } finally {
+      setPendingDocs((prev) => prev.filter((p) => p.id !== pendingId));
+    }
+  }, []);
+
+  // Path-based loader (drag-drop / file picker), bytes via tauri fs.
+  const loadDocFromPath = useCallback(async (filePath: string) => {
+    const name = filePath.split(/[\\/]/).pop() || filePath;
+    await extractAndAttach(name, () => readFile(filePath));
+  }, [extractAndAttach]);
+
+  // File-object loader (clipboard paste), bytes via File.arrayBuffer.
+  // Browsers expose pasted Finder/Explorer files as File objects with
+  // no underlying path, so we can't reuse the tauri-fs readFile path.
+  const processDocFile = useCallback(async (file: File) => {
+    const name = file.name || "pasted file";
+    await extractAndAttach(name, async () => new Uint8Array(await file.arrayBuffer()));
+  }, [extractAndAttach]);
+
+  // Handle file picker — images and documents
   const handleFilePicker = useCallback(async () => {
+    const imageExtensions = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
     try {
       const selected = await openFileDialog({
-        multiple: false,
-        filters: [{
-          name: "Images",
-          extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp"],
-        }],
+        multiple: true,
+        filters: [
+          { name: "Attachments", extensions: [...imageExtensions, ...DOC_PICKER_EXTENSIONS] },
+          { name: "Images", extensions: imageExtensions },
+          { name: "Documents", extensions: [...DOC_PICKER_EXTENSIONS] },
+        ],
       });
-      if (selected) {
-        await loadImageFromPath(selected);
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      for (const path of paths) {
+        if (imageExtensions.includes(extFromName(path))) {
+          await loadImageFromPath(path);
+        } else {
+          await loadDocFromPath(path);
+        }
       }
     } catch (err) {
       console.error("file picker error:", err);
     }
-  }, [loadImageFromPath]);
+  }, [loadImageFromPath, loadDocFromPath]);
 
   // Drag-drop only works in the embedded (non-overlay) chat. The overlay is an
   // NSPanel with NonActivatingPanel style which doesn't receive drag events.
@@ -2196,7 +3182,14 @@ export function StandaloneChat({
         setIsDragging(false);
         const paths = event.payload.paths;
         if (paths && paths.length > 0) {
-          loadImageFromPath(paths[0]);
+          const imageExtensions = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"];
+          for (const path of paths) {
+            if (imageExtensions.includes(extFromName(path))) {
+              loadImageFromPath(path);
+            } else {
+              loadDocFromPath(path);
+            }
+          }
         }
       } else if (event.payload.type === "leave") {
         setIsDragging(false);
@@ -2206,40 +3199,52 @@ export function StandaloneChat({
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [isEmbedded, loadImageFromPath]);
+  }, [isEmbedded, loadImageFromPath, loadDocFromPath]);
 
   // Handle paste events to capture images
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
     const files = e.clipboardData?.files;
 
-    // Try items first (works in most browsers)
+    // Walk both surfaces (`items` for the common path, `files` as a
+    // fallback for browsers that don't expose Finder/Explorer pastes
+    // through items). Images take the existing fast path; documents
+    // route through processDocFile, which mirrors the drag-drop flow
+    // including pending-chip rendering. Non-file clipboard content
+    // (plain text, html) is ignored — the default paste handles it.
+    const handled = new Set<File>();
+    const tryDispatch = (file: File | null | undefined) => {
+      if (!file || handled.has(file)) return false;
+      const fileTypeIsImage = file.type.startsWith("image/");
+      const ext = extFromName(file.name || "");
+      if (fileTypeIsImage) {
+        handled.add(file);
+        processImageFile(file);
+        return true;
+      }
+      if (isSupportedDocExt(ext)) {
+        handled.add(file);
+        void processDocFile(file);
+        return true;
+      }
+      return false;
+    };
+
+    let didDispatch = false;
     if (items) {
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
-        if (item.type.startsWith("image/")) {
-          e.preventDefault();
-          const file = item.getAsFile();
-          if (file) {
-            processImageFile(file);
-          }
-          return;
-        }
+        if (item.kind !== "file") continue;
+        if (tryDispatch(item.getAsFile())) didDispatch = true;
       }
     }
-
-    // Fallback: try files array (some browsers put images here)
     if (files && files.length > 0) {
       for (let i = 0; i < files.length; i++) {
-        const file = files[i];
-        if (file.type.startsWith("image/")) {
-          e.preventDefault();
-          processImageFile(file);
-          return;
-        }
+        if (tryDispatch(files[i])) didDispatch = true;
       }
     }
-  }, [processImageFile]);
+    if (didDispatch) e.preventDefault();
+  }, [processImageFile, processDocFile]);
 
   // Signal that this chat window is ready to receive prefill events.
   // Other windows wait for "chat-ready" before emitting "chat-prefill"
@@ -2260,8 +3265,15 @@ export function StandaloneChat({
       sessionStorage.removeItem("pendingChatPrefill");
       try {
         const data = JSON.parse(pending);
+        // Stamp targetWindow so an autoSend prefill is claimed by THIS window
+        // only. sessionStorage is per-window, so the window that stored the
+        // pending prefill (and navigated here) is the correct target. Without
+        // this, pipe-store / pipes-section store the prefill with no target,
+        // and the untargeted re-emit fires in BOTH windows → duplicate chat.
+        // An explicit targetWindow in `data` still wins (spread comes last).
+        const prefillData = { targetWindow: getCurrentWindow().label, ...data };
         // Small delay to let the chat fully initialize without showing setup flashes.
-        setTimeout(() => emit("chat-prefill", data), 120);
+        setTimeout(() => emit("chat-prefill", prefillData), 120);
       } catch {
         setIsPreparingPrefill(false);
       }
@@ -2344,13 +3356,45 @@ export function StandaloneChat({
   // receive the same event, causing duplicate abort→session→prompt sequences.
   const prefillInFlightRef = useRef(false);
 
+  // Cross-window dedup for parallel-job autoSend prefills. Two parallel jobs
+  // can fire identical-content autoSend prefills targeting DIFFERENT windows
+  // ("home" + "chat"); each window mints its own session id and persists the
+  // same logical run twice (the duplicate sidebar rows). Each Tauri window has
+  // isolated localStorage, so we coordinate via Tauri events with a
+  // DETERMINISTIC tie-break (no atomic lock needed): every competing window
+  // broadcasts its claim, waits a fixed collection window to gather all claims
+  // for the same normalized prompt, then independently picks the SAME winner
+  // (smallest window label, then earliest ts, then nonce). Losers drop.
+  const prefillClaimsRef = useRef<Map<string, Array<{ windowLabel: string; timestamp: number; nonce: string }>>>(new Map());
+  useEffect(() => {
+    const unlisten = listen<{ dedupKey: string; windowLabel: string; timestamp: number; nonce: string }>(
+      "chat-prefill-claim",
+      (event) => {
+        const { dedupKey, windowLabel, timestamp, nonce } = event.payload || ({} as any);
+        if (!dedupKey) return;
+        const bucket = prefillClaimsRef.current.get(dedupKey) ?? [];
+        if (!bucket.some((c) => c.nonce === nonce && c.windowLabel === windowLabel)) {
+          bucket.push({ windowLabel, timestamp, nonce });
+          prefillClaimsRef.current.set(dedupKey, bucket);
+        }
+      },
+    );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   // Listen for chat-prefill events from search modal and pipe creation
   useEffect(() => {
-    const unlisten = listen<{ context: string; prompt?: string; frameId?: number; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
-      const { context, prompt, frameId, autoSend, source, targetWindow } = event.payload;
+    const unlisten = listen<{ context: string; prompt?: string; displayLabel?: string; frameId?: number; images?: string[]; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
+      const { context, prompt, displayLabel, frameId, images, autoSend, source, targetWindow } = event.payload;
+      const prefillImages = normalizeImageDataUrls(images);
 
-      // Only process if this window is the intended target (or no target for backwards compat)
-      if (targetWindow && getCurrentWindow().label !== targetWindow) return;
+      // Route to exactly one window. An autoSend prefill with no targetWindow
+      // would otherwise be claimed by BOTH the home and overlay panels — each
+      // mints its own session id and sends, producing a duplicate conversation.
+      // shouldHandleChatPrefillForWindow pins an untargeted autoSend to home.
+      if (!shouldHandleChatPrefillForWindow({ targetWindow, autoSend }, getCurrentWindow().label)) return;
 
       if (autoSend && prompt) {
         // Deduplicate: skip if another listener instance is already handling this
@@ -2364,10 +3408,37 @@ export function StandaloneChat({
         // Start a new conversation then send
         (async () => {
           try {
+            // Cross-window dedup: compete for the right to handle this prefill.
+            const imageKey = prefillImages.map((img) => img.slice(0, 96)).join("|");
+            const dedupKey = `${fullMessage.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 200)}|images:${imageKey}`;
+            const myWindowLabel = getCurrentWindow().label;
+            const myNonce = Math.random().toString(36).slice(2, 10);
+            const myClaim = { windowLabel: myWindowLabel, timestamp: Date.now(), nonce: myNonce };
+            const bucket = prefillClaimsRef.current.get(dedupKey) ?? [];
+            bucket.push(myClaim);
+            prefillClaimsRef.current.set(dedupKey, bucket);
+            try {
+              await emit("chat-prefill-claim", { dedupKey, ...myClaim });
+            } catch {}
+            // Wait the collection window so every competing window's claim lands.
+            await new Promise((r) => setTimeout(r, 250));
+            const claims = prefillClaimsRef.current.get(dedupKey) ?? [myClaim];
+            const winner = [...claims].sort((a, b) => {
+              if (a.windowLabel !== b.windowLabel) return a.windowLabel < b.windowLabel ? -1 : 1;
+              if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+              return a.nonce < b.nonce ? -1 : a.nonce > b.nonce ? 1 : 0;
+            })[0];
+            setTimeout(() => prefillClaimsRef.current.delete(dedupKey), 5_000);
+            if (!winner || winner.nonce !== myNonce || winner.windowLabel !== myWindowLabel) {
+              // Another window won the tie-break — drop this duplicate.
+              console.log(`[chat-prefill] dropped duplicate autoSend (winner=${winner?.windowLabel})`);
+              return;
+            }
             // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
+            optimisticSteerRef.current = null;
             piLastErrorRef.current = null;
             setIsLoading(false);
             setIsStreaming(false);
@@ -2393,7 +3464,7 @@ export function StandaloneChat({
             autoSendBypassRef.current = true;
             await new Promise(r => setTimeout(r, 200));
             if (sendMessageRef.current) {
-              await sendMessageRef.current(fullMessage);
+              await sendMessageRef.current(fullMessage, displayLabel, prefillImages);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
@@ -2412,6 +3483,9 @@ export function StandaloneChat({
       if (frameId) {
         setPrefillFrameId(frameId);
       }
+      if (prefillImages.length > 0) {
+        setPastedImages(prefillImages);
+      }
       if (prompt) {
         setInput(prompt);
       }
@@ -2422,7 +3496,13 @@ export function StandaloneChat({
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [piInfo]);
+    // Register once. The handler only touches refs and stable setters, so it
+    // doesn't need to re-subscribe on piInfo changes — and re-subscribing
+    // creates a teardown/attach gap where an in-flight chat-prefill event can
+    // be lost (e.g. meeting-notes Summarize → page reload → 120ms emit), which
+    // leaves isPreparingPrefill stuck true and the chat blank.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Listen for chat-load-conversation events. Sources:
   //   - timeline (clicking a previous chat in the timeline view)
@@ -2449,62 +3529,66 @@ export function StandaloneChat({
   loadConversationRef.current = loadConversation;
   startNewConversationRef.current = startNewConversation;
 
-  useEffect(() => {
-    const unlisten = listen<{ conversationId: string }>("chat-load-conversation", async (event) => {
-      const { conversationId: convId } = event.payload;
-      const { loadConversationFile } = await import("@/lib/chat-storage");
-      const { useChatStore } = await import("@/lib/stores/chat-store");
+  const openConversationLocally = useCallback(async (convId: string) => {
+    const { loadConversationFile } = await import("@/lib/chat-storage");
+    const { useChatStore } = await import("@/lib/stores/chat-store");
 
-      // 0) Already on this conversation — skip the snapshot+swap. The
-      //    page-level listener handles navigation back to home; we
-      //    just make sure currentId reflects the panel so the sidebar
-      //    re-highlights the row. Without this short-circuit, clicking
-      //    the already-loaded chat from a non-home section would
-      //    snapshot+reset+rehydrate the same id and briefly blank the
-      //    panel.
-      if (convId === piSessionIdRef.current) {
-        useChatStore.getState().actions.setCurrent(convId);
-        emit("chat-current-session", { id: convId });
-        return;
-      }
-
-      // 1) Disk first — saved conversations are the canonical source.
-      const conv = await loadConversationFile(convId);
-      if (conv) {
-        loadConversationRef.current(conv);
-        return;
-      }
-
-      // 2) Store fallback — the conversation may exist only in memory
-      //    because it was started in this session and hasn't completed
-      //    a turn yet (no agent_end → no save). Without this branch,
-      //    clicking back to a chat that's been streaming in the
-      //    background would fall through to startNewConversation and
-      //    silently WIPE the in-memory state.
-      const session = useChatStore.getState().sessions[convId];
-      if (session?.messages && session.messages.length > 0) {
-        // Stub conversation — loadConversation prefers store messages
-        // over the conv arg whenever the store has them, so the empty
-        // messages array here is just a satisfaction of the type.
-        loadConversationRef.current({
-          id: convId,
-          title: session.title || "untitled",
-          messages: [],
-          createdAt: Date.now(),
-          updatedAt: session.updatedAt,
-        });
-        return;
-      }
-
-      // 3) Truly new id (sidebar's "+ new chat" path) — adopt the
-      //    requested id so sidebar + chat (and the chat-store's
-      //    currentId) all agree from message 0.
-      await startNewConversationRef.current(convId);
-      // Mirror the new id back to the sidebar so its currentId matches.
+    // Already on this conversation — keep the store/sidebar in sync without
+    // forcing a redundant snapshot+swap.
+    if (convId === piSessionIdRef.current) {
+      useChatStore.getState().actions.setCurrent(convId);
       emit("chat-current-session", { id: convId });
+      return;
+    }
+
+    const conv = await loadConversationFile(convId);
+    if (conv) {
+      loadConversationRef.current(conv);
+      return;
+    }
+
+    const session = useChatStore.getState().sessions[convId];
+    if (session?.messages && session.messages.length > 0) {
+      // `loadConversation` will prefer the store's live message list for this
+      // id, but the metadata here should still mirror the session as closely
+      // as possible so this fallback stays behaviorally aligned with disk loads.
+      loadConversationRef.current({
+        id: convId,
+        title: session.title || "untitled",
+        messages: [],
+        createdAt: session.createdAt,
+        updatedAt: session.updatedAt,
+      });
+      return;
+    }
+
+    await startNewConversationRef.current(convId);
+    emit("chat-current-session", { id: convId });
+  }, []);
+
+  useEffect(() => {
+    const unlisten = listen<ChatLoadConversationPayload>("chat-load-conversation", async (event) => {
+      const { conversationId: convId, targetWindow } = event.payload;
+      const windowLabel = getCurrentWindow().label;
+      if (!shouldHandleChatLoadConversationForWindow(
+        { conversationId: convId, targetWindow },
+        windowLabel === "chat" ? "chat" : "home",
+      )) {
+        return;
+      }
+      await openConversationLocally(convId);
     });
     return () => { unlisten.then((fn) => fn()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openConversationLocally]);
+
+  // Cmd+N / Ctrl+N from home/page emits this so the user can immediately type
+  // after a new chat is created without having to click into the textarea.
+  useEffect(() => {
+    const unlisten = listen("chat-focus-input", () => {
+      inputRef.current?.focus();
+    });
+    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
   // Tell the sidebar which session is current whenever the chat panel
@@ -2521,12 +3605,11 @@ export function StandaloneChat({
   }, [conversationId]);
 
   // E2E hook: expose a function to seed a user message into a session.
-  // Required by parallel-chat.spec.ts because `ensureAssistantPlaceholder`
-  // (added 2026-04-29 in e1f55023d) only creates an assistant bubble when
+  // Required by chat-streaming-performance.spec.ts because
+  // `ensureAssistantPlaceholder` only creates an assistant bubble when
   // the last message in LOCAL React state is `role: "user"`. Without a
   // way to inject a user message, the test's pure pi_event-faking path
-  // can't materialize any assistant DOM and CI has been red on every PR
-  // since.
+  // can't materialize any assistant DOM.
   //
   // Three places get updated:
   //   1. Local React state (`setMessages`) — what `ensureAssistantPlaceholder`
@@ -2658,10 +3741,25 @@ export function StandaloneChat({
         if (!mountedRef.current) return;
         handleAgentEventDataRef.current?.(envelope.event);
       });
+      // E2E seam: agent_event delivery to the panel is gated on this
+      // foreground registration completing. Tests can wait on this
+      // signal before emitting events; without it, deltas race the
+      // registration window and go to the default router, which
+      // early-returns for `store.currentId === sid`, silently dropping
+      // them. Cleared in the cleanup below so successive switches don't
+      // see a stale id.
+      if (typeof window !== "undefined") {
+        (window as any).__e2eForegroundReady = conversationId;
+      }
     })();
     return () => {
       cancelled = true;
       try { off?.(); } catch { /* ignore */ }
+      if (typeof window !== "undefined") {
+        if ((window as any).__e2eForegroundReady === conversationId) {
+          (window as any).__e2eForegroundReady = null;
+        }
+      }
     };
   }, [conversationId]);
 
@@ -2729,10 +3827,18 @@ export function StandaloneChat({
     if (!sess || sess.kind === "pipe-watch") return undefined;
     return !!sess.isLoading;
   });
+  const currentStreamingMessageId = useChatStore((s) => {
+    if (!conversationId) return null;
+    return s.sessions[conversationId]?.streamingMessageId ?? null;
+  });
   useEffect(() => {
     if (storeChatIsStreaming === false) setIsStreaming(false);
     if (storeChatIsLoading === false) setIsLoading(false);
   }, [storeChatIsStreaming, storeChatIsLoading]);
+
+  useEffect(() => {
+    isStreamingRef.current = isStreaming;
+  }, [isStreaming]);
 
   // Keep the pipe-context banner in sync with the current session.
   // When the panel switches AWAY from a pipe-watch session (user
@@ -2835,6 +3941,19 @@ export function StandaloneChat({
     activeFilters.contentType ||
     activeFilters.appName ||
     activeFilters.speakerName;
+  const activeFilterCount = (activeFilters.timeRanges.length > 0 ? 1 : 0) +
+    (activeFilters.contentType ? 1 : 0) +
+    (activeFilters.appName ? 1 : 0) +
+    (activeFilters.speakerName ? 1 : 0);
+  const activeFilterLabels = React.useMemo(
+    () => [
+      ...activeFilters.timeRanges.map((range) => range.label),
+      activeFilters.contentType,
+      activeFilters.appName,
+      activeFilters.speakerName,
+    ].filter((label): label is string => Boolean(label)),
+    [activeFilters]
+  );
 
   // Remove a specific @mention from input
   const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
@@ -2982,13 +4101,27 @@ export function StandaloneChat({
       return;
     }
 
-    // Enter without shift submits the form. We intentionally don't gate on
-    // isLoading anymore — if a previous prompt is still streaming, the new
-    // one is enqueued at the rust level (see `pi_command_queue.rs`) and
-    // shown in the queued-cards rail under the transcript.
+    if (isComposerSteerShortcut(e, isMac) && !showMentionDropdown) {
+      e.preventDefault();
+      e.stopPropagation();
+      if ((input.trim() || pastedImages.length > 0) && !steerShortcutInFlightRef.current) {
+        steerShortcutInFlightRef.current = true;
+        void Promise.resolve(steerMessage(input.trim())).finally(() => {
+          steerShortcutInFlightRef.current = false;
+        });
+      }
+      return;
+    }
+
+    // Enter without shift submits the form. While Pi is replying, submit maps
+    // to native steering so the correction applies to the current answer.
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
-      if (input.trim() || pastedImages.length > 0) {
+      // Don't send while a document extraction is still in flight —
+      // otherwise the user's prompt ships without the file attached,
+      // which is the exact silent-drop bug the pending-chips fix.
+      if (pendingDocsRef.current.length > 0) return;
+      if (input.trim() || pastedImages.length > 0 || attachedDocsRef.current.length > 0) {
         sendMessage(input.trim());
       }
       return;
@@ -3014,20 +4147,55 @@ export function StandaloneChat({
   };
 
   useEffect(() => {
+    const handleComposerSteerShortcut = (event: KeyboardEvent) => {
+      if (showMentionDropdown) return;
+      if (isComposing || event.isComposing || event.keyCode === 229) return;
+      if (!isComposerSteerShortcut(event, isMac)) return;
+      if (document.activeElement === inputRef.current || event.target === inputRef.current) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if ((input.trim() || pastedImages.length > 0) && !steerShortcutInFlightRef.current) {
+        steerShortcutInFlightRef.current = true;
+        void Promise.resolve(steerMessage(input.trim())).finally(() => {
+          steerShortcutInFlightRef.current = false;
+        });
+      }
+    };
+
+    window.addEventListener("keydown", handleComposerSteerShortcut, true);
+    return () => window.removeEventListener("keydown", handleComposerSteerShortcut, true);
+  }, [input, isComposing, isMac, pastedImages, showMentionDropdown]);
+
+  useEffect(() => {
     // Don't resolve preset until settings are loaded from the store —
     // before that, settings.aiPresets contains only the hardcoded default,
     // which would cause Pi to start with the wrong model then immediately restart.
     if (!isSettingsLoaded) return;
     // Don't overwrite pipe-specific preset when watching a pipe execution
     if (activePipeExecution) return;
-    const defaultPreset = settings.aiPresets?.find((p) => p.defaultPreset);
-    const next = defaultPreset || settings.aiPresets?.[0];
-    // Only update if the preset actually changed (avoid triggering downstream restart)
+    const presets = settings.aiPresets ?? [];
+    const fallback = presets.find((p) => p.defaultPreset) ?? presets[0];
     setActivePreset((prev) => {
-      if (prev && next && prev.provider === next.provider && prev.model === next.model) {
-        return prev; // same reference → no re-render → no restart
+      // First load — pick the default.
+      if (!prev) return fallback;
+      // User's selection still exists. Re-bind to the latest object so edits
+      // in the Settings tab flow through, but keep the same id (don't snap
+      // back to the default just because settings got rewritten by an
+      // unrelated update — loadUser, team sync, device discovery, etc).
+      const stillThere = presets.find((p) => p.id === prev.id);
+      if (stillThere) {
+        return stillThere.provider === prev.provider &&
+          stillThere.model === prev.model &&
+          stillThere.url === prev.url &&
+          (stillThere as any).apiKey === (prev as any).apiKey &&
+          (stillThere as any).maxTokens === (prev as any).maxTokens &&
+          stillThere.prompt === prev.prompt
+          ? prev
+          : stillThere;
       }
-      return next;
+      // Preset was deleted — fall back to default.
+      return fallback;
     });
   }, [settings.aiPresets, isSettingsLoaded]);
 
@@ -3062,8 +4230,9 @@ export function StandaloneChat({
       if (e.key === "Escape" && !showMentionDropdown) {
         if (isLoading || isStreaming) {
           // Stop the agent
+          piActiveStopRequestedRef.current = true;
           try {
-            await commands.piAbort(piSessionIdRef.current);
+            await commands.piAbortActive(piSessionIdRef.current);
           } catch (err) {
             console.warn("[Pi] Failed to abort on Escape:", err);
           }
@@ -3078,26 +4247,89 @@ export function StandaloneChat({
     return () => window.removeEventListener("keydown", handleEscape);
   }, [showMentionDropdown, isLoading, isStreaming]);
 
-  // Smart auto-scroll: only scroll to bottom if user is near the bottom.
-  // If user scrolled up to read, don't interrupt them.
-  useEffect(() => {
-    if (!isUserScrolledUp) {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  const isNearScrollBottom = useCallback((container: HTMLDivElement) => {
+    return container.scrollHeight - container.scrollTop - container.clientHeight <= 150;
+  }, []);
+
+  const scrollMessagesToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    const container = scrollContainerRef.current;
+    if (container) {
+      container.scrollTo({ top: container.scrollHeight, behavior });
+    } else {
+      messagesEndRef.current?.scrollIntoView({ behavior });
     }
-  }, [messages, isUserScrolledUp]);
+  }, []);
+
+  const scheduleScrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
+    if (autoScrollFrameRef.current != null) {
+      cancelAnimationFrame(autoScrollFrameRef.current);
+    }
+
+    scrollMessagesToBottom(behavior);
+    autoScrollFrameRef.current = requestAnimationFrame(() => {
+      scrollMessagesToBottom("auto");
+      autoScrollFrameRef.current = requestAnimationFrame(() => {
+        scrollMessagesToBottom("auto");
+        autoScrollFrameRef.current = null;
+      });
+    });
+  }, [scrollMessagesToBottom]);
 
   const handleMessagesScroll = useCallback(() => {
-    const el = scrollContainerRef.current;
-    if (!el) return;
-    // Consider "near bottom" if within 150px of the bottom
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
-    setIsUserScrolledUp(!nearBottom);
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const nearBottom = isNearScrollBottom(container);
+    stickToBottomRef.current = nearBottom;
+    setIsUserScrolledUp((prev) => (prev === !nearBottom ? prev : !nearBottom));
+  }, [isNearScrollBottom]);
+
+  // Loading a saved conversation should land at the newest message. Keep the
+  // panel pinned while markdown media loads and changes the message height.
+  useEffect(() => {
+    stickToBottomRef.current = true;
+    setIsUserScrolledUp(false);
+    scheduleScrollToBottom("auto");
+  }, [conversationId, scheduleScrollToBottom]);
+
+  // Smart auto-scroll: only follow new content while the user remains near the
+  // bottom. Once they scroll upward, leave the viewport alone.
+  useEffect(() => {
+    if (stickToBottomRef.current) {
+      scheduleScrollToBottom("auto");
+    }
+  }, [messages, isLoading, isStreaming, scheduleScrollToBottom]);
+
+  // Media players and collapsible sections can change height after the message
+  // array is already stable. ResizeObserver keeps old chats pinned through
+  // those late layout changes without treating them as a user scroll.
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    const content = container?.firstElementChild;
+    if (!container || !content || typeof ResizeObserver === "undefined") return;
+
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) {
+        scheduleScrollToBottom("auto");
+      }
+    });
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, [scheduleScrollToBottom]);
+
+  useEffect(() => {
+    return () => {
+      if (autoScrollFrameRef.current != null) {
+        cancelAnimationFrame(autoScrollFrameRef.current);
+      }
+    };
   }, []);
 
   const scrollToBottom = useCallback(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    stickToBottomRef.current = true;
+    scheduleScrollToBottom("smooth");
     setIsUserScrolledUp(false);
-  }, []);
+  }, [scheduleScrollToBottom]);
 
   // Preload recent speakers when filter popover opens
   useEffect(() => {
@@ -3249,6 +4481,12 @@ export function StandaloneChat({
   //
   // Called directly from the AIPresetsSelector onPresetSaved callback.
   const handlePiRestart = useCallback((preset: AIPreset) => {
+    if (isStreamingRef.current) {
+      pendingPresetRef.current = preset;
+      toast({ title: "model will switch after this response finishes" });
+      return;
+    }
+
     const providerConfig = buildProviderConfig(preset);
     if (!providerConfig) return;
 
@@ -3319,6 +4557,14 @@ export function StandaloneChat({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings.user?.token, setRunningConfigFromProviderConfig, restartCurrentPiSession]);
 
+  useEffect(() => {
+    if (!isStreaming && pendingPresetRef.current) {
+      const preset = pendingPresetRef.current;
+      pendingPresetRef.current = null;
+      handlePiRestart(preset);
+    }
+  }, [isStreaming, handlePiRestart]);
+
   // Listen for Pi / pipe events.
   //
   // Stage 3 of the events refactor: the panel registers with the
@@ -3360,26 +4606,34 @@ export function StandaloneChat({
       const newAssistantId = (Date.now() + 1).toString();
       let created = false;
       setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (!last || last.role !== "user") return prev;
+        let targetIdx = -1;
+        for (let i = prev.length - 1; i >= 0; i--) {
+          if (prev[i]?.role === "user") {
+            targetIdx = i;
+            break;
+          }
+        }
+        if (targetIdx === -1) return prev;
+
+        const target = prev[targetIdx];
+        if (!target || target.role !== "user") return prev;
         created = true;
-        return [
-          ...prev,
-          {
-            id: newAssistantId,
-            role: "assistant",
-            content: "Processing...",
-            timestamp: Date.now(),
-            model: activePreset?.model,
-            provider: activePreset?.provider,
-          },
-        ];
+
+        const base = [...prev];
+        base.splice(targetIdx + 1, 0, {
+          id: newAssistantId,
+          role: "assistant",
+          content: "Processing...",
+          timestamp: Date.now(),
+          model: activePreset?.model,
+          provider: activePreset?.provider,
+        });
+        return base;
       });
       if (!created) return false;
       piMessageIdRef.current = newAssistantId;
       piStreamingTextRef.current = "";
       piContentBlocksRef.current = [];
-      setStreamedCharCount(0);
       setIsLoading(true);
       setIsStreaming(true);
       const sidNow = piSessionIdRef.current;
@@ -3405,6 +4659,47 @@ export function StandaloneChat({
     };
 
     const handlePiEventData = (data: any) => {
+        const emitSessionActivity = (
+          partial: {
+            status?: ReturnType<typeof statusForEvent>;
+            preview?: string;
+            title?: string;
+            lastError?: string;
+            unreadHint?: boolean;
+          },
+          opts?: { throttleMs?: number },
+        ) => {
+          try {
+            const sid = piSessionIdRef.current;
+            if (!sid) return;
+            const status = partial.status ?? null;
+            const preview = partial.preview?.replace(/\s+/g, " ").trim();
+            const title = partial.title?.trim();
+            const lastError = partial.lastError;
+            const unreadHint = partial.unreadHint === true;
+            const updatedAt = Date.now();
+            const sig = `${status ?? ""}|${preview ?? ""}|${title ?? ""}|${lastError ?? ""}|${unreadHint ? "1" : "0"}`;
+            const lastSig = sessionActivityLastSigRef.current[sid];
+            const throttleMs = opts?.throttleMs ?? 0;
+            const lastAt = sessionActivityLastEmitAtRef.current[sid] ?? 0;
+            if (sig === lastSig && throttleMs > 0 && updatedAt - lastAt < throttleMs) return;
+            if (sig === lastSig && throttleMs === 0) return;
+            if (throttleMs > 0 && updatedAt - lastAt < throttleMs && !status && !lastError) return;
+            sessionActivityLastSigRef.current[sid] = sig;
+            sessionActivityLastEmitAtRef.current[sid] = updatedAt;
+            void emit("chat-session-activity", {
+              id: sid,
+              status: status ?? undefined,
+              preview: preview || undefined,
+              title: title || undefined,
+              updatedAt,
+              lastError,
+              unreadHint,
+            });
+          } catch {
+            // best effort only
+          }
+        };
 
         // Mirror status into the chat-store so the sidebar dot reflects what
         // Pi is actually doing. The bus routes foreground events exclusively
@@ -3423,19 +4718,46 @@ export function StandaloneChat({
             if (cur !== next) {
               store.actions.patch(sid, { status: next });
             }
+            emitSessionActivity({
+              status: next,
+              title: useChatStore.getState().sessions[sid]?.title,
+              lastError: next === "error" ? (piLastErrorRef.current ?? undefined) : undefined,
+            });
           }
         } catch {
           /* defensive — never let a status-mirror failure break the
              foreground event handler */
         }
 
-        if (data.type === "message_update" && data.assistantMessageEvent) {
+        if (
+          data.type === "agent_end" ||
+          data.type === "pipe_done" ||
+          (data.type === "response" && data.success === false) ||
+          (data.type === "auto_retry_end" && data.success === false) ||
+          (data.type === "message_update" && data.assistantMessageEvent?.type === "error") ||
+          ((data.type === "message_start" || data.type === "message_end") &&
+            data.message?.role === "assistant" &&
+            data.message?.stopReason === "error")
+        ) {
+          cancelStreamingMessageRender();
+        }
+
+        if (
+          data.type === "message_update" &&
+          data.assistantMessageEvent &&
+          data.assistantMessageEvent.type !== "error"
+        ) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
+            void maybeInterruptForPendingSteer("text_delta");
             // First delta of a queued turn → create the placeholder lazily.
             if (!ensureAssistantPlaceholder()) return;
             piStreamingTextRef.current += evt.delta;
-            setStreamedCharCount(piStreamingTextRef.current.length);
+            emitSessionActivity({
+              status: "streaming",
+              preview: evt.delta,
+              unreadHint: true,
+            }, { throttleMs: 250 });
 
             // Append to last text block or create new one
             const blocks = piContentBlocksRef.current;
@@ -3446,26 +4768,8 @@ export function StandaloneChat({
               blocks.push({ type: "text", text: evt.delta });
             }
 
-            if (piMessageIdRef.current) {
-              const msgId = piMessageIdRef.current;
-              const content = piStreamingTextRef.current;
-              const contentBlocks = [...blocks];
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content, contentBlocks } : m)
-              );
-            }
+            scheduleStreamingMessageRender();
 
-            // Trigger follow-up generation after enough content
-            if (
-              piStreamingTextRef.current.length > 500 &&
-              !followUpFiredRef.current
-            ) {
-              followUpFiredRef.current = true;
-              generateFollowUps(
-                lastUserMessageRef.current,
-                piStreamingTextRef.current
-              );
-            }
           } else if (evt.type === "thinking_start") {
             if (!ensureAssistantPlaceholder()) return;
             piThinkingStartRef.current = Date.now();
@@ -3484,14 +4788,9 @@ export function StandaloneChat({
             if (thinkingBlock && thinkingBlock.type === "thinking") {
               thinkingBlock.text += evt.delta;
             }
-            if (piMessageIdRef.current) {
-              const msgId = piMessageIdRef.current;
-              const contentBlocks = [...blocks];
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: m.content === "Processing..." ? "" : m.content, contentBlocks } : m)
-              );
-            }
+            scheduleStreamingMessageRender();
           } else if (evt.type === "thinking_end") {
+            void maybeInterruptForPendingSteer("thinking_end");
             const blocks = piContentBlocksRef.current;
             const thinkingBlock = blocks[blocks.length - 1];
             if (thinkingBlock && thinkingBlock.type === "thinking") {
@@ -3509,6 +4808,7 @@ export function StandaloneChat({
             }
           }
         } else if (data.type === "tool_execution_start") {
+          void maybeInterruptForPendingSteer("tool_execution_start");
           if (!ensureAssistantPlaceholder()) return;
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -3526,6 +4826,7 @@ export function StandaloneChat({
             );
           }
         } else if (data.type === "tool_execution_end") {
+          void maybeInterruptForPendingSteer("tool_execution_end");
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
             const toolCallId = data.toolCallId;
@@ -3553,6 +4854,7 @@ export function StandaloneChat({
           const errorStr = data.finalError || "Request failed after retries";
           console.error("[Pi] Auto-retry failed:", errorStr);
           piLastErrorRef.current = errorStr;
+          emitSessionActivity({ status: "error", lastError: errorStr });
 
           // Detect rate limit or daily limit from the error
           const quotaErrorType = classifyQuotaError(errorStr);
@@ -3584,6 +4886,7 @@ export function StandaloneChat({
           const reason = data.assistantMessageEvent.reason || "";
           const errorDetail = data.assistantMessageEvent.error || "";
           console.error("[Pi] Message error:", reason, errorDetail);
+          emitSessionActivity({ status: "error", lastError: `${reason} ${errorDetail}`.trim() || undefined });
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -3620,14 +4923,10 @@ export function StandaloneChat({
             }
           }
         } else if (data.type === "message_start" && data.message?.role === "user") {
-          // pi-mono fires `message_start` for a user message at the start of
-          // every turn that introduces one — i.e. (a) the original prompt
-          // and (b) each queued followUp processed inside the SAME agent run
-          // (only one `agent_end` fires for the whole run, after all
-          // followUps drain). If we relied on `agent_end` to close out the
-          // current assistant message, the followUp's text_delta would land
-          // on the previous turn's assistant bubble (the user saw responses
-          // mashed together: "...Which?Hey. What do you need?").
+          // Pi fires `message_start` for each user turn. When a queued
+          // follow-up starts, close the previous streaming target here so the
+          // next text_delta creates a fresh assistant bubble instead of
+          // appending to the prior reply.
           //
           // Clear the streaming refs here so the next text_delta lazily
           // creates a fresh assistant placeholder via `ensureAssistantPlaceholder`.
@@ -3639,6 +4938,7 @@ export function StandaloneChat({
             piStreamingTextRef.current.length > 0 ||
             piContentBlocksRef.current.length > 0;
           if (hasStreamedContent) {
+            flushStreamingMessageRender();
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
@@ -3646,32 +4946,129 @@ export function StandaloneChat({
             // processing the followUp turn.
           }
 
-          // The user message tied to this turn just left the queue and is
-          // now in-flight — clear the `queued` flag so the bubble drops
-          // its muted treatment. We match on content text since pi-mono
-          // doesn't echo our optimistic message id back.
-          {
-            const text = (() => {
-              const c = data.message?.content;
-              if (typeof c === "string") return c;
-              if (Array.isArray(c)) {
-                return c
-                  .filter((p: any) => p?.type === "text" && typeof p.text === "string")
-                  .map((p: any) => p.text)
-                  .join("");
+          const rawText = (() => {
+            const c = data.message?.content;
+            if (typeof c === "string") return c;
+            if (Array.isArray(c)) {
+              return c
+                .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+                .map((p: any) => p.text)
+                .join("");
+            }
+            return "";
+          })();
+          const text = extractConversationHistorySyncUserText(rawText) ?? rawText;
+          const eventImages = imageDataUrlsFromPiContent(data.message?.content);
+          const pendingOptimisticSteer = optimisticSteerRef.current;
+          const isPendingOptimisticSteerEcho = Boolean(
+            pendingOptimisticSteer &&
+            pendingOptimisticSteer.content.trim() === text.trim()
+          );
+          const shouldConsumePendingOptimisticSteer = isPendingOptimisticSteerEcho;
+          const preMatchedTurnIntent = findTurnIntentForUserStart(piSessionIdRef.current, text, pendingNextPiUserDisplayRef.current);
+
+          if (!piMessageIdRef.current || isPendingOptimisticSteerEcho || preMatchedTurnIntent?.kind === "steer") {
+            const sidForStartedUser = piSessionIdRef.current;
+            const pendingDisplay = pendingNextPiUserDisplayRef.current &&
+              (!text || turnIntentTextValuesMatch(pendingNextPiUserDisplayRef.current.preview, text))
+                ? pendingNextPiUserDisplayRef.current
+                : null;
+            const queuedDisplay = pendingDisplay ?? consumeQueuedDisplayForStartedMessage(sidForStartedUser, text);
+            const matchedTurnIntent = preMatchedTurnIntent ?? findTurnIntentForUserStart(sidForStartedUser, text, queuedDisplay);
+            if (matchedTurnIntent?.consumedAssistantId) {
+              pendingNextPiUserIntentRef.current = null;
+              if (pendingNextPiUserDisplayRef.current?.turnIntentId === matchedTurnIntent.id) {
+                pendingNextPiUserDisplayRef.current = null;
               }
-              return "";
-            })();
-            if (text) {
-              setMessages((prev) => {
-                let cleared = false;
-                return prev.map((m) => {
-                  if (cleared || !m.queued || m.role !== "user" || m.content !== text) {
-                    return m;
-                  }
-                  cleared = true;
-                  return { ...m, queued: false };
-                });
+              if (optimisticSteerRef.current?.turnIntentId === matchedTurnIntent.id) {
+                optimisticSteerRef.current = null;
+              }
+              return;
+            }
+            const queuedImages = queuedDisplay?.images.length ? queuedDisplay.images : eventImages;
+            if (pendingDisplay) {
+              pendingNextPiUserDisplayRef.current = null;
+            }
+            if (!text && !queuedImages.length && !queuedDisplay?.displayContent) {
+              return;
+            }
+            const nextUserIntent = matchedTurnIntent
+              ? (matchedTurnIntent.kind === "steer" ? "steer" : null)
+              : pendingNextPiUserIntentRef.current;
+            pendingNextPiUserIntentRef.current = null;
+            const queuedTurnUserId = Date.now().toString();
+            const queuedTurnAssistantId = (Date.now() + 1).toString();
+            const optimisticSteer = optimisticSteerRef.current;
+            const isOptimisticSteerEcho = Boolean(
+              matchedTurnIntent?.kind === "steer" && matchedTurnIntent.displayedUserId ||
+              queuedDisplay?.optimisticUserId ||
+              (
+                optimisticSteer &&
+                optimisticSteer.content.trim() === text.trim()
+              ),
+            );
+            if (isOptimisticSteerEcho || shouldConsumePendingOptimisticSteer) {
+              optimisticSteerRef.current = null;
+            }
+            if (matchedTurnIntent?.kind === "steer") {
+              markTurnIntentConsumed(matchedTurnIntent.id, queuedTurnAssistantId);
+            }
+            const startedUser: Message | null = isOptimisticSteerEcho ? null : {
+              id: queuedTurnUserId,
+              role: "user",
+              content: text,
+              ...(queuedDisplay?.displayContent ? { displayContent: queuedDisplay.displayContent } : {}),
+              ...(queuedImages.length ? { images: [...queuedImages] } : {}),
+              ...(queuedDisplay?.attachments?.length ? { attachments: [...queuedDisplay.attachments] } : {}),
+              ...(nextUserIntent === "steer" ? { intent: "steer" as const } : {}),
+              ...(matchedTurnIntent ? { turnIntentId: matchedTurnIntent.id } : {}),
+              timestamp: Date.now(),
+            };
+            const assistantPlaceholder: Message = {
+              id: queuedTurnAssistantId,
+              role: "assistant",
+              content: "Processing...",
+              ...(nextUserIntent === "steer" ? { intent: "steer" as const } : {}),
+              ...(matchedTurnIntent ? { turnIntentId: matchedTurnIntent.id } : {}),
+              ...(nextUserIntent === "steer" ? { steeredResponse: true } : {}),
+              timestamp: Date.now(),
+              model: activePreset?.model,
+              provider: activePreset?.provider,
+            };
+
+            let nextRows: Message[] | null = null;
+            setMessages((prev) => {
+              const rows = startedUser
+                ? [...prev, startedUser, assistantPlaceholder]
+                : [...prev, assistantPlaceholder];
+              nextRows = rows;
+              return rows;
+            });
+            if (nextRows) {
+              void saveConversation(nextRows, {
+                refreshHistory: false,
+                syncActiveConversation: false,
+              });
+            }
+
+            piMessageIdRef.current = queuedTurnAssistantId;
+            piStreamingTextRef.current = "";
+            piContentBlocksRef.current = [];
+            setIsLoading(true);
+            setIsStreaming(true);
+
+            if (sidForStartedUser) {
+              const storeState = useChatStore.getState();
+              if (startedUser) {
+                storeState.actions.appendMessage(sidForStartedUser, startedUser as any);
+              }
+              storeState.actions.appendMessage(sidForStartedUser, assistantPlaceholder as any);
+              storeState.actions.setStreaming(sidForStartedUser, {
+                streamingMessageId: queuedTurnAssistantId,
+                streamingText: "",
+                contentBlocks: [],
+                isStreaming: true,
+                isLoading: true,
               });
             }
           }
@@ -3681,6 +5078,7 @@ export function StandaloneChat({
           const errMsg = data.message.errorMessage || data.message.error || "Unknown error";
           console.error("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
+          emitSessionActivity({ status: "error", lastError: errMsg });
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -3739,7 +5137,7 @@ export function StandaloneChat({
               }
             }
 
-            // Surface credits_exhausted / rate limit errors from agent_end
+            // Surface credits_exhausted / rate limit / connection errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
               const quotaErrorType = classifyQuotaError(errStr);
@@ -3749,9 +5147,11 @@ export function StandaloneChat({
                     } catch {}
                                   content = buildDailyLimitMessage(errStr);
               } else if (quotaErrorType === "rate") {
-                  content = buildRateLimitMessage(errStr);
+                content = buildRateLimitMessage(errStr);
+              } else if (errStr.includes("model_not_allowed")) {
+                content = "This model requires an upgrade.";
               } else {
-                content = `Error: ${errStr}`;
+                content = errStr;
               }
             }
 
@@ -3759,6 +5159,7 @@ export function StandaloneChat({
             // functional updater until after the refs are cleared below.
             const blocksSnapshot = [...piContentBlocksRef.current];
             const streamedText = piStreamingTextRef.current;
+            const wasStoppedByUser = piActiveStopRequestedRef.current;
 
             // Check if content was already set by error handlers above
             setMessages((prev) => {
@@ -3780,6 +5181,9 @@ export function StandaloneChat({
                 return prev;
               }
               const contentBlocks = [...blocksSnapshot];
+              if (wasStoppedByUser && !content && contentBlocks.length === 0) {
+                return prev.filter((m) => m.id !== msgId);
+              }
               // If no text content but we have tool/thinking blocks, don't show "no response"
               const hasNonTextBlocks = contentBlocks.some((b) => b.type === "tool" || b.type === "thinking");
               let emptyResponseRetryPrompt: string | undefined;
@@ -3819,14 +5223,30 @@ export function StandaloneChat({
                 ? { ...m, content, contentBlocks, ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}) }
                 : m);
             });
-
             if (!isPipeWatch) {
-              posthog.capture("chat_response_received", {
+              const analyticsPayload = {
                 provider: activePreset?.provider,
                 model: activePreset?.model,
                 has_tool_use: blocksSnapshot.some((b) => b.type === "tool"),
                 response_length: streamedText?.length ?? 0,
-              });
+              };
+              setTimeout(() => {
+                posthog.capture("chat_response_received", analyticsPayload);
+              }, POST_STREAM_SIDE_EFFECT_DELAY_MS);
+
+              const followUpText = streamedText || content || "";
+              if (followUpText.length > 500 && !followUpFiredRef.current) {
+                const followUpTurnId = msgId;
+                const followUpSessionId = piSessionIdRef.current;
+                const userPromptForFollowUps = lastUserMessageRef.current;
+                followUpFiredRef.current = true;
+                setTimeout(() => {
+                  if (!mountedRef.current) return;
+                  if (piSessionIdRef.current !== followUpSessionId) return;
+                  if (piMessageIdRef.current && piMessageIdRef.current !== followUpTurnId) return;
+                  generateFollowUps(userPromptForFollowUps, followUpText);
+                }, FOLLOW_UP_GENERATION_DELAY_MS);
+              }
             }
           }
           if (!isPipeWatch) {
@@ -3834,13 +5254,23 @@ export function StandaloneChat({
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
             piLastErrorRef.current = null;
+            piActiveStopRequestedRef.current = false;
             piThinkingStartRef.current = null;
             followUpFiredRef.current = false;
+            forceQueueModeRef.current = false;
+            piRateLimitRetries.current = 0;
             setIsLoading(false);
             setIsStreaming(false);
+            emitSessionActivity({ status: "idle" });
+            if (steerAbortAtBoundaryRef.current) {
+              finishPendingSteerInterrupt();
+            } else if (pendingSteerBatchRef.current.some((item) => item.sessionId === piSessionIdRef.current)) {
+              void flushPendingSteerBatch();
+            }
           }
         } else if (data.type === "response" && data.success === false) {
           const errorStr = data.error || "Unknown error";
+          emitSessionActivity({ status: "error", lastError: errorStr });
           // Pi agent first-call bug (pi-mono#2461) — first RPC prompt crashes.
           // Auto-retry the same prompt once. The second call works.
           if (errorStr.includes("startsWith") || errorStr.includes("text.startsWith")) {
@@ -3850,9 +5280,49 @@ export function StandaloneChat({
               // Re-send the last prompt
               const lastUserMsg = messages.findLast(m => m.role === "user");
               if (lastUserMsg?.content) {
-                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null).catch(() => {});
+                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null, null).catch(() => {});
               }
             }
+            return;
+          }
+          // Rate-limit (429) auto-retry — honor the gateway's reset_in hint and
+          // re-send the same prompt. The cloud LLM gateway caps free/logged-in
+          // tiers at a few dozen requests/minute; a single agentic run can trip
+          // it, after which a short wait clears the budget. Without this the turn
+          // dies silently (e.g. pipe creation stalls mid-skill).
+          if (
+            classifyQuotaError(errorStr) === "rate" &&
+            piRateLimitRetries.current < PI_MAX_RATE_LIMIT_RETRIES &&
+            piSessionIdRef.current &&
+            lastUserMessageRef.current
+          ) {
+            piRateLimitRetries.current += 1;
+            const attempt = piRateLimitRetries.current;
+            const waitSecs = parseRateLimitWaitSeconds(errorStr);
+            const retrySession = piSessionIdRef.current;
+            const retryPrompt = lastUserMessageRef.current;
+            console.warn(`[Pi] rate limited, auto-retry ${attempt}/${PI_MAX_RATE_LIMIT_RETRIES} in ${waitSecs}s:`, errorStr);
+            // Reset the in-flight buffers so the retried turn renders cleanly into
+            // the same bubble instead of appending onto any pre-429 partial output.
+            piStreamingTextRef.current = "";
+            piContentBlocksRef.current = [];
+            const retryTurnId = piMessageIdRef.current;
+            if (retryTurnId) {
+              setMessages((prev) =>
+                prev.map((m) => m.id === retryTurnId
+                  ? { ...m, content: `Rate limited — retrying in ${waitSecs}s… (attempt ${attempt}/${PI_MAX_RATE_LIMIT_RETRIES})`, contentBlocks: [] }
+                  : m)
+              );
+            }
+            setTimeout(() => {
+              // Guard the delayed re-send: bail if the user unmounted, switched
+              // sessions, or started a new turn during the wait, so we never
+              // inject a stale prompt into the wrong place.
+              if (!mountedRef.current) return;
+              if (piSessionIdRef.current !== retrySession) return;
+              if (piMessageIdRef.current && piMessageIdRef.current !== retryTurnId) return;
+              commands.piPrompt(retrySession, retryPrompt, null, null).catch(() => {});
+            }, waitSecs * 1000);
             return;
           }
           if (piMessageIdRef.current) {
@@ -3912,6 +5382,7 @@ export function StandaloneChat({
             error_type: errorCategory,
           });
           piStreamingTextRef.current = "";
+          optimisticSteerRef.current = null;
           if (piMessageIdRef.current?.startsWith("pipe-")) {
             setActivePipeExecution(null);
           }
@@ -3954,10 +5425,17 @@ export function StandaloneChat({
       // Replaces the prior `listen("pi_terminated", ...)`. The bus
       // mirrors `agent_terminated`; legacy `pi_terminated` is a Stage 5
       // cleanup target.
-      busUnregistrations.push(onAgentTerminated((payload) => {
+      busUnregistrations.push(onAgentTerminated(async (payload) => {
         if (!mounted) return;
         if (payload.sessionId !== piSessionIdRef.current) return;
         const terminatedPid = payload.pid;
+        const termKey = `${payload.sessionId}:${typeof terminatedPid === "number" ? terminatedPid : "unknown"}`;
+        const nowMs = Date.now();
+        const lastSeen = piTerminationDedupRef.current[termKey] ?? 0;
+        if (nowMs - lastSeen < 4000) {
+          return;
+        }
+        piTerminationDedupRef.current[termKey] = nowMs;
         if (typeof terminatedPid === "number" && piIntentionallyStoppedPidsRef.current.delete(terminatedPid)) {
           return;
         }
@@ -3965,7 +5443,31 @@ export function StandaloneChat({
           piStoppedIntentionallyRef.current = false;
           return;
         }
+        const shouldResumePendingSteer = steerAbortAtBoundaryRef.current &&
+          pendingSteerBatchRef.current.some((item) => item.sessionId === payload.sessionId);
         console.log("[Pi] Process terminated, pid:", terminatedPid);
+        try {
+          const info = await commands.piInfo(piSessionIdRef.current);
+          if (info.status === "ok" && info.data.running && info.data.pid !== terminatedPid) {
+            setPiInfo(info.data);
+            return;
+          }
+        } catch {}
+
+        if (shouldResumePendingSteer) {
+          piStreamingTextRef.current = "";
+          piMessageIdRef.current = null;
+          piContentBlocksRef.current = [];
+          piLastErrorRef.current = null;
+          piActiveStopRequestedRef.current = false;
+          piThinkingStartRef.current = null;
+          followUpFiredRef.current = false;
+          forceQueueModeRef.current = false;
+          setIsLoading(false);
+          setIsStreaming(false);
+          finishPendingSteerInterrupt();
+          return;
+        }
 
         // If a message was in flight, append error to the message so the user
         // knows the agent stopped unexpectedly (not just "completed").
@@ -4060,6 +5562,7 @@ export function StandaloneChat({
         if (!piMessageIdRef.current) return;
         const line = event.payload;
         if (line.includes("model_not_allowed") || line.includes("403")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -4067,6 +5570,7 @@ export function StandaloneChat({
             );
           }
         } else if (line.includes("429") || line.includes("rate") || line.includes("daily_limit")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -4074,6 +5578,7 @@ export function StandaloneChat({
             );
           }
         } else if (line.includes("content must be a string") || line.includes("does not support images") || line.includes("image_url is not supported")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -4099,17 +5604,36 @@ export function StandaloneChat({
     // session this panel is bound to. Single source of truth lives in
     // `pi_command_queue.rs`; this listener just mirrors it into local state.
     let unlistenQueue: UnlistenFn | undefined;
-    listen<{ sessionId: string; queued: PiQueuedPrompt[] }>("pi-queue-changed", (event) => {
+    listen<{
+      sessionId?: string;
+      session_id?: string;
+      queued?: PiQueuedPrompt[];
+    }>("pi-queue-changed", (event) => {
       if (!mounted) return;
-      if (event.payload.sessionId !== piSessionIdRef.current) return;
-      setQueuedPrompts(event.payload.queued ?? []);
+      const { sessionId, queued } = normalizeQueueEventPayload(event.payload);
+      if (!sessionId) return;
+      setQueuedPromptsBySession((prev) => {
+        const existing = prev[sessionId] ?? [];
+        if (queuedSnapshotsEqual(existing, queued)) return prev;
+        return { ...prev, [sessionId]: queued };
+      });
     }).then(fn => { unlistenQueue = fn; });
 
     // Initial fetch — closes the gap between component mount and first event.
     (async () => {
+      const sidAtFetch = piSessionIdRef.current;
       try {
-        const res = await commands.piPending(piSessionIdRef.current);
-        if (mounted && res.status === "ok") setQueuedPrompts(res.data);
+        const res = await commands.piPending(sidAtFetch);
+        if (!mounted) return;
+        const nextQueue = res.status === "ok" ? res.data : [];
+        setQueuedPromptsBySession((prev) => {
+          const existing = prev[sidAtFetch] ?? [];
+          if (queuedSnapshotsEqual(existing, nextQueue)) return prev;
+          return {
+            ...prev,
+            [sidAtFetch]: nextQueue,
+          };
+        });
       } catch { /* ignore — queue may not be initialized yet */ }
     })();
 
@@ -4131,6 +5655,7 @@ export function StandaloneChat({
 
     return () => {
       mounted = false;
+      cancelStreamingMessageRender();
       for (const off of busUnregistrations) {
         try { off(); } catch { /* ignore — tearing down */ }
       }
@@ -4401,86 +5926,252 @@ export function StandaloneChat({
    * the chat-store — same path used for any other message, just kicked off
    * after the queue drains.
    */
-  async function enqueuePiMessage(userMessage: string, displayLabel?: string) {
-    if (!piInfo?.running) {
-      // No Pi running → fall back to the normal start-and-send path.
-      return sendPiMessage(userMessage, displayLabel);
-    }
-
-    // Local optimistic message + chat-store mirror. Skips assistant placeholder
-    // entirely; the new turn's `agent_start` (downstream from the rust queue
-    // dequeue) will create one through the existing event flow.
-    // Mark queued=true so the bubble renders with a muted/lighter treatment
-    // until Pi actually starts streaming this turn (cleared in handleAgentStart).
-    const newUserMessage: Message = {
-      id: Date.now().toString(),
-      role: "user",
-      content: userMessage,
-      ...(displayLabel ? { displayContent: displayLabel } : {}),
-      ...(pastedImages.length > 0 ? { images: [...pastedImages] } : {}),
-      timestamp: Date.now(),
-      queued: true,
-    };
-    setMessages((prev) => [...prev, newUserMessage]);
-    setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
-
-    const sidNow = piSessionIdRef.current;
-    if (sidNow) {
-      const storeState = useChatStore.getState();
-      if (!storeState.sessions[sidNow]) {
-        storeState.actions.upsert({
-          id: sidNow,
-          title: "new chat",
-          preview: "",
-          status: "streaming",
-          messageCount: 0,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          pinned: false,
-          unread: false,
-        });
-      }
-      storeState.actions.appendMessage(sidNow, newUserMessage as any);
-      storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
-    }
-
-    // Persist immediately — covers the edge case where Pi crashes between
-    // enqueue and dequeue, leaving the user's message stranded otherwise.
-    void saveConversation([...messages, newUserMessage]);
-
-    posthog.capture("chat_message_enqueued", {
-      provider: activePreset?.provider,
-      model: activePreset?.model,
-      pending_count: queuedPrompts.length + 1,
-    });
-
-    // Convert any data-URL pastes to the Pi image-content shape (same format
-    // used by the normal send path further down in this file).
+  function imageDataUrlsToPiImages(images: string[]) {
     const piImages: Array<{ type: string; mimeType: string; data: string }> = [];
-    for (const img of pastedImages) {
+    for (const img of images) {
       const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
       if (match) {
         piImages.push({ type: "image", mimeType: match[1], data: match[2] });
       }
     }
-    if (pastedImages.length > 0) setPastedImages([]);
+    return piImages;
+  }
+
+  function imageDataUrlsFromPiContent(content: unknown) {
+    if (!Array.isArray(content)) return [];
+    const images: string[] = [];
+    for (const part of content) {
+      if (!part || typeof part !== "object") continue;
+      const item = part as { type?: unknown; mimeType?: unknown; mime_type?: unknown; data?: unknown };
+      if (item.type !== "image" || typeof item.data !== "string") continue;
+      if (item.data.startsWith("data:image/")) {
+        images.push(item.data);
+        continue;
+      }
+      const mime = typeof item.mimeType === "string"
+        ? item.mimeType
+        : typeof item.mime_type === "string"
+          ? item.mime_type
+          : "image/png";
+      images.push(`data:${mime};base64,${item.data}`);
+    }
+    return images;
+  }
+
+  function normalizeImageDataUrls(value: unknown): string[] {
+    if (!Array.isArray(value)) return [];
+    return value
+      .filter((item): item is string =>
+        typeof item === "string" && /^data:image\/[^;]+;base64,/.test(item),
+      )
+      .slice(0, 8);
+  }
+
+  function queuedPreviewForText(text: string) {
+    return Array.from(text).slice(0, 200).join("");
+  }
+
+  function shouldKeepQueuedDisplay(payload: QueuedDisplayPayload) {
+    return payload.images.length > 0 || !!payload.displayContent || (payload.attachments?.length ?? 0) > 0;
+  }
+
+  function restoreQueuedDisplay(sessionId: string | null, promptId: string, payload: QueuedDisplayPayload | null) {
+    if (!sessionId || !payload || !shouldKeepQueuedDisplay(payload)) return;
+    queuedDisplayBySessionRef.current = {
+      ...queuedDisplayBySessionRef.current,
+      [sessionId]: {
+        ...(queuedDisplayBySessionRef.current[sessionId] ?? {}),
+        [promptId]: payload,
+      },
+    };
+  }
+
+  function takeQueuedDisplayById(sessionId: string | null, promptId: string): QueuedDisplayPayload | null {
+    if (!sessionId) return null;
+    const current = queuedDisplayBySessionRef.current[sessionId];
+    const payload = current?.[promptId] ?? null;
+    if (!payload) return null;
+    const { [promptId]: _removed, ...rest } = current;
+    queuedDisplayBySessionRef.current = {
+      ...queuedDisplayBySessionRef.current,
+      [sessionId]: rest,
+    };
+    return payload;
+  }
+
+  function payloadMatchesText(payload: QueuedDisplayPayload, text: string) {
+    const preview = queuedPreviewForText(text);
+    if (!payload.preview) return !preview;
+    return preview === payload.preview || text.startsWith(payload.preview);
+  }
+
+  function consumeQueuedDisplayForStartedMessage(sessionId: string | null, text: string): QueuedDisplayPayload | null {
+    if (!sessionId) return null;
+    const queued = queuedDisplayBySessionRef.current[sessionId] ?? {};
+    const match = Object.entries(queued).find(([, payload]) => payloadMatchesText(payload, text));
+    if (!match) return null;
+    return takeQueuedDisplayById(sessionId, match[0]);
+  }
+
+  async function enqueuePiMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
+    if (!piInfo?.running) {
+      // No Pi running → fall back to the normal start-and-send path.
+      return sendPiMessage(userMessage, displayLabel, imageDataUrls);
+    }
+
+    // Convert any data-URL pastes to the Pi image-content shape (same format
+    // used by the normal send path further down in this file).
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const piImages = imageDataUrlsToPiImages(outgoingImages);
+    const queuedImageDataUrls = outgoingImages.length > 0 ? [...outgoingImages] : [];
+    const prevInput = input;
+    const hadPastedImages = imageDataUrls == null && pastedImages.length > 0;
+    // Snapshot whatever sendMessage stashed for us. Consumed here so it
+    // doesn't leak into a later turn if this enqueue races with another.
+    const queuedAttachments = consumePendingAttachments();
+
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+    if (hadPastedImages) setPastedImages([]);
+
+    // Issue #3636: same contract as sendPiMessage's send path — every
+    // turn carries the recent conversation history so the model has
+    // context even if Pi's internal session lost it (compaction,
+    // crash + auto-restart, kill that the termination handler missed).
+    // The queue path was previously a silent gap: when an earlier send
+    // was still in-flight, follow-ups routed here got the bare user
+    // message, and any Pi state divergence in between manifested as
+    // "chat suddenly forgot what we were talking about."
+    let queuedPrompt = userMessage;
+    if (messages.length > 0) {
+      const historyLines = messages
+        .slice(-40)
+        .map((m) => {
+          let text = m.content || "";
+          if (m.contentBlocks?.length) {
+            const blockTexts = m.contentBlocks
+              .map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              })
+              .filter(Boolean)
+              .join("\n");
+            if (blockTexts && !text) text = blockTexts;
+            else if (blockTexts) text += "\n" + blockTexts;
+          }
+          return `${m.role}: ${text}`;
+        })
+        .join("\n");
+      queuedPrompt = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
+    }
+
+    // E2E test hook — capture queued prompts for context-loss assertions
+    {
+      const g = window as any;
+      if (Array.isArray(g.__e2ePiPromptCaptures)) {
+        g.__e2ePiPromptCaptures.push({
+          sessionId: piSessionIdRef.current,
+          message: queuedPrompt,
+          at: Date.now(),
+        });
+      }
+    }
 
     try {
-      const result = await commands.piPrompt(
+      const result = await commands.piQueuePrompt(
         piSessionIdRef.current,
-        userMessage,
+        queuedPrompt,
         piImages.length > 0 ? piImages : null,
+        queuedPreviewForText(userMessage),
       );
+      const queuedTurnIntentId = `queued-${result.status === "ok" ? result.data : Date.now()}`;
       if (result.status !== "ok") {
+        setInput(prevInput);
+        if (hadPastedImages) setPastedImages(queuedImageDataUrls);
         toast({ title: "failed to queue message", description: result.error, variant: "destructive" });
+        return;
       }
+
+      registerTurnIntent({
+        id: queuedTurnIntentId,
+        sessionId: piSessionIdRef.current,
+        kind: "queued",
+        content: userMessage,
+        preview: queuedPreviewForText(userMessage),
+        queueId: result.data,
+        createdAt: Date.now(),
+      });
+      restoreQueuedDisplay(piSessionIdRef.current, result.data, {
+        preview: queuedPreviewForText(userMessage),
+        images: queuedImageDataUrls,
+        ...(queuedAttachments ? { attachments: queuedAttachments } : {}),
+        ...(displayLabel ? { displayContent: displayLabel } : {}),
+        turnIntentId: queuedTurnIntentId,
+      });
+
+      posthog.capture("chat_message_enqueued", {
+        provider: activePreset?.provider,
+        model: activePreset?.model,
+        pending_count: queuedPrompts.length + 1,
+      });
     } catch (e) {
+      setInput(prevInput);
+      if (hadPastedImages) setPastedImages(queuedImageDataUrls);
       console.warn("[Pi] failed to enqueue follow-up:", e);
     }
   }
 
-  async function sendPiMessage(userMessage: string, displayLabel?: string) {
+  function clearActivePiTurnState() {
+    cancelStreamingMessageRender();
+    piStreamingTextRef.current = "";
+    piMessageIdRef.current = null;
+    piContentBlocksRef.current = [];
+    forceQueueModeRef.current = false;
+    setIsLoading(false);
+    setIsStreaming(false);
+  }
+
+  async function interruptActivePiTurn() {
+    const hasActiveTurn = isLoading || isStreaming || !!piMessageIdRef.current;
+    if (!hasActiveTurn) return;
+
+    let aborted = false;
+    try {
+      const abortResult = await Promise.race([
+        commands.piAbort(piSessionIdRef.current),
+        new Promise<{ status: "error"; error: string }>((resolve) => {
+          window.setTimeout(() => resolve({ status: "error", error: "Abort timed out" }), 1_500);
+        }),
+      ]);
+      if (abortResult.status === "ok") {
+        aborted = true;
+      } else {
+        console.warn("[Pi] Abort before steering failed:", abortResult.error);
+      }
+    } catch (e) {
+      console.warn("[Pi] Abort before steering threw:", e);
+    }
+
+    if (!aborted) {
+      const providerConfig = buildProviderConfig();
+      if (!providerConfig) {
+        throw new Error("No AI preset selected");
+      }
+      await restartCurrentPiSession(providerConfig);
+    }
+
+    clearActivePiTurnState();
+  }
+
+  async function sendPiMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
+    clearPendingSteerTransportState();
+
     // Auto-start Pi if it's not running yet (new session or crash recovery)
     if (!piInfo?.running) {
       if (piStartInFlightRef.current) {
@@ -4513,12 +6204,12 @@ export function StandaloneChat({
             }
           } else {
             const providerLabel = providerConfig?.provider || "AI";
-            toast({ title: `failed to start ${providerLabel}`, description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+            toast({ title: `failed to start AI assistant (${providerLabel})`, description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
             return;
           }
         } catch (e) {
           const providerLabel = providerConfig?.provider || "AI";
-          toast({ title: `failed to start ${providerLabel}`, description: String(e), variant: "destructive" });
+          toast({ title: `failed to start AI assistant (${providerLabel})`, description: String(e), variant: "destructive" });
           return;
         } finally {
           setPiStarting(false);
@@ -4531,28 +6222,20 @@ export function StandaloneChat({
       await piPresetSwitchPromiseRef.current;
     }
 
-    // If a previous message is still processing, abort it first.
-    // piAbort now waits for the Pi SDK to confirm the abort completed — no sleep needed.
-    if (piMessageIdRef.current) {
-      console.warn("[Pi] Aborting previous message before sending new one");
-      try {
-        await commands.piAbort(piSessionIdRef.current);
-      } catch (e) {
-        console.warn("[Pi] Failed to abort previous:", e);
-      }
-      piStreamingTextRef.current = "";
-      piMessageIdRef.current = null;
-      piContentBlocksRef.current = [];
-      setIsLoading(false);
-      setIsStreaming(false);
-    }
+    await interruptActivePiTurn();
+    forceQueueModeRef.current = true;
 
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const shouldClearPastedImages = imageDataUrls == null && pastedImages.length > 0;
+
+    const consumedAttachments = consumePendingAttachments();
     const newUserMessage: Message = {
       id: Date.now().toString(),
       role: "user",
       content: userMessage,
       ...(displayLabel ? { displayContent: displayLabel } : {}),
-      ...(pastedImages.length > 0 ? { images: [...pastedImages] } : {}),
+      ...(outgoingImages.length > 0 ? { images: [...outgoingImages] } : {}),
+      ...(consumedAttachments ? { attachments: consumedAttachments } : {}),
       timestamp: Date.now(),
     };
 
@@ -4561,18 +6244,26 @@ export function StandaloneChat({
     piStreamingTextRef.current = "";
     piMessageIdRef.current = assistantMessageId;
     piContentBlocksRef.current = [];
-    setStreamedCharCount(0);
 
     // Clear follow-ups for new message
     setFollowUpSuggestions([]);
     followUpFiredRef.current = false;
+    piRateLimitRetries.current = 0;
     if (followUpAbortRef.current) {
       followUpAbortRef.current.abort();
       followUpAbortRef.current = null;
     }
     lastUserMessageRef.current = userMessage;
 
-    setMessages((prev) => [...prev, newUserMessage]);
+    let nextRowsAfterUserAppend: Message[] | null = null;
+    setMessages((prev) => {
+      const next = [...prev, newUserMessage];
+      nextRowsAfterUserAppend = next;
+      return next;
+    });
+    if (nextRowsAfterUserAppend) {
+      void saveConversation(nextRowsAfterUserAppend, { refreshHistory: false });
+    }
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
     setIsLoading(true);
@@ -4595,7 +6286,7 @@ export function StandaloneChat({
       if (!storeState.sessions[sidNow]) {
         storeState.actions.upsert({
           id: sidNow,
-          title: "new chat",
+          title: "untitled",
           preview: "",
           status: "streaming",
           messageCount: 0,
@@ -4606,6 +6297,10 @@ export function StandaloneChat({
         });
       }
       storeState.actions.appendMessage(sidNow, newUserMessage as any);
+      const currentTitle = useChatStore.getState().sessions[sidNow]?.title;
+      if (displayLabel && isPlaceholderConversationTitle(currentTitle)) {
+        storeState.actions.patch(sidNow, { title: displayLabel });
+      }
       storeState.actions.appendMessage(sidNow, {
         id: assistantMessageId,
         role: "assistant",
@@ -4628,20 +6323,10 @@ export function StandaloneChat({
       storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
     }
 
-    // Persist user message to disk immediately so it survives a
-    // navigate-away-mid-stream or a Pi crash before agent_end. The
-    // existing save-on-isLoading-transition only fires when the stream
-    // completes cleanly — if anything kills the turn before then, the
-    // user's message would otherwise live only in the in-memory store
-    // and vanish on the next cold reload. Fire-and-forget: the next
-    // save (on agent_end) will overwrite the same file with the full
-    // conversation including the assistant reply.
-    void saveConversation([...messages, newUserMessage]);
-
     posthog.capture("chat_message_sent", {
       provider: activePreset?.provider,
       model: activePreset?.model,
-      has_images: pastedImages.length > 0 || !!prefillFrameId,
+      has_images: outgoingImages.length > 0 || !!prefillFrameId,
       has_context: !!prefillContext,
       message_index: messages.filter((m) => m.role === "user").length,
     });
@@ -4685,7 +6370,7 @@ export function StandaloneChat({
         setPrefillContext(null);
       }
 
-      for (const img of pastedImages) {
+      for (const img of outgoingImages) {
         const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
         if (match) {
           piImages.push({
@@ -4695,16 +6380,49 @@ export function StandaloneChat({
           });
         }
       }
-      if (pastedImages.length > 0) setPastedImages([]);
+      if (shouldClearPastedImages) setPastedImages([]);
 
       setMessages((prev) => [
         ...prev,
         { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: activePreset?.model, provider: activePreset?.provider },
       ]);
 
-      // If Pi's session is out of sync (restart, conversation load), inject history
+      // Always re-inject the recent conversation history into every prompt
+      // when the chat has prior turns (issue #3636).
+      //
+      // The previous contract gated injection on `piSessionSyncedRef.current`
+      // — a local boolean that tracked "we believe Pi has the conversation
+      // in its own in-memory session." The ref was reset on explicit Pi
+      // restarts (piStart paths), but Pi can also lose state silently —
+      // pi-agent runs context compaction by default (default settings:
+      // reserveTokens 16384, keepRecentTokens 20000), pi can crash and
+      // be auto-restarted before our termination handler observes the
+      // exit, and a queued / steer follow-up can race with a fresh
+      // sendPiMessage in ways the ref can't track. When the ref says
+      // "synced" but Pi has actually dropped everything, the next turn
+      // is sent as a bare user message — the model sees no prior context
+      // and answers as if the conversation just started. That's the
+      // user-visible symptom in issue #3636: "chat suddenly loses prior
+      // conversation context, but if I explicitly ask it to read the
+      // previous conversation, it can."
+      //
+      // The frontend's `messages` array is the durable source of truth
+      // (it's what gets persisted to disk on every save). Sending the
+      // last ~40 turns every time costs a small amount of tokens against
+      // the model's context window, but eliminates the entire class of
+      // "pi state silently diverged from messages" bugs. Pi appends the
+      // prompt verbatim to its own session; in the steady-state path the
+      // model sees a small amount of duplication between Pi's accumulated
+      // state and the injected block, which it handles fine. In the
+      // failure path (Pi just restarted, compacted, or never had this
+      // turn at all), the injected block IS the conversation and the
+      // model has what it needs.
+      //
+      // `piSessionSyncedRef` is kept around because other code paths
+      // (preset change, reauth, the conversation-load handler) still
+      // toggle it for diagnostics, but it no longer gates injection.
       let promptMessage = userMessage;
-      if (!piSessionSyncedRef.current && messages.length > 0) {
+      if (messages.length > 0) {
         const historyLines = messages
           .slice(-40)
           .map(m => {
@@ -4728,9 +6446,19 @@ export function StandaloneChat({
           })
           .join("\n");
         promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
-        piSessionSyncedRef.current = true;
-      } else {
-        piSessionSyncedRef.current = true;
+      }
+      piSessionSyncedRef.current = true;
+
+      // E2E test hook — write to __e2ePiPromptCaptures when the recorder is installed
+      {
+        const g = window as any;
+        if (Array.isArray(g.__e2ePiPromptCaptures)) {
+          g.__e2ePiPromptCaptures.push({
+            sessionId: piSessionIdRef.current,
+            message: promptMessage,
+            at: Date.now(),
+          });
+        }
       }
 
       // Send prompt — abort/new_session now await completion, so no retry needed
@@ -4738,6 +6466,7 @@ export function StandaloneChat({
         piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
+        null,
       );
 
       // Race: user hit "+ NEW" before Pi finished registering the new session
@@ -4764,6 +6493,7 @@ export function StandaloneChat({
               piSessionIdRef.current,
               promptMessage,
               piImages.length > 0 ? piImages : null,
+              null,
             );
           }
         } catch (e) {
@@ -4785,7 +6515,7 @@ export function StandaloneChat({
         } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died") || rawError.includes("Pi not initialized")) {
           const provider = activePreset?.provider;
           errorMsg = provider === "native-ollama"
-            ? "Ollama is not running. Start it with: `ollama serve`"
+            ? "Ollama isn't running. Start it with: `ollama serve`"
             : "AI agent crashed — restarting automatically...";
           retryPrompt = userMessage;
         } else if (rawError.includes("not found")) {
@@ -4801,6 +6531,7 @@ export function StandaloneChat({
               : m
           )
         );
+        forceQueueModeRef.current = false;
         setIsLoading(false);
         setIsStreaming(false);
       }
@@ -4814,6 +6545,7 @@ export function StandaloneChat({
             : m
         )
       );
+      forceQueueModeRef.current = false;
       setIsLoading(false);
       setIsStreaming(false);
     }
@@ -4903,21 +6635,706 @@ export function StandaloneChat({
     }
   }
 
-  async function sendMessage(userMessage: string, displayLabel?: string) {
+  async function sendMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
     if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
+    const trimmed = userMessage.trim();
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const queuedDocs = attachedDocsRef.current;
+    if (!trimmed && outgoingImages.length === 0 && queuedDocs.length === 0) return;
 
-    // If a previous prompt is still streaming, enqueue this one at the rust
-    // level instead of going through sendPiMessage (which aborts the previous
-    // turn — exactly what we DON'T want when the user is queueing follow-ups).
-    // The rust queue's drain loop will pull this prompt and write it to stdin
-    // as soon as the in-flight prompt's `agent_end` arrives. The pi-event-router
-    // will append the new turn's user + assistant messages to the chat-store.
-    if (isLoading || isStreaming) {
-      return enqueuePiMessage(userMessage, displayLabel);
+    // Fold any attached documents into the outgoing turn. The extracted
+    // text rides in `content` (what the model sees, kept for
+    // history/retries) while the bubble renders `displayContent` (the
+    // clean prompt) plus an attachment row above it (icon + name).
+    // The raw `<attached file: ...>` payload never reaches the renderer:
+    // when attachments are present the bubble's expand-chevron is
+    // suppressed (see ChatMessage / CollapsibleUserMessage).
+    let outgoingMessage = trimmed;
+    let outgoingDisplay = displayLabel;
+    const snapshotDocs = queuedDocs.length > 0 ? [...queuedDocs] : [];
+    if (queuedDocs.length > 0) {
+      const docText = docsToPromptText(queuedDocs);
+      outgoingMessage = [trimmed, docText].filter(Boolean).join("\n\n");
+      // Always set a clean displayContent when docs are attached.
+      // Without it, the bubble would render `outgoingMessage` directly
+      // — dumping the extracted PDF prose into the chat.
+      const cleanLabel = trimmed || `📎 ${queuedDocs.map((d) => d.name).join(", ")}`;
+      outgoingDisplay = displayLabel ?? cleanLabel;
+      pendingAttachmentsRef.current = queuedDocs.map((d) => ({
+        name: d.name,
+        ext: d.ext,
+        charCount: d.charCount,
+        truncated: d.truncated,
+      }));
+      setAttachedDocs([]);
     }
 
-    // All providers route through Pi agent
-    return sendPiMessage(userMessage, displayLabel);
+    // Restore the chips if the downstream send path threw. Mirrors the
+    // pastedImages restore-on-error contract in enqueuePiMessage/sendPiMessage:
+    // a failed dispatch must not silently swallow the user's attachments.
+    const restoreDocsOnError = (e: unknown) => {
+      if (snapshotDocs.length === 0) return;
+      setAttachedDocs((prev) => prev.length === 0 ? snapshotDocs : prev);
+      throw e;
+    };
+
+    // Guard the tiny gap between submit and React's loading state update.
+    // During this window, rapid Enter presses must queue (not start a second
+    // normal turn), otherwise user bubbles can drift.
+    if (forceQueueModeRef.current || sendDispatchInFlightRef.current || piMessageIdRef.current || isLoading || isStreaming) {
+      try {
+        return await enqueuePiMessage(outgoingMessage, outgoingDisplay, imageDataUrls);
+      } catch (e) {
+        restoreDocsOnError(e);
+      }
+    }
+
+    sendDispatchInFlightRef.current = true;
+    try {
+      // All providers route through Pi agent
+      return await sendPiMessage(outgoingMessage, outgoingDisplay, imageDataUrls);
+    } catch (e) {
+      restoreDocsOnError(e);
+    } finally {
+      sendDispatchInFlightRef.current = false;
+    }
+  }
+
+  const openConnectionSetup = useCallback((connectionId: string) => {
+    window.dispatchEvent(
+      new CustomEvent("open-settings", {
+        detail: {
+          section: "connections",
+          connectionId: connectionId === "connections" ? null : connectionId,
+        },
+      }),
+    );
+  }, []);
+
+  async function queueFollowUpMessage(userMessage: string, displayLabel?: string) {
+    if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
+    return enqueuePiMessage(userMessage, displayLabel);
+  }
+
+  // Queue UI is session-scoped. On chat switch, hydrate pending items for the
+  // active session key without mutating other session queues.
+  useEffect(() => {
+    const sid = currentQueueSessionId;
+    if (!sid) {
+      return;
+    }
+
+    let cancelled = false;
+    setQueuedActionPromptId(null);
+
+    (async () => {
+      try {
+        const queuedRes = await commands.piPending(sid);
+        if (cancelled) return;
+        const nextQueue = queuedRes.status === "ok" ? queuedRes.data : [];
+        setQueuedPromptsBySession((prev) => {
+          const existing = prev[sid] ?? [];
+          if (queuedSnapshotsEqual(existing, nextQueue)) return prev;
+          return {
+            ...prev,
+            [sid]: nextQueue,
+          };
+        });
+      } catch {
+        if (!cancelled) {
+          setQueuedPromptsBySession((prev) => {
+            const existing = prev[sid] ?? [];
+            if (existing.length === 0) return prev;
+            return {
+              ...prev,
+              [sid]: [],
+            };
+          });
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [currentQueueSessionId]);
+
+  async function cancelQueuedPrompt(prompt: PiQueuedPrompt, options: { silent?: boolean } = {}) {
+    setQueuedActionPromptId(prompt.id);
+    try {
+      const result = await commands.piCancelQueued(piSessionIdRef.current, prompt.id);
+      if (result.status !== "ok") {
+        if (!options.silent) {
+          toast({ title: "failed to cancel queued message", description: result.error, variant: "destructive" });
+        }
+        return false;
+      }
+      if (!result.data) {
+        if (!options.silent) {
+          toast({
+            title: "message already started",
+            description: "Use stop if you want to interrupt the active reply.",
+          });
+        }
+        return false;
+      }
+      if (currentQueueSessionId) {
+        takeQueuedDisplayById(currentQueueSessionId, prompt.id);
+        setQueuedPromptsBySession((prev) => ({
+          ...prev,
+          [currentQueueSessionId]: (prev[currentQueueSessionId] ?? []).filter(
+            (queued) => queued.id !== prompt.id,
+          ),
+        }));
+      }
+      return true;
+    } catch (e) {
+      if (!options.silent) {
+        toast({
+          title: "failed to cancel queued message",
+          description: e instanceof Error ? e.message : String(e),
+          variant: "destructive",
+        });
+      }
+      return false;
+    } finally {
+      setQueuedActionPromptId((current) => current === prompt.id ? null : current);
+    }
+  }
+
+  function setAssistantInterruptedState(activeAssistantId: string | null, interruptedBySteer: boolean) {
+    if (!activeAssistantId) return;
+    let changed = false;
+    let nextRows: Message[] | null = null;
+    setMessages((prev) => {
+      const next = prev.map((message) => {
+        if (
+          message.id !== activeAssistantId ||
+          message.role !== "assistant" ||
+          Boolean(message.interruptedBySteer) === interruptedBySteer
+        ) {
+          return message;
+        }
+        changed = true;
+        return { ...message, interruptedBySteer };
+      });
+      if (changed) nextRows = next;
+      return changed ? next : prev;
+    });
+    if (!changed || !nextRows) return;
+    void saveConversation(nextRows, {
+      refreshHistory: false,
+      syncActiveConversation: false,
+    });
+    const sidNow = piSessionIdRef.current;
+    if (sidNow) {
+      useChatStore.getState().actions.setMessages(sidNow, nextRows as any);
+    }
+  }
+
+  function markCurrentAssistantInterrupted() {
+    setAssistantInterruptedState(piMessageIdRef.current, true);
+  }
+
+  function clearCurrentAssistantInterrupted() {
+    setAssistantInterruptedState(piMessageIdRef.current, false);
+  }
+
+  function buildSteerPrompt(batch: PendingSteerBatchItem[]) {
+    const latest = batch[batch.length - 1];
+    if (!latest) return "";
+
+    const originalUserMessage = latest.originalUserMessage.trim();
+    const steerMessages = batch
+      .map((item, index) => `${index + 1}. ${item.content}`)
+      .join("\n");
+
+    return [
+      "The user sent steering messages while the previous assistant response was still running.",
+      "Treat them as live steering for that turn: they may refine the original request, replace it, or redirect to a new request.",
+      "Infer the user's intent from the original request and the steering messages. If a steering message is a complete request, answer that request directly.",
+      "Apply steering messages in order. If they conflict, the final steering message has highest priority.",
+      "Do not explain the steering mechanism unless the user asks about it.",
+      "",
+      "Original user request:",
+      originalUserMessage || "(unknown previous request)",
+      "",
+      "Steering messages:",
+      steerMessages,
+      "",
+      "Final steering message:",
+      latest.content,
+      "",
+      "Now answer according to the final steered intent.",
+    ].join("\n");
+  }
+
+  function clearPendingSteerTransportState(sessionId = piSessionIdRef.current) {
+    pendingNextPiUserIntentRef.current = null;
+    pendingNextPiUserDisplayRef.current = null;
+    optimisticSteerRef.current = null;
+    if (sessionId) {
+      pendingSteerBatchRef.current = pendingSteerBatchRef.current.filter((item) => item.sessionId !== sessionId);
+      turnIntentLedgerRef.current = turnIntentLedgerRef.current.filter((record) =>
+        record.sessionId !== sessionId ||
+        record.kind !== "steer" ||
+        Boolean(record.consumedAssistantId)
+      );
+    }
+  }
+
+  async function flushPendingSteerBatch() {
+    const sessionId = piSessionIdRef.current;
+    if (!sessionId || pendingSteerFlushInFlightRef.current) return;
+
+    const batch = pendingSteerBatchRef.current.filter((item) => item.sessionId === sessionId);
+    if (batch.length === 0) return;
+    pendingSteerBatchRef.current = pendingSteerBatchRef.current.filter((item) => item.sessionId !== sessionId);
+    pendingSteerFlushInFlightRef.current = true;
+
+    const latest = batch[batch.length - 1];
+    const interruptedAssistantId = batch.find((item) => item.interruptedAssistantId)?.interruptedAssistantId ?? null;
+    const prompt = buildSteerPrompt(batch);
+    const preview = queuedPreviewForText(latest.content);
+    const combinedImages = imageDataUrlsToPiImages(batch.flatMap((item) => item.images));
+    const hasActiveAssistant = Boolean(piMessageIdRef.current);
+
+    const labelMarkers: Message[] = batch.slice(0, -1).map((item, index) => ({
+      id: `${item.turnIntentId}-label`,
+      role: "assistant",
+      content: "",
+      intent: "steer",
+      turnIntentId: item.turnIntentId,
+      timestamp: Date.now() + index,
+      model: activePreset?.model,
+      provider: activePreset?.provider,
+    }));
+    const labelMarkerIds = new Set(labelMarkers.map((marker) => marker.id));
+
+    let nextRowsAfterLabels: Message[] | null = null;
+    if (labelMarkers.length > 0) {
+      setMessages((prev) => {
+        const existingIds = new Set(prev.map((message) => message.id));
+        const markersToAppend = labelMarkers.filter((marker) => !existingIds.has(marker.id));
+        if (markersToAppend.length === 0) return prev;
+        const next = [...prev, ...markersToAppend];
+        nextRowsAfterLabels = next;
+        return next;
+      });
+      if (nextRowsAfterLabels) {
+        void saveConversation(nextRowsAfterLabels, {
+          refreshHistory: false,
+          syncActiveConversation: false,
+        });
+        useChatStore.getState().actions.setMessages(sessionId, nextRowsAfterLabels as any);
+      }
+    }
+
+    pendingNextPiUserIntentRef.current = "steer";
+    pendingNextPiUserDisplayRef.current = {
+      preview,
+      images: [...latest.images],
+      ...(latest.attachments?.length ? { attachments: [...latest.attachments] } : {}),
+      ...(latest.displayContent ? { displayContent: latest.displayContent } : {}),
+      optimisticUserId: latest.optimisticUserId,
+      turnIntentId: latest.turnIntentId,
+    };
+    optimisticSteerRef.current = {
+      id: latest.optimisticUserId,
+      content: prompt,
+      turnIntentId: latest.turnIntentId,
+    };
+    batch.slice(0, -1).forEach((item) => removeTurnIntent(item.turnIntentId));
+    registerTurnIntent({
+      id: latest.turnIntentId,
+      sessionId,
+      kind: "steer",
+      content: prompt,
+      preview,
+      displayedUserId: latest.optimisticUserId,
+      createdAt: latest.createdAt,
+    });
+
+    let precreatedSteerAssistantId: string | null = null;
+    if (hasActiveAssistant) {
+      const steerAssistantId = `${latest.turnIntentId}-assistant`;
+      precreatedSteerAssistantId = steerAssistantId;
+      const steerAssistantPlaceholder: Message = {
+        id: steerAssistantId,
+        role: "assistant",
+        content: "Processing...",
+        intent: "steer",
+        turnIntentId: latest.turnIntentId,
+        steeredResponse: true,
+        timestamp: Date.now(),
+        model: activePreset?.model,
+        provider: activePreset?.provider,
+      };
+      let nextRowsAfterAssistant: Message[] | null = null;
+      setMessages((prev) => {
+        if (prev.some((message) => message.id === steerAssistantId)) return prev;
+        const steerUserIndex = prev.findIndex((message) => message.id === latest.optimisticUserId);
+        const insertIndex = steerUserIndex >= 0 ? steerUserIndex + 1 : prev.length;
+        const next = [
+          ...prev.slice(0, insertIndex),
+          steerAssistantPlaceholder,
+          ...prev.slice(insertIndex),
+        ];
+        nextRowsAfterAssistant = next;
+        return next;
+      });
+      if (nextRowsAfterAssistant) {
+        void saveConversation(nextRowsAfterAssistant, {
+          refreshHistory: false,
+          syncActiveConversation: false,
+        });
+        useChatStore.getState().actions.setMessages(sessionId, nextRowsAfterAssistant as any);
+      }
+      markTurnIntentConsumed(latest.turnIntentId, steerAssistantId);
+      piMessageIdRef.current = steerAssistantId;
+      piStreamingTextRef.current = "";
+      piContentBlocksRef.current = [];
+      useChatStore.getState().actions.setStreaming(sessionId, {
+        streamingMessageId: steerAssistantId,
+        streamingText: "",
+        contentBlocks: [],
+        isStreaming: true,
+        isLoading: true,
+      });
+    }
+
+    lastUserMessageRef.current = latest.content;
+    setIsLoading(true);
+    setIsStreaming(true);
+
+    try {
+      const result = hasActiveAssistant
+        ? await commands.piSteer(
+            sessionId,
+            prompt,
+            combinedImages.length > 0 ? combinedImages : null,
+          )
+        : await commands.piPrompt(
+            sessionId,
+            prompt,
+            combinedImages.length > 0 ? combinedImages : null,
+            preview,
+          );
+
+      if (result.status !== "ok") {
+        pendingNextPiUserIntentRef.current = null;
+        pendingNextPiUserDisplayRef.current = null;
+        optimisticSteerRef.current = null;
+        removeTurnIntent(latest.turnIntentId);
+        setAssistantInterruptedState(interruptedAssistantId, false);
+        if (labelMarkerIds.size > 0) {
+          setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
+        }
+        if (precreatedSteerAssistantId) {
+          setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
+          piMessageIdRef.current = null;
+          piStreamingTextRef.current = "";
+          piContentBlocksRef.current = [];
+        }
+        pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
+        setIsLoading(false);
+        setIsStreaming(false);
+        toast({ title: "failed to send steered message", description: result.error, variant: "destructive" });
+      }
+    } catch (e) {
+      pendingNextPiUserIntentRef.current = null;
+      pendingNextPiUserDisplayRef.current = null;
+      optimisticSteerRef.current = null;
+      removeTurnIntent(latest.turnIntentId);
+      setAssistantInterruptedState(interruptedAssistantId, false);
+      if (labelMarkerIds.size > 0) {
+        setMessages((prev) => prev.filter((message) => !labelMarkerIds.has(message.id)));
+      }
+      if (precreatedSteerAssistantId) {
+        setMessages((prev) => prev.filter((message) => message.id !== precreatedSteerAssistantId));
+        piMessageIdRef.current = null;
+        piStreamingTextRef.current = "";
+        piContentBlocksRef.current = [];
+      }
+      pendingSteerBatchRef.current = [...batch, ...pendingSteerBatchRef.current];
+      setIsLoading(false);
+      setIsStreaming(false);
+      const description = e instanceof Error ? e.message : String(e);
+      toast({ title: "failed to send steered message", description, variant: "destructive" });
+    } finally {
+      pendingSteerFlushInFlightRef.current = false;
+    }
+  }
+
+  function finishPendingSteerInterrupt(options?: { flush?: boolean }) {
+    steerAbortAtBoundaryRef.current = false;
+    steerAbortInFlightRef.current = false;
+    if (options?.flush !== false) {
+      void flushPendingSteerBatch();
+    }
+  }
+
+  async function maybeInterruptForPendingSteer(_reason: string) {
+    if (!steerAbortAtBoundaryRef.current) return;
+    if (steerAbortInFlightRef.current) return;
+    const sid = piSessionIdRef.current;
+    if (!sid) return;
+    const hasPending = pendingSteerBatchRef.current.some((item) => item.sessionId === sid);
+    if (!hasPending) {
+      finishPendingSteerInterrupt({ flush: false });
+      return;
+    }
+    if (!piMessageIdRef.current || (!isLoading && !isStreaming)) {
+      finishPendingSteerInterrupt();
+      return;
+    }
+
+    steerAbortInFlightRef.current = true;
+    try {
+      piActiveStopRequestedRef.current = true;
+      await commands.piAbortActive(sid);
+    } catch (e) {
+      console.warn("[steer] boundary abort failed", e);
+      steerAbortInFlightRef.current = false;
+    }
+  }
+
+  async function steerMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
+    const hasImages = imageDataUrls ? imageDataUrls.length > 0 : pastedImages.length > 0;
+    const trimmed = userMessage.trim();
+    if (!trimmed && !hasImages) return;
+
+    const hadActiveReply = isLoading || isStreaming || !!piMessageIdRef.current;
+    if (!hadActiveReply || !piInfo?.running) {
+      return sendPiMessage(trimmed, displayLabel, imageDataUrls);
+    }
+
+    posthog.capture("chat_message_steered", {
+      provider: activePreset?.provider,
+      model: activePreset?.model,
+      had_active_reply: hadActiveReply,
+      from_queue: !!imageDataUrls,
+    });
+
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const shouldClearPastedImages = imageDataUrls == null && pastedImages.length > 0;
+    const fallbackOriginalUserMessage = lastUserMessageRef.current;
+
+    setFollowUpSuggestions([]);
+    followUpFiredRef.current = false;
+    piRateLimitRetries.current = 0;
+    if (followUpAbortRef.current) {
+      followUpAbortRef.current.abort();
+      followUpAbortRef.current = null;
+    }
+    lastUserMessageRef.current = trimmed;
+    const turnIntentId = `steer-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const steerAttachments = consumePendingAttachments();
+    const optimisticUser: Message = {
+      id: turnIntentId,
+      role: "user",
+      content: trimmed,
+      ...(displayLabel ? { displayContent: displayLabel } : {}),
+      ...(outgoingImages.length ? { images: [...outgoingImages] } : {}),
+      ...(steerAttachments ? { attachments: steerAttachments } : {}),
+      intent: "steer",
+      turnIntentId,
+      timestamp: Date.now(),
+    };
+    markCurrentAssistantInterrupted();
+    const activeAssistantId = piMessageIdRef.current;
+    let originalUserMessage = fallbackOriginalUserMessage;
+    let nextRowsAfterOptimisticAppend: Message[] | null = null;
+    setMessages((prev) => {
+      const activeAssistantIndex = activeAssistantId
+        ? prev.findIndex((message) => message.id === activeAssistantId)
+        : -1;
+      if (activeAssistantIndex >= 0) {
+        for (let i = activeAssistantIndex - 1; i >= 0; i -= 1) {
+          const candidate = prev[i];
+          if (candidate?.role === "user" && candidate.intent !== "steer") {
+            originalUserMessage = candidate.content;
+            break;
+          }
+        }
+      }
+      if (activeAssistantIndex < 0) {
+        const next = [...prev, optimisticUser];
+        nextRowsAfterOptimisticAppend = next;
+        return next;
+      }
+
+      const activeAssistant = prev[activeAssistantIndex];
+      const hasVisibleAssistantContent = Boolean(
+        activeAssistant?.content &&
+        activeAssistant.content !== "Processing..."
+      ) || Boolean(activeAssistant?.contentBlocks?.length);
+      let insertIndex = hasVisibleAssistantContent
+        ? activeAssistantIndex + 1
+        : activeAssistantIndex;
+      while (
+        insertIndex < prev.length &&
+        prev[insertIndex]?.role === "user" &&
+        prev[insertIndex]?.intent === "steer"
+      ) {
+        insertIndex += 1;
+      }
+      const next = [
+        ...prev.slice(0, insertIndex),
+        optimisticUser,
+        ...prev.slice(insertIndex),
+      ];
+      nextRowsAfterOptimisticAppend = next;
+      return next;
+    });
+    if (nextRowsAfterOptimisticAppend) {
+      void saveConversation(nextRowsAfterOptimisticAppend, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
+    }
+    const sidNow = piSessionIdRef.current;
+    if (sidNow && nextRowsAfterOptimisticAppend) {
+      useChatStore.getState().actions.setMessages(sidNow, nextRowsAfterOptimisticAppend as any);
+    }
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+
+    if (shouldClearPastedImages) setPastedImages([]);
+
+    pendingSteerBatchRef.current = [
+      ...pendingSteerBatchRef.current,
+      {
+        turnIntentId,
+        sessionId: piSessionIdRef.current,
+        content: trimmed,
+        originalUserMessage,
+        interruptedAssistantId: activeAssistantId ?? undefined,
+        images: [...outgoingImages],
+        ...(steerAttachments ? { attachments: [...steerAttachments] } : {}),
+        ...(displayLabel ? { displayContent: displayLabel } : {}),
+        optimisticUserId: optimisticUser.id,
+        createdAt: Date.now(),
+      },
+    ];
+    if (hadActiveReply) {
+      // Request interruption at the next safe boundary event.
+      steerAbortAtBoundaryRef.current = true;
+      void maybeInterruptForPendingSteer("steer_message");
+      return;
+    }
+    if (!piMessageIdRef.current) {
+      void flushPendingSteerBatch();
+    }
+  }
+
+  async function steerQueuedPrompt(prompt: PiQueuedPrompt) {
+    setQueuedActionPromptId(prompt.id);
+    const queuedDisplay = takeQueuedDisplayById(currentQueueSessionId, prompt.id);
+    const existingTurnIntent = queuedDisplay?.turnIntentId
+      ? turnIntentLedgerRef.current.find((record) => record.sessionId === currentQueueSessionId && record.id === queuedDisplay.turnIntentId)
+      : turnIntentLedgerRef.current.find((record) => record.sessionId === currentQueueSessionId && record.queueId === prompt.id);
+    const turnIntentId = existingTurnIntent?.id ?? `queued-steer-${prompt.id}`;
+    const optimisticQueuedContent = existingTurnIntent?.kind === "steer"
+      ? existingTurnIntent.preview
+      : existingTurnIntent?.content ?? queuedDisplay?.preview ?? prompt.preview;
+    const optimisticQueuedUser: Message = {
+      id: turnIntentId,
+      role: "user",
+      content: optimisticQueuedContent,
+      ...(queuedDisplay?.displayContent ? { displayContent: queuedDisplay.displayContent } : {}),
+      ...(queuedDisplay?.images.length ? { images: [...queuedDisplay.images] } : {}),
+      ...(queuedDisplay?.attachments?.length ? { attachments: [...queuedDisplay.attachments] } : {}),
+      intent: "steer",
+      turnIntentId,
+      timestamp: Date.now(),
+    };
+    try {
+      pendingNextPiUserIntentRef.current = "steer";
+      pendingNextPiUserDisplayRef.current = {
+        preview: existingTurnIntent?.preview ?? queuedDisplay?.preview ?? prompt.preview,
+        images: queuedDisplay?.images ? [...queuedDisplay.images] : [],
+        ...(queuedDisplay?.displayContent ? { displayContent: queuedDisplay.displayContent } : {}),
+        optimisticUserId: optimisticQueuedUser.id,
+        turnIntentId,
+      };
+      registerTurnIntent({
+        id: turnIntentId,
+        sessionId: currentQueueSessionId,
+        kind: "steer",
+        content: existingTurnIntent?.content ?? queuedDisplay?.preview ?? prompt.preview,
+        preview: existingTurnIntent?.preview ?? queuedDisplay?.preview ?? prompt.preview,
+        displayedUserId: optimisticQueuedUser.id,
+        queueId: prompt.id,
+        createdAt: existingTurnIntent?.createdAt ?? Date.now(),
+      });
+      markCurrentAssistantInterrupted();
+      let nextRowsAfterQueuedSteer: Message[] | null = null;
+      setMessages((prev) => {
+        if (prev.some((message) => message.turnIntentId === turnIntentId || message.id === optimisticQueuedUser.id)) {
+          return prev;
+        }
+        const next = [...prev, optimisticQueuedUser];
+        nextRowsAfterQueuedSteer = next;
+        return next;
+      });
+      if (nextRowsAfterQueuedSteer) {
+        void saveConversation(nextRowsAfterQueuedSteer, {
+          refreshHistory: false,
+          syncActiveConversation: false,
+        });
+        const sidNow = piSessionIdRef.current;
+        if (sidNow) {
+          useChatStore.getState().actions.setMessages(sidNow, nextRowsAfterQueuedSteer as any);
+        }
+      }
+      const result = await commands.piSteerQueued(piSessionIdRef.current, prompt.id);
+      if (result.status !== "ok") {
+        pendingNextPiUserIntentRef.current = null;
+        pendingNextPiUserDisplayRef.current = null;
+        removeTurnIntent(turnIntentId);
+        setMessages((prev) => prev.filter((message) => message.turnIntentId !== turnIntentId));
+        restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
+        clearCurrentAssistantInterrupted();
+        toast({ title: "failed to steer queued message", description: result.error, variant: "destructive" });
+        return;
+      }
+      if (!result.data) {
+        pendingNextPiUserIntentRef.current = null;
+        pendingNextPiUserDisplayRef.current = null;
+        removeTurnIntent(turnIntentId);
+        setMessages((prev) => prev.filter((message) => message.turnIntentId !== turnIntentId));
+        restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
+        clearCurrentAssistantInterrupted();
+        toast({
+          title: "message already started",
+          description: "That follow-up has moved out of the queue.",
+        });
+        return;
+      }
+      if (currentQueueSessionId) {
+        setQueuedPromptsBySession((prev) => ({
+          ...prev,
+          [currentQueueSessionId]: (prev[currentQueueSessionId] ?? []).filter(
+            (queued) => queued.id !== prompt.id,
+          ),
+        }));
+      }
+    } catch (e) {
+      pendingNextPiUserIntentRef.current = null;
+      pendingNextPiUserDisplayRef.current = null;
+      removeTurnIntent(turnIntentId);
+      setMessages((prev) => prev.filter((message) => message.turnIntentId !== turnIntentId));
+      restoreQueuedDisplay(currentQueueSessionId, prompt.id, queuedDisplay);
+      clearCurrentAssistantInterrupted();
+      toast({
+        title: "failed to steer queued message",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setQueuedActionPromptId((current) => current === prompt.id ? null : current);
+    }
   }
 
   // Keep ref in sync so useEffect callbacks can call sendMessage
@@ -4947,6 +7364,28 @@ export function StandaloneChat({
       }
       if (sections.length > 0) {
         body = sections.join("\n\n");
+      }
+    }
+
+    if (m.role === "assistant") {
+      // Mirror the in-app aggregation: if this message's per-message footer
+      // was folded into a turn-level aggregate, skip its Sources block here
+      // so we don't repeat the same files across every step of an agentic
+      // loop. The aggregated Sources block is appended after the last
+      // assistant of the turn instead.
+      const isDeferred = citationPlan.deferredMessageIds.has(m.id);
+      const turnAggregate = citationPlan.aggregatedAfter.get(m.id);
+      if (!isDeferred) {
+        const citationsMarkdown = formatSourceCitationsMarkdown(sourceCitationsFromMessage(m));
+        if (citationsMarkdown) {
+          body = body ? `${body}\n\n${citationsMarkdown}` : citationsMarkdown;
+        }
+      }
+      if (turnAggregate && turnAggregate.length > 0) {
+        const aggregateMarkdown = formatSourceCitationsMarkdown(turnAggregate);
+        if (aggregateMarkdown) {
+          body = body ? `${body}\n\n${aggregateMarkdown}` : aggregateMarkdown;
+        }
       }
     }
 
@@ -4980,13 +7419,15 @@ export function StandaloneChat({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() && pastedImages.length === 0) return;
+    if (pendingDocsRef.current.length > 0) return; // wait for extraction to finish
+    if (!input.trim() && pastedImages.length === 0 && attachedDocsRef.current.length === 0) return;
     sendMessage(input.trim());
   };
 
   const handleStop = async () => {
+    piActiveStopRequestedRef.current = true;
     try {
-      await commands.piAbort(piSessionIdRef.current);
+      await commands.piAbortActive(piSessionIdRef.current);
     } catch (e) {
       console.warn("[Pi] Failed to abort:", e);
     }
@@ -4999,6 +7440,224 @@ export function StandaloneChat({
     setIsLoading(false);
     setIsStreaming(false);
   };
+
+  const renderComposerUtilityMenu = () => {
+    const timeLabels: Record<string, string> = {
+      "today's activity": "today",
+      "yesterday": "yesterday",
+      "past 7 days": "last week",
+      "past hour": "last hour",
+      "this morning": "this morning",
+    };
+
+    return (
+      <>
+        <div className="p-1 border-b border-border/50">
+          <button
+            type="button"
+            disabled={!canChat}
+            onClick={async () => {
+              setAppFilterOpen(false);
+              await handleFilePicker();
+            }}
+            className="w-full flex items-center gap-2 px-2 py-2 text-left text-sm rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none transition-colors"
+          >
+            <Paperclip className="h-4 w-4 text-muted-foreground shrink-0" />
+            <span>add photos & files</span>
+          </button>
+        </div>
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 flex items-center gap-1.5">
+          <Filter className="h-3 w-3" />
+          <span>filters</span>
+          {activeFilterCount > 0 && (
+            <span className="ml-auto text-foreground">{activeFilterCount}</span>
+          )}
+        </div>
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
+          time
+        </div>
+        {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
+          const isActive = activeFilters.timeRanges.some((r) => r.label === timeLabels[s.description]);
+          return (
+            <button
+              key={s.tag}
+              type="button"
+              onClick={() => {
+                if (isActive) {
+                  removeFilter("time", timeLabels[s.description]);
+                } else {
+                  removeFilter("time");
+                  setTimeout(() => {
+                    setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                  }, 0);
+                }
+                setAppFilterOpen(false);
+              }}
+              className={cn(
+                "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                isActive && "bg-muted"
+              )}
+            >
+              <span>{s.tag}</span>
+              <span className="text-[10px] text-muted-foreground">{s.description}</span>
+            </button>
+          );
+        })}
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+          content type
+        </div>
+        {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "content").map((s) => {
+          const contentTypeMap: Record<string, string> = { screen: "screen", audio: "audio", input: "input" };
+          const tagName = s.tag.slice(1);
+          const isActive = activeFilters.contentType === (contentTypeMap[tagName] || tagName);
+          return (
+            <button
+              key={s.tag}
+              type="button"
+              onClick={() => {
+                if (isActive) {
+                  removeFilter("content");
+                } else {
+                  removeFilter("content");
+                  setTimeout(() => {
+                    setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                  }, 0);
+                }
+                setAppFilterOpen(false);
+              }}
+              className={cn(
+                "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                isActive && "bg-muted"
+              )}
+            >
+              <span>{s.tag}</span>
+              <span className="text-[10px] text-muted-foreground">{s.description}</span>
+            </button>
+          );
+        })}
+
+        <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+          apps
+        </div>
+        {appMentionSuggestions.length === 0 ? (
+          <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
+        ) : (
+          appMentionSuggestions.map((suggestion) => {
+            const isActive = activeFilters.appName === suggestion.appName;
+            return (
+              <button
+                key={`app-${suggestion.tag}`}
+                type="button"
+                onClick={() => {
+                  if (isActive) {
+                    removeFilter("app");
+                  } else {
+                    if (activeFilters.appName) removeFilter("app");
+                    setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
+                  }
+                  setAppFilterOpen(false);
+                }}
+                className={cn(
+                  "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                  isActive && "bg-muted"
+                )}
+              >
+                <span>{suggestion.tag}</span>
+                <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
+              </button>
+            );
+          })
+        )}
+
+        {connections.length > 0 && (
+          <>
+            <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+              connections
+            </div>
+            {connections.map((c) => {
+              const tag = connectionMentionTag(c, isWindows);
+              return (
+                <button
+                  key={`conn-${c.id}`}
+                  type="button"
+                  onClick={() => {
+                    setInput((prev) => `${tag} ${prev.trim()}`.trim() + " ");
+                    setAppFilterOpen(false);
+                  }}
+                  className="w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2"
+                >
+                  <span className="flex items-center gap-1.5 min-w-0">
+                    <ConnectionToolIcon name={c.icon || c.id} />
+                    <span className="truncate">{tag}</span>
+                  </span>
+                  <span className="text-[10px] text-muted-foreground truncate">
+                    {c.name}
+                  </span>
+                </button>
+              );
+            })}
+          </>
+        )}
+
+        {recentSpeakers.length > 0 && (
+          <>
+            <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+              speakers
+            </div>
+            {recentSpeakers.map((s) => {
+              const speakerName = s.tag.startsWith('@"') ? s.tag.slice(2, -1) : s.tag.slice(1);
+              const isActive = activeFilters.speakerName === speakerName;
+              return (
+                <button
+                  key={`speaker-${s.tag}`}
+                  type="button"
+                  onClick={() => {
+                    if (isActive) {
+                      removeFilter("speaker");
+                    } else {
+                      if (activeFilters.speakerName) removeFilter("speaker");
+                      setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                    }
+                    setAppFilterOpen(false);
+                  }}
+                  className={cn(
+                    "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                    isActive && "bg-muted"
+                  )}
+                >
+                  <span>{s.tag}</span>
+                  <span className="text-[10px] text-muted-foreground">speaker</span>
+                </button>
+              );
+            })}
+          </>
+        )}
+      </>
+    );
+  };
+
+  const activeSourceFooterMessageId =
+    isLoading || isStreaming
+      ? piMessageIdRef.current ?? currentStreamingMessageId ?? null
+      : null;
+
+  // Per-turn aggregation plan. Pipe sessions (pipe-run, pipe-watch) and any
+  // chat with an agentic loop (≥2 assistant messages with citations between
+  // user turns) fold their per-message footers into one aggregated footer
+  // rendered after the last assistant of the turn. Single-step turns keep
+  // their per-message footer untouched.
+  const isPipeSessionChat =
+    currentSessionKind === "pipe-run" || currentSessionKind === "pipe-watch";
+  const citationPlan = React.useMemo(
+    () =>
+      computeChatCitationPlan(messages, {
+        forceAggregate: isPipeSessionChat,
+      }),
+    [isPipeSessionChat, messages],
+  );
 
   return (
     <div className={cn("flex flex-col bg-background", className ?? "h-screen")} data-testid="section-home">
@@ -5082,9 +7741,12 @@ export function StandaloneChat({
               <Plus size={14} />
               <span>New</span>
             </Button>
-            <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
-              {formatShortcutDisplay(settings.showChatShortcut || (isMac ? "Control+Super+L" : "Alt+L"), isMac)}
-            </kbd>
+            {!settings.disabledShortcuts.includes("showChatShortcut") &&
+            settings.showChatShortcut ? (
+              <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
+                {formatShortcutDisplay(settings.showChatShortcut, isMac)}
+              </kbd>
+            ) : null}
           </>
         )}
       </div>
@@ -5165,7 +7827,7 @@ export function StandaloneChat({
                         >
                           <div className="flex-1 min-w-0">
                             <p className="text-xs font-medium truncate">
-                              {conv.title}
+                              {(isConversationHistorySyncPrompt(conv.title) ? undefined : conv.title) || "untitled"}
                             </p>
                             <p className="text-[10px] text-muted-foreground">
                               {conv.messageCount} messages
@@ -5191,7 +7853,7 @@ export function StandaloneChat({
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   setOpenConvMenuId(null);
-                                  setRenameValue(conv.title);
+                                  setRenameValue(isConversationHistorySyncPrompt(conv.title) ? "" : conv.title);
                                   setRenamingConvId(conv.id);
                                 }}
                               >
@@ -5225,13 +7887,13 @@ export function StandaloneChat({
         {/* Messages */}
         <div
           ref={scrollContainerRef}
-          onScroll={handleMessagesScroll}
           // min-w-0 lets this flex child shrink when the BrowserSidebar
           // opens. Without it, flex's default `min-width: auto` keeps the
           // chat content at content-width and the sidebar overflows past
           // the right edge of the window — the native webview faithfully
           // follows the placeholder rect off-screen.
           className="relative flex-1 min-w-0 overflow-y-auto overflow-x-hidden"
+          onScroll={handleMessagesScroll}
           onContextMenu={(e) => {
             if (messages.length === 0) return;
             e.preventDefault();
@@ -5268,7 +7930,7 @@ export function StandaloneChat({
             setTimeout(() => document.addEventListener("mousedown", remove), 0);
           }}
         >
-        <div className="max-w-4xl mx-auto w-full p-4 space-y-4">
+        <div className={cn(CHAT_RAIL_CLASS, "px-5 sm:px-6 py-4 space-y-4")}>
         {/* Pipe-watch banner — shown when the user clicked through from
             a running pipe execution. Replaces the prior synthetic
             "Watching pipe: X" user-bubble sentinel. */}
@@ -5278,7 +7940,7 @@ export function StandaloneChat({
             executionId={activePipeExecution.executionId}
           />
         )}
-        {messages.length === 0 && !isPreparingPrefill && disabledReason && (!hasPresets || !hasValidModel || needsLogin) && (
+        {messages.length === 0 && !isPreparingPrefill && !activePipeExecution && !isLoading && !isStreaming && disabledReason && (!hasPresets || !hasValidModel || needsLogin) && (
           <div className="relative flex flex-col items-center justify-center py-12 space-y-4">
             <div className="relative p-6 rounded-2xl border bg-muted/50 border-border/50">
               {needsLogin ? (
@@ -5319,12 +7981,14 @@ export function StandaloneChat({
             )}
           </div>
         )}
-        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && (
+        {messages.length === 0 && !isPreparingPrefill && !activePipeExecution && !isLoading && !isStreaming && hasPresets && hasValidModel && (
           <SummaryCards
             onSendMessage={sendMessage}
-            autoSuggestions={autoSuggestions}
+            onOpenConnection={openConnectionSetup}
+            connectionSetupSuggestions={connectionSetupSuggestions}
+            autoSuggestions={connectionAwareSuggestions}
             suggestionsRefreshing={suggestionsRefreshing}
-            onRefreshSuggestions={refreshSuggestions}
+            onRefreshSuggestions={refreshVisibleSuggestions}
             customTemplates={customTemplates}
             onSaveCustomTemplate={saveCustomTemplate}
             onDeleteCustomTemplate={deleteCustomTemplate}
@@ -5334,16 +7998,72 @@ export function StandaloneChat({
           />
         )}
         <AnimatePresence mode="popLayout">
-          {messages
-            .filter((m) => {
+          {(() => {
+            const visibleMessages = messages.filter((m) => {
               if (m.role !== "assistant") return true;
               // hide placeholder "Processing..." messages (the grid dissolve loader handles this state)
               if (m.content === "Processing..." && !m.contentBlocks?.length) return false;
               // hide empty messages with no content blocks
-              if (!m.content && !m.contentBlocks?.length) return false;
+              if (!m.content && !m.contentBlocks?.length && !isSteeredAssistantMessage(m)) return false;
               return true;
-            })
-            .map((message) => (
+            });
+
+            const renderItems = buildCollapsedSteerRenderItems(visibleMessages, {
+              canCollapseSteerWork: !isLoading && !isStreaming && !piMessageIdRef.current,
+            });
+
+            return renderItems.map((item) => {
+              if (item.type === "collapsed-steer-work") {
+                const expanded = expandedSteerWorkIds.has(item.id);
+                return (
+                  <CollapsedSteerWorkRow
+                    key={item.id}
+                    item={item}
+                    expanded={expanded}
+                    onToggle={() => {
+                      setExpandedSteerWorkIds((current) => {
+                        const next = new Set(current);
+                        if (next.has(item.id)) {
+                          next.delete(item.id);
+                        } else {
+                          next.add(item.id);
+                        }
+                        return next;
+                      });
+                    }}
+                  />
+                );
+              }
+
+              const message = item.message;
+              if (item.hideWhenCollapsedBy && !expandedSteerWorkIds.has(item.hideWhenCollapsedBy)) {
+                return null;
+              }
+              const messageIndex = visibleMessages.findIndex((candidate) => candidate.id === message.id);
+              const shouldSuppressIntentLabel = item.hideIntentLabelWhenCollapsedBy &&
+                !expandedSteerWorkIds.has(item.hideIntentLabelWhenCollapsedBy);
+              const intentLabel = shouldSuppressIntentLabel ? null : getMessageIntentLabel(message);
+              const isSteerUserMessage = message.role === "user" && message.intent === "steer";
+              const canEditMessage = message.role === "user" && !isSteerUserMessage && !isLoading;
+              const canShowMessageActions = !item.showActionsWhenExpandedBy ||
+                expandedSteerWorkIds.has(item.showActionsWhenExpandedBy);
+              const isActiveStreamingAssistantMessage =
+                message.role === "assistant" &&
+                (isLoading || isStreaming) &&
+                message.id === activeSourceFooterMessageId;
+              const shouldShowMessageActionBar =
+                canShowMessageActions && !isActiveStreamingAssistantMessage;
+              const nextAssistant = visibleMessages
+                .slice(messageIndex + 1)
+                .find((candidate) => candidate.role === "assistant");
+              const hideSupersededSteerBody = isSteeredAssistantMessage(message) && Boolean(
+                nextAssistant &&
+                isSteeredAssistantMessage(nextAssistant) &&
+                !message.content &&
+                !message.contentBlocks?.length
+              );
+              const turnAggregatedCitations = citationPlan.aggregatedAfter.get(message.id);
+              return [
             <motion.div
               key={message.id}
               initial={{ opacity: 0, y: 10 }}
@@ -5351,30 +8071,34 @@ export function StandaloneChat({
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.2 }}
               className={cn(
-                "relative flex gap-3 min-w-0",
-                message.role === "user" ? "flex-row-reverse" : "flex-row"
+                "relative flex min-w-0",
+                message.role === "user" ? "justify-end" : "justify-start"
               )}
               data-testid={`chat-message-${message.role}`}
               data-message-id={message.id}
             >
               <div
                 className={cn(
-                  "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition-colors",
+                  "group/message flex flex-col min-w-0",
                   message.role === "user"
-                    ? "bg-foreground text-background border-foreground"
-                    : "bg-muted/50 text-foreground border-border/50"
+                    ? (editingMessageId === message.id ? "items-end w-full" : "items-end max-w-[82%]")
+                    : "items-start w-full"
                 )}
               >
-                {message.role === "user" ? (
-                  <User className="h-4 w-4" />
-                ) : (
-                  <PipeAIIcon size={16} animated={false} />
-                )}
-              </div>
-              <div className="group/message flex-1 flex flex-col min-w-0">
-              <div
+              {intentLabel ? (
+                <div
+                  className={cn(
+                    "mb-1 px-1 text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground/80",
+                    message.role === "user" ? "text-right" : "text-left"
+                  )}
+                >
+                  {intentLabel}
+                </div>
+              ) : null}
+              {hideSupersededSteerBody ? null : (
+                <div
                 onMouseDown={(e) => {
-                  if (message.role !== "user" || isLoading || editingMessageId === message.id) return;
+                  if (!canEditMessage || editingMessageId === message.id) return;
                   // Stage caret position from the click coords (still on live
                   // DOM), but defer entering edit mode to mouseup. Letting
                   // the user drag-select text inside their own messages
@@ -5385,7 +8109,7 @@ export function StandaloneChat({
                   pendingEditDownXYRef.current = { x: e.clientX, y: e.clientY };
                 }}
                 onMouseUp={(e) => {
-                  if (message.role !== "user" || isLoading || editingMessageId === message.id) return;
+                  if (!canEditMessage || editingMessageId === message.id) return;
                   const down = pendingEditDownXYRef.current;
                   pendingEditDownXYRef.current = null;
                   // If the mouse moved more than ~3px between down and up,
@@ -5397,79 +8121,130 @@ export function StandaloneChat({
                     return;
                   }
                   // Real click — enter edit mode.
-                  setEditDraft(message.content);
-                  setEditingMessageId(message.id);
+                  enterEditMode(message, pendingCaretRef.current ?? undefined);
                 }}
                 className={cn(
-                  "relative rounded-xl px-4 py-3 text-sm border overflow-hidden max-w-full transition-opacity",
+                  "relative rounded-xl text-sm overflow-hidden max-w-full transition-all",
                   message.role === "user"
-                    ? "bg-foreground text-background border-foreground"
-                    : "bg-muted/30 border-border/50",
-                  message.role === "user" && !isLoading && editingMessageId !== message.id && "cursor-text",
-                  // Queued user messages — visually de-emphasised so the eye stays on
-                  // the active turn. Cleared when pi-mono fires message_start for
-                  // this turn (see handler above).
-                  message.queued && "opacity-50 border-dashed"
+                    ? "bg-muted/60 text-foreground px-4 py-3"
+                    : "bg-background text-foreground py-1",
+                  canEditMessage && editingMessageId !== message.id && "cursor-text",
+                  // In edit mode, keep the bubble at full available width so it
+                  // doesn't shrink or look like a separate small input.
+                  editingMessageId === message.id && message.role === "user" && "w-full"
                 )}
               >
                 {editingMessageId === message.id ? (
-                  <textarea
-                    ref={(el) => {
-                      editTextareaRef.current = el;
-                      // Synchronous focus + caret placement BEFORE the browser
-                      // paints. Using the ref callback (instead of useEffect)
-                      // guarantees the cursor lands where the user clicked on
-                      // the very first frame — no flash-of-start-of-text.
-                      if (el && pendingCaretRef.current != null) {
-                        const pos = pendingCaretRef.current;
-                        pendingCaretRef.current = null;
-                        el.focus({ preventScroll: true });
-                        try { el.setSelectionRange(pos, pos); } catch { /* ignore */ }
-                      }
-                    }}
-                    value={editDraft}
-                    onChange={(e) => setEditDraft(e.target.value)}
-                    onBlur={() => {
-                      const trimmed = editDraft.trim();
-                      setEditingMessageId(null);
-                      if (!trimmed || trimmed === message.content) return;
-                      const idx = messages.findIndex((m) => m.id === message.id);
-                      if (idx === -1) return;
-                      setMessages((prev) => prev.slice(0, idx));
-                      sendMessage(trimmed, message.displayContent);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === "Escape") { e.preventDefault(); setEditingMessageId(null); }
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        (e.currentTarget as HTMLTextAreaElement).blur();
-                      }
-                    }}
-                    rows={Math.min(8, Math.max(1, editDraft.split("\n").length))}
-                    className="w-full resize-none bg-transparent text-background placeholder:text-background/40 focus:outline-none"
-                  />
+                  <div className="flex flex-col gap-2 w-full min-w-0">
+                    <textarea
+                      ref={(el) => {
+                        editTextareaRef.current = el;
+                        // Synchronous focus + caret placement BEFORE the browser
+                        // paints. Using the ref callback (instead of useEffect)
+                        // guarantees the cursor lands where the user clicked on
+                        // the very first frame — no flash-of-start-of-text.
+                        if (el && pendingCaretRef.current != null) {
+                          const pos = pendingCaretRef.current;
+                          pendingCaretRef.current = null;
+                          el.focus({ preventScroll: true });
+                          try { el.setSelectionRange(pos, pos); } catch { /* ignore */ }
+                        }
+                      }}
+                      value={editDraft}
+                      onChange={(e) => setEditDraft(e.target.value)}
+                      onBlur={() => commitEditedMessage(message, editDraft)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") {
+                          e.preventDefault();
+                          setEditingMessageId(null);
+                          pendingCaretRef.current = null;
+                          setEditDraft(message.content);
+                        }
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          (e.currentTarget as HTMLTextAreaElement).blur();
+                        }
+                      }}
+                      rows={Math.min(10, Math.max(1, editDraft.split("\n").length))}
+                      className="block w-full min-w-0 resize-none bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none leading-relaxed"
+                    />
+                    <div className="flex items-center justify-end gap-2">
+                      <button
+                        type="button"
+                        className="text-xs px-2 py-1 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onMouseUp={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingMessageId(null);
+                          pendingCaretRef.current = null;
+                          setEditDraft(message.content);
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        className="text-xs px-2 py-1 rounded-md bg-foreground text-background hover:bg-foreground/90 transition-colors"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onMouseUp={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          commitEditedMessage(message, editDraft);
+                        }}
+                      >
+                        Save
+                      </button>
+                    </div>
+                  </div>
                 ) : (
-                  <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
+                  <MessageContent
+                    message={message}
+                    deferSourceFooter={
+                      citationPlan.deferredMessageIds.has(message.id) ||
+                      message.id === activeSourceFooterMessageId
+                    }
+                    onImageClick={(images, index) => setImageViewer({ images, index })}
+                    onRetry={(prompt) => sendMessage(prompt)}
+                  />
                 )}
               </div>
+              )}
+              {!hideSupersededSteerBody && shouldShowMessageActionBar ? (
+                <>
                 {/* Action buttons - appear on hover, outside the message box */}
-                <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 transition-all duration-200">
-                  <button
-                    onClick={async () => {
-                      await navigator.clipboard.writeText(message.content);
-                      setCopiedMessageId(message.id);
-                      setTimeout(() => setCopiedMessageId(null), 2000);
-                    }}
-                    className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
-                    title="Copy message"
-                  >
-                    {copiedMessageId === message.id ? (
-                      <Check className="h-3 w-3" />
-                    ) : (
-                      <Copy className="h-3 w-3" />
+                {editingMessageId !== message.id && (
+                  <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 group-focus-within/message:opacity-100 transition-all duration-200">
+                    <button
+                      onClick={async () => {
+                        await navigator.clipboard.writeText(message.content);
+                        setCopiedMessageId(message.id);
+                        setTimeout(() => setCopiedMessageId(null), 2000);
+                      }}
+                      className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
+                      title="Copy message"
+                    >
+                      {copiedMessageId === message.id ? (
+                        <Check className="h-3 w-3" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                    </button>
+                    {canEditMessage && (
+                      <button
+                        type="button"
+                        onMouseUp={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          enterEditMode(message);
+                        }}
+                        className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
+                        title="Edit"
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
                     )}
-                  </button>
-                  {message.role === "assistant" && !isLoading && (
+                    {message.role === "assistant" && !isLoading && (
                     <button
                       onClick={() => {
                         const msgIndex = messages.findIndex((m) => m.id === message.id);
@@ -5489,8 +8264,8 @@ export function StandaloneChat({
                     >
                       <RefreshCw className="h-3 w-3" />
                     </button>
-                  )}
-                  {message.role === "assistant" && (
+                    )}
+                    {message.role === "assistant" && (
                     <Popover
                       open={openMessageMenuId === message.id}
                       onOpenChange={(open) => setOpenMessageMenuId(open ? message.id : null)}
@@ -5543,11 +8318,29 @@ export function StandaloneChat({
                         </button>
                       </PopoverContent>
                     </Popover>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )}
+                </>
+              ) : null}
               </div>
-            </motion.div>
-          ))}
+            </motion.div>,
+            turnAggregatedCitations && turnAggregatedCitations.length > 0 ? (
+              <motion.div
+                key={`turn-sources-${message.id}`}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.15 }}
+                className="w-full"
+                data-testid="chat-turn-sources"
+              >
+                <SourceCitationFooter citations={turnAggregatedCitations} />
+              </motion.div>
+            ) : null,
+              ];
+            });
+          })()}
         </AnimatePresence>
         <AnimatePresence>
           {isLoading && (() => {
@@ -5593,61 +8386,6 @@ export function StandaloneChat({
           })()}
         </AnimatePresence>
 
-        {/* Queued follow-ups — rendered between the streaming message and the
-            scroll anchor so they sit visually in the "what's next" gap. The
-            list comes from rust via `pi-queue-changed`; entries disappear as
-            the drain loop pulls each prompt and starts streaming it. */}
-        <AnimatePresence>
-          {queuedPrompts.length > 0 && (
-            <motion.div
-              key="queued-rail"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -4 }}
-              transition={{ duration: 0.2 }}
-              className="px-4 py-2 space-y-1.5"
-            >
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground/60 px-1">
-                queued · waiting for current reply
-              </div>
-              {queuedPrompts.map((p, i) => (
-                <motion.div
-                  key={p.id}
-                  layout
-                  initial={{ opacity: 0, x: -6 }}
-                  animate={{ opacity: 0.55, x: 0 }}
-                  exit={{ opacity: 0, x: 6, scale: 0.96 }}
-                  transition={{ duration: 0.18 }}
-                  whileHover={{ opacity: 0.85 }}
-                  className="group/qcard flex items-center gap-2 px-3 py-2 rounded-md border border-dashed border-border/40 bg-transparent text-sm text-muted-foreground/80 hover:border-border hover:bg-muted/30 transition-colors"
-                  title={p.preview.length > 80 ? p.preview : undefined}
-                >
-                  <span className="font-mono text-[10px] text-muted-foreground/50 shrink-0 w-4 text-right">
-                    {i + 1}
-                  </span>
-                  <Clock className="h-3 w-3 flex-shrink-0 opacity-50" />
-                  <span className="truncate flex-1">{p.preview}</span>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        await commands.piCancelQueued(piSessionIdRef.current, p.id);
-                      } catch (e) {
-                        console.warn("[Pi] cancel queued failed:", e);
-                      }
-                    }}
-                    className="opacity-0 group-hover/qcard:opacity-100 transition-opacity p-0.5 hover:bg-muted rounded shrink-0"
-                    aria-label="cancel queued message"
-                    title="cancel"
-                  >
-                    <X className="h-3 w-3 text-muted-foreground" />
-                  </button>
-                </motion.div>
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
-
         <div ref={messagesEndRef} />
       </div> {/* End of max-w-4xl wrapper */}
 
@@ -5667,11 +8405,11 @@ export function StandaloneChat({
 
       {/* Input */}
       <div ref={inputSectionRef} className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
-        <div className="max-w-4xl mx-auto w-full">
+        <div className={CHAT_RAIL_CLASS}>
         {/* Prefill, filters, suggestions first; then attached images in gap; then agent bar; then form */}
         {/* Prefill context indicator from search */}
         {(prefillContext || prefillFrameId) && (
-          <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
+          <div className="px-5 sm:px-6 py-2 border-b border-border/30 bg-muted/30">
             <div className="flex items-start justify-between gap-2">
               {prefillFrameId && (
                 <div className="flex-shrink-0">
@@ -5716,57 +8454,6 @@ export function StandaloneChat({
           </div>
         )}
 
-        {/* Active filters chips */}
-        {hasActiveFilters && (
-          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap gap-1.5">
-            {activeFilters.timeRanges.map((range, idx) => (
-              <button
-                key={`time-${idx}`}
-                type="button"
-                onClick={() => removeFilter("time", range.label)}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 rounded-full hover:bg-blue-500/20 transition-colors"
-              >
-                <span>🕐</span>
-                <span>{range.label}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            ))}
-            {activeFilters.contentType && (
-              <button
-                type="button"
-                onClick={() => removeFilter("content")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 rounded-full hover:bg-purple-500/20 transition-colors"
-              >
-                <span>{activeFilters.contentType === "audio" ? "🎤" : "🖥️"}</span>
-                <span>{activeFilters.contentType}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-            {activeFilters.appName && (
-              <button
-                type="button"
-                onClick={() => removeFilter("app")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 rounded-full hover:bg-green-500/20 transition-colors"
-              >
-                <span>📱</span>
-                <span>{activeFilters.appName}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-            {activeFilters.speakerName && (
-              <button
-                type="button"
-                onClick={() => removeFilter("speaker")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-orange-500/10 text-orange-600 dark:text-orange-400 border border-orange-500/20 rounded-full hover:bg-orange-500/20 transition-colors"
-              >
-                <span>👤</span>
-                <span>{activeFilters.speakerName}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-          </div>
-        )}
-
         {/* Follow-up suggestions (TikTok-style) */}
         <AnimatePresence>
           {!isLoading && followUpSuggestions.length > 0 && messages.length > 0 && (
@@ -5775,7 +8462,7 @@ export function StandaloneChat({
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: 8 }}
               transition={{ duration: 0.2 }}
-              className="px-3 pt-2 flex flex-col gap-1"
+              className="px-5 sm:px-6 pt-2 flex flex-col gap-1"
             >
               <span className="text-[10px] text-muted-foreground/60 uppercase tracking-wider font-medium">follow up</span>
               <div className="flex flex-wrap gap-1.5">
@@ -5797,24 +8484,29 @@ export function StandaloneChat({
         {/* Persistent auto-suggestions above input. Inline chips when the
             input is wide enough; collapses to a single trigger button that
             opens a popover when narrow (e.g. BrowserSidebar squeezed the
-            chat column). 520px is the rough threshold below which 4 chips
+            chat column). 520px is the rough threshold below which 3 chips
             wrap to multiple rows and eat too much vertical space. */}
-        {messages.length > 0 && !isLoading && autoSuggestions.length > 0 && (
+        {messages.length > 0 && !isLoading && connectionAwareSuggestions.length > 0 && (
           inputSectionWidth >= 520 ? (
-            <div className="px-3 pt-2 flex flex-wrap gap-1.5 items-center">
-              {autoSuggestions.slice(0, 4).map((s, i) => (
+            <div className="px-5 sm:px-6 pt-2 flex flex-wrap gap-1.5 items-center">
+              {connectionAwareSuggestions.slice(0, 3).map((s, i) => (
                 <button
                   key={i}
                   type="button"
                   onClick={() => sendMessage(s.text)}
-                  className="px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer max-w-[280px] truncate"
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer max-w-[280px]"
                   title={s.preview ? `${s.text} — ${s.preview}` : s.text}
                 >
-                  {s.text}
+                  {s.connectionIcon ? (
+                    <ConnectionToolIcon name={s.connectionIcon} />
+                  ) : (
+                    <Sparkles className="w-3 h-3 shrink-0 text-muted-foreground/70" strokeWidth={1.5} aria-hidden />
+                  )}
+                  <span className="truncate">{s.text}</span>
                 </button>
               ))}
               <button
-                onClick={refreshSuggestions}
+                onClick={refreshVisibleSuggestions}
                 disabled={suggestionsRefreshing}
                 className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
                 title="refresh suggestions"
@@ -5823,7 +8515,7 @@ export function StandaloneChat({
               </button>
             </div>
           ) : (
-            <div className="px-3 pt-2 flex items-center gap-1.5">
+            <div className="px-5 sm:px-6 pt-2 flex items-center gap-1.5">
               <Popover>
                 <PopoverTrigger asChild>
                   <button
@@ -5843,22 +8535,27 @@ export function StandaloneChat({
                   sideOffset={6}
                 >
                   <div className="flex flex-col gap-0.5">
-                    {autoSuggestions.slice(0, 4).map((s, i) => (
+                    {connectionAwareSuggestions.slice(0, 3).map((s, i) => (
                       <button
                         key={i}
                         type="button"
                         onClick={() => sendMessage(s.text)}
-                        className="text-left px-2 py-1.5 text-[11px] font-mono rounded-sm hover:bg-muted text-muted-foreground hover:text-foreground transition-colors line-clamp-2"
+                        className="text-left px-2 py-1.5 text-[11px] font-mono rounded-sm hover:bg-muted text-muted-foreground hover:text-foreground transition-colors flex items-start gap-1.5"
                         title={s.preview ? `${s.text} — ${s.preview}` : s.text}
                       >
-                        {s.text}
+                        {s.connectionIcon ? (
+                          <ConnectionToolIcon name={s.connectionIcon} />
+                        ) : (
+                          <Sparkles className="w-3 h-3 mt-0.5 shrink-0 text-muted-foreground/70" strokeWidth={1.5} aria-hidden />
+                        )}
+                        <span className="line-clamp-2">{s.text}</span>
                       </button>
                     ))}
                   </div>
                 </PopoverContent>
               </Popover>
               <button
-                onClick={refreshSuggestions}
+                onClick={refreshVisibleSuggestions}
                 disabled={suggestionsRefreshing}
                 className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
                 title="refresh suggestions"
@@ -5869,27 +8566,80 @@ export function StandaloneChat({
           )
         )}
 
-        {/* Attached images in the gap (above agent bar, like reference); click to open full-screen viewer */}
-        {pastedImages.length > 0 && (
-          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
+        {/* Composer attachment strip — one row, docs + images side by side.
+            Both kinds share a 64px height so the row has a consistent
+            baseline (the previous design rendered them in two separate
+            <div> rows with different heights, producing a fragmented strip
+            when a user attached one of each). Mirrors the in-bubble
+            in-bubble attachment row order (pending first so the user sees
+            the spinner promote in-place to a resolved chip, then resolved
+            docs, then images). */}
+        {(attachedDocs.length > 0 || pendingDocs.length > 0 || pastedImages.length > 0) && (
+          <div className="px-5 sm:px-6 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
+            {pendingDocs.map((doc) => {
+              const badge = attachmentBadge(doc.ext);
+              return (
+                <div
+                  key={`pending-${doc.id}`}
+                  className="flex items-center gap-2.5 h-16 max-w-[240px] rounded-xl border border-border/50 bg-muted/40 px-2.5 shadow-sm opacity-80"
+                  title={`${doc.name} — extracting…`}
+                  aria-busy="true"
+                >
+                  <div className={`relative shrink-0 w-10 h-10 rounded-lg flex items-center justify-center text-[10px] font-semibold tracking-tight ${badge.tint}`}>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-medium text-foreground">{doc.name}</div>
+                    <div className="truncate text-[10px] text-muted-foreground">extracting…</div>
+                  </div>
+                </div>
+              );
+            })}
+            {attachedDocs.map((doc, i) => {
+              const badge = attachmentBadge(doc.ext);
+              return (
+                <div
+                  key={`doc-${doc.name}-${i}`}
+                  className="relative group flex items-center gap-2.5 h-16 max-w-[240px] rounded-xl border border-border/50 bg-muted/40 px-2.5 shadow-sm"
+                  title={`${doc.name} — ${doc.charCount.toLocaleString()} chars${doc.truncated ? " (truncated to fit)" : ""}`}
+                >
+                  <div className={`shrink-0 w-10 h-10 rounded-lg flex items-center justify-center text-[10px] font-semibold tracking-tight ${badge.tint}`}>
+                    {badge.label}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-medium text-foreground">{doc.name}</div>
+                    <div className="truncate text-[10px] text-muted-foreground">
+                      {doc.charCount.toLocaleString()} chars{doc.truncated ? " • truncated" : ""}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAttachedDocs((prev) => prev.filter((_, idx) => idx !== i))}
+                    className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
+                  >
+                    <X className="w-3 h-3" />
+                  </button>
+                </div>
+              );
+            })}
             {pastedImages.map((img, i) => (
-              <div key={i} className="relative group shrink-0">
+              <div key={`img-${i}`} className="relative group shrink-0">
                 <button
                   type="button"
                   onClick={() => setImageViewer({ images: pastedImages, index: i })}
-                  className="block rounded-lg border border-border/50 shadow-sm overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="block rounded-xl border border-border/50 shadow-sm overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src={img}
                     alt={`Attached ${i + 1}`}
-                    className="h-20 w-20 min-h-20 min-w-20 object-cover cursor-pointer"
+                    className="h-16 w-16 min-h-16 min-w-16 object-cover cursor-pointer"
                   />
                 </button>
                 <button
                   type="button"
                   onClick={(e) => { e.stopPropagation(); setPastedImages(prev => prev.filter((_, idx) => idx !== i)); }}
-                  className="absolute -top-1.5 -right-1.5 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
+                  className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
                 >
                   <X className="w-3 h-3" />
                 </button>
@@ -5898,219 +8648,9 @@ export function StandaloneChat({
           </div>
         )}
 
-        <div className="p-2 border-b border-border/30 flex items-center gap-2">
-          <Popover open={appFilterOpen} onOpenChange={setAppFilterOpen}>
-            <PopoverTrigger asChild>
-              <button
-                type="button"
-                className={cn(
-                  "shrink-0 flex items-center gap-1 px-2 h-10 text-[11px] font-mono border rounded-md transition-colors",
-                  hasActiveFilters
-                    ? "border-foreground text-foreground"
-                    : "border-border text-muted-foreground hover:text-foreground hover:border-foreground"
-                )}
-                title="Search filters"
-              >
-                <Filter className="w-3 h-3" />
-                <span>filter</span>
-                {hasActiveFilters && (
-                  <span className="text-[10px] text-muted-foreground">
-                    ({(activeFilters.timeRanges.length > 0 ? 1 : 0) +
-                      (activeFilters.contentType ? 1 : 0) +
-                      (activeFilters.appName ? 1 : 0) +
-                      (activeFilters.speakerName ? 1 : 0)})
-                  </span>
-                )}
-              </button>
-            </PopoverTrigger>
-            <PopoverContent className="w-64 p-0 max-h-[360px] overflow-y-auto" align="start">
-              {/* Time filters */}
-              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
-                time
-              </div>
-              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
-                const timeLabels: Record<string, string> = {
-                  "today's activity": "today",
-                  "yesterday": "yesterday",
-                  "past 7 days": "last week",
-                  "past hour": "last hour",
-                  "this morning": "this morning",
-                };
-                const isActive = activeFilters.timeRanges.some((r) => r.label === timeLabels[s.description]);
-                return (
-                  <button
-                    key={s.tag}
-                    type="button"
-                    onClick={() => {
-                      if (isActive) {
-                        removeFilter("time", timeLabels[s.description]);
-                      } else {
-                        removeFilter("time");
-                        setTimeout(() => {
-                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
-                        }, 0);
-                      }
-                      setAppFilterOpen(false);
-                    }}
-                    className={cn(
-                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
-                      isActive && "bg-muted"
-                    )}
-                  >
-                    <span>{s.tag}</span>
-                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
-                  </button>
-                );
-              })}
-
-              {/* Content type filters */}
-              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
-                content type
-              </div>
-              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "content").map((s) => {
-                const contentTypeMap: Record<string, string> = { screen: "screen", audio: "audio", input: "input" };
-                const tagName = s.tag.slice(1);
-                const isActive = activeFilters.contentType === (contentTypeMap[tagName] || tagName);
-                return (
-                  <button
-                    key={s.tag}
-                    type="button"
-                    onClick={() => {
-                      if (isActive) {
-                        removeFilter("content");
-                      } else {
-                        removeFilter("content");
-                        setTimeout(() => {
-                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
-                        }, 0);
-                      }
-                      setAppFilterOpen(false);
-                    }}
-                    className={cn(
-                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
-                      isActive && "bg-muted"
-                    )}
-                  >
-                    <span>{s.tag}</span>
-                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
-                  </button>
-                );
-              })}
-
-              {/* App filters */}
-              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
-                apps
-              </div>
-              {appMentionSuggestions.length === 0 ? (
-                <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
-              ) : (
-                appMentionSuggestions.map((suggestion) => {
-                  const isActive = activeFilters.appName === suggestion.appName;
-                  return (
-                    <button
-                      key={`app-${suggestion.tag}`}
-                      type="button"
-                      onClick={() => {
-                        if (isActive) {
-                          removeFilter("app");
-                        } else {
-                          if (activeFilters.appName) removeFilter("app");
-                          setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
-                        }
-                        setAppFilterOpen(false);
-                      }}
-                      className={cn(
-                        "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
-                        isActive && "bg-muted"
-                      )}
-                    >
-                      <span>{suggestion.tag}</span>
-                      <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
-                    </button>
-                  );
-                })
-              )}
-
-              {/* Connections — lets users mention their own integrations (gmail, slack, etc.) */}
-              {connections.length > 0 && (
-                <>
-                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
-                    connections
-                  </div>
-                  {connections.map((c) => {
-                    const tag = `@${c.id}`;
-                    return (
-                      <button
-                        key={`conn-${c.id}`}
-                        type="button"
-                        onClick={() => {
-                          setInput((prev) => `${tag} ${prev.trim()}`.trim() + " ");
-                          setAppFilterOpen(false);
-                        }}
-                        className="w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2"
-                      >
-                        <span>{tag}</span>
-                        <span className="text-[10px] text-muted-foreground truncate">
-                          {c.name}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </>
-              )}
-
-              {/* Speakers */}
-              {recentSpeakers.length > 0 && (
-                <>
-                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
-                    speakers
-                  </div>
-                  {recentSpeakers.map((s) => {
-                    const speakerName = s.tag.startsWith('@"') ? s.tag.slice(2, -1) : s.tag.slice(1);
-                    const isActive = activeFilters.speakerName === speakerName;
-                    return (
-                      <button
-                        key={`speaker-${s.tag}`}
-                        type="button"
-                        onClick={() => {
-                          if (isActive) {
-                            removeFilter("speaker");
-                          } else {
-                            if (activeFilters.speakerName) removeFilter("speaker");
-                            setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
-                          }
-                          setAppFilterOpen(false);
-                        }}
-                        className={cn(
-                          "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
-                          isActive && "bg-muted"
-                        )}
-                      >
-                        <span>{s.tag}</span>
-                        <span className="text-[10px] text-muted-foreground">speaker</span>
-                      </button>
-                    );
-                  })}
-                </>
-              )}
-            </PopoverContent>
-          </Popover>
-          <div className="flex-1 min-w-0">
-            <AIPresetsSelector
-              onPresetChange={setActivePreset}
-              onPresetSaved={handlePiRestart}
-              controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
-              onControlledSelect={activePipeExecution ? (id) => {
-                const match = settings.aiPresets?.find((p) => p.id === id);
-                if (match) setActivePreset(match);
-              } : undefined}
-            />
-          </div>
-        </div>
-
         <form
           onSubmit={handleSubmit}
-          className="p-3 relative"
+          className="px-5 sm:px-6 pb-4 pt-3 relative"
           onPaste={handlePaste}
         >
           {/* Drop zone overlay — only shown in embedded (non-overlay) chat */}
@@ -6132,6 +8672,106 @@ export function StandaloneChat({
               )}
             </AnimatePresence>
           )}
+
+          {queuedPrompts.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: 0.18 }}
+              className="mb-2 rounded-lg border border-border/60 bg-background/95 backdrop-blur-sm shadow-sm overflow-hidden"
+            >
+              <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border/50 bg-background">
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <Clock className="h-3 w-3 text-muted-foreground/70 shrink-0" />
+                  <span className="text-[10px] uppercase tracking-wide text-muted-foreground font-medium">
+                    Queued
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-muted-foreground/60">
+                  {queuedPrompts.length}
+                </span>
+              </div>
+              <TooltipProvider delayDuration={150}>
+                <div ref={queuedScrollRef} className="max-h-[112px] overflow-y-auto scrollbar-minimal">
+                  {queuedPrompts.map((p, i) => {
+                    const isBusy = queuedActionPromptId === p.id;
+                    const queuedDisplay = queuedDisplayBySessionRef.current[currentQueueSessionId]?.[p.id];
+                    const label = queuedDisplay?.preview || p.preview || "image follow-up";
+                    return (
+                      <motion.div
+                        key={p.id}
+                        layout
+                        initial={{ opacity: 0, y: 4 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ duration: 0.16 }}
+                        tabIndex={0}
+                        role="listitem"
+                        onKeyDown={(e) => {
+                          if (isBusy) return;
+                          if (isQueuedItemSteerShortcut(e, isMac)) {
+                            e.preventDefault();
+                            steerQueuedPrompt(p);
+                          } else if (isQueuedItemCancelShortcut(e)) {
+                            e.preventDefault();
+                            cancelQueuedPrompt(p);
+                          }
+                        }}
+                        className="group/qcard select-none flex min-h-[36px] items-center gap-2 px-2.5 py-1.5 border-b border-border/40 last:border-b-0 text-sm text-foreground/90 focus-visible:outline-none focus-visible:bg-muted/20 hover:bg-muted/15 transition-colors"
+                        title={label.length > 90 ? label : undefined}
+                      >
+                        <span className="w-4 shrink-0 text-right font-mono text-[10px] text-muted-foreground/50">
+                          {i + 1}
+                        </span>
+                        <span className="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[12px]">
+                          {label}
+                        </span>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() => steerQueuedPrompt(p)}
+                                className="h-6 px-2 inline-flex items-center gap-1 justify-center text-foreground bg-background hover:bg-muted/20 disabled:opacity-50 disabled:pointer-events-none transition-colors border border-border/50"
+                                aria-label={`steer queued message ${i + 1}`}
+                              >
+                                {isBusy ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <>
+                                    <CornerDownRight className="h-2.5 w-2.5" />
+                                    <span className="text-[10px] font-medium">Steer</span>
+                                  </>
+                                )}
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              Steer current reply with this message ({formatSteerShortcut(isMac)})
+                            </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() => cancelQueuedPrompt(p)}
+                                className="h-6 w-6 inline-flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted/20 disabled:opacity-50 disabled:pointer-events-none transition-colors border border-transparent hover:border-border/50"
+                                aria-label={`remove queued message ${i + 1}`}
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Remove queued message</TooltipContent>
+                          </Tooltip>
+                        </div>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+              </TooltipProvider>
+            </motion.div>
+          )}
+
           <div
             className={cn(
               "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
@@ -6152,7 +8792,7 @@ export function StandaloneChat({
                   disabledReason
                     ? disabledReason
                     : isLoading || isStreaming
-                      ? "type to queue next message..."
+                      ? "Message will be queued..."
                       : "Ask about your screen... (type @ for filters, paste images)"
                 }
                 disabled={!canChat}
@@ -6214,133 +8854,121 @@ export function StandaloneChat({
               </AnimatePresence>
             </div>
             {/* Buttons row below textarea so scrollbar is above and full width is typeable */}
-            <div className="flex items-center justify-end gap-0.5 shrink-0 px-2 pb-2 pt-1">
-              {(() => {
-                // Privacy filter: removes personal info (names, emails, phones,
-                // addresses, account numbers) from screenpipe API responses
-                // before the AI sees them. Pro-only; non-pro click opens upsell.
-                const isPro = settings.user?.cloud_subscribed === true;
-                const privacyOn = isPro && settings.piPrivacyFilter === true;
-                return (
-                  <TooltipProvider delayDuration={150}>
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          type="button"
-                          size="icon"
-                          variant="ghost"
-                          onClick={() => {
-                            if (!isPro) {
-                              openUrl("https://screenpi.pe/onboarding");
-                              return;
-                            }
-                            updateSettings({ piPrivacyFilter: !privacyOn });
-                          }}
-                          disabled={isLoading}
-                          className={cn(
-                            "h-8 w-8 hover:bg-muted/50",
-                            privacyOn
-                              ? "text-foreground hover:text-foreground"
-                              : "text-muted-foreground hover:text-foreground"
-                          )}
-                          aria-label={
-                            privacyOn
-                              ? "Disable privacy filter"
-                              : "Enable privacy filter"
-                          }
-                        >
-                          {privacyOn ? (
-                            <ShieldCheck className="h-4 w-4" />
-                          ) : (
-                            <Shield className="h-4 w-4" />
-                          )}
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent
-                        side="top"
-                        align="center"
-                        className="max-w-[320px] p-3 space-y-2 text-xs leading-relaxed"
-                      >
-                        <div className="font-medium text-sm">
-                          {!isPro
-                            ? "Privacy filter — Pro"
-                            : privacyOn
-                              ? "Privacy filter: ON"
-                              : "Privacy filter: OFF"}
-                        </div>
-                        <div className="text-muted-foreground">
-                          {!isPro
-                            ? "Remove names, emails, phone numbers and other personal info from your screen data before the AI sees it. Adds ~1–2s per search. Click the shield to upgrade."
-                            : privacyOn
-                              ? "Names, emails, phone numbers and other personal info are removed from your screen data before it reaches the AI. Adds ~1–2s per search. Click the shield to turn off."
-                              : "Turn this on to strip personal info (names, emails, phones, addresses, account numbers) from your screen data before the AI sees it. Adds ~1–2s per search."}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            e.preventDefault();
-                            openUrl("https://docs.screenpi.pe/privacy-filter");
-                          }}
-                          className="text-[11px] underline text-muted-foreground hover:text-foreground transition-colors"
-                        >
-                          How it works →
-                        </button>
-                      </TooltipContent>
-                    </Tooltip>
-                  </TooltipProvider>
-                );
-              })()}
-              <Button
-                type="button"
-                size="icon"
-                variant="ghost"
-                onClick={handleFilePicker}
-                disabled={isLoading || !canChat}
-                className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted/50"
-                title="Attach image"
-              >
-                <Paperclip className="h-4 w-4" />
-              </Button>
-              {(() => {
-                // Three button modes:
-                //   1. streaming + input empty → stop (square)
-                //   2. streaming + input has text → queue (chevron-up, submits, enqueues)
-                //   3. not streaming → send (paper plane)
-                const hasInput = input.trim().length > 0 || pastedImages.length > 0;
-                const isQueueMode = (isLoading || isStreaming) && hasInput;
-                const isStopMode = (isLoading || isStreaming) && !hasInput;
-                return (
+            <div className="flex items-center gap-1.5 shrink-0 px-2 pb-2 pt-1">
+              <Popover open={appFilterOpen} onOpenChange={setAppFilterOpen}>
+                <PopoverTrigger asChild>
                   <Button
-                    type={isStopMode ? "button" : "submit"}
+                    type="button"
                     size="icon"
-                    disabled={(!hasInput && !isStopMode) || !canChat}
-                    onClick={isStopMode ? handleStop : undefined}
+                    variant="ghost"
                     className={cn(
-                      "h-8 w-8 transition-all duration-200 relative",
-                      "bg-foreground text-background hover:bg-foreground/80"
+                      "h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted/50 relative shrink-0",
+                      hasActiveFilters && "text-foreground bg-muted/50"
                     )}
-                    title={
-                      isStopMode
-                        ? "stop"
-                        : isQueueMode
-                          ? `queue (${queuedPrompts.length + 1} pending)`
-                          : "send"
-                    }
+                    title="Add attachments and filters"
+                    aria-label="Add attachments and filters"
                   >
-                    {isStopMode ? (
-                      <Square className="h-4 w-4" />
-                    ) : isQueueMode ? (
-                      <ChevronUp className="h-4 w-4" />
-                    ) : (
-                      <Send className="h-4 w-4" />
-                    )}
-                    {isQueueMode && queuedPrompts.length > 0 && (
-                      <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full bg-foreground text-background text-[9px] font-mono font-semibold flex items-center justify-center border border-background">
-                        {queuedPrompts.length + 1}
+                    <Plus className="h-4 w-4" />
+                    {activeFilterCount > 0 && (
+                      <span className="absolute -top-1 -right-1 min-w-[15px] h-[15px] px-1 rounded-full bg-foreground text-background text-[9px] font-mono font-semibold flex items-center justify-center">
+                        {activeFilterCount}
                       </span>
                     )}
                   </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  className="w-72 p-0 max-h-[420px] overflow-y-auto"
+                  align="start"
+                  side="top"
+                  sideOffset={6}
+                >
+                  {renderComposerUtilityMenu()}
+                </PopoverContent>
+              </Popover>
+              <div className="flex-1 min-w-0">
+                {hasActiveFilters && (
+                <div className="hidden sm:flex min-w-0 items-center gap-1 overflow-hidden">
+                  {activeFilterLabels.slice(0, 2).map((label, idx) => (
+                    <span
+                      key={`${label}-${idx}`}
+                      className="inline-flex h-6 max-w-[140px] items-center rounded-md border border-border/50 px-2 text-[10px] font-medium text-muted-foreground truncate"
+                      title={label}
+                    >
+                      {label}
+                    </span>
+                  ))}
+                  {activeFilterLabels.length > 2 && (
+                    <span className="inline-flex h-6 items-center rounded-md border border-border/50 px-2 text-[10px] font-medium text-muted-foreground shrink-0">
+                      +{activeFilterLabels.length - 2}
+                    </span>
+                  )}
+                </div>
+                )}
+              </div>
+              <AIPresetsSelector
+                compact
+                showModelOnly
+                containerClassName="w-[180px] max-w-[42vw] min-w-[120px] shrink-0 gap-0"
+                triggerClassName="h-8 border-0 bg-transparent px-1.5 text-xs text-muted-foreground shadow-none hover:bg-muted/50 hover:text-foreground"
+                onPresetSaved={handlePiRestart}
+                controlledPresetId={
+                  activePreset?.id ??
+                  settings.aiPresets?.find((p) => p.defaultPreset)?.id ??
+                  settings.aiPresets?.[0]?.id ??
+                  null
+                }
+                onControlledSelect={(id) => {
+                  if (!id) return;
+                  const match = settings.aiPresets?.find((p) => p.id === id);
+                  if (!match) return;
+                  setActivePreset(match);
+                  if (!activePipeExecution) handlePiRestart(match);
+                }}
+              />
+              {(() => {
+                const hasInput = input.trim().length > 0 || pastedImages.length > 0 || attachedDocs.length > 0;
+                const primaryAction = getComposerPrimaryAction(isLoading || isStreaming, hasInput);
+                const isStopMode = primaryAction === "stop";
+                // Pending doc extraction blocks send (but not stop). The
+                // button stays visible but disabled — the spinning chip
+                // upstream is the affordance that explains why.
+                const hasPendingDocs = pendingDocs.length > 0;
+                const sendDisabled = (!hasInput && !isStopMode) || !canChat || (!isStopMode && hasPendingDocs);
+                return (
+                  <>
+                    <Button
+                      type={isStopMode ? "button" : "submit"}
+                      size="icon"
+                      disabled={sendDisabled}
+                      onClick={isStopMode ? handleStop : undefined}
+                      className={cn(
+                        "h-8 w-8 transition-all duration-200 relative",
+                        "bg-foreground text-background hover:bg-foreground/80"
+                      )}
+                      title={
+                        isStopMode
+                          ? "stop"
+                          : hasPendingDocs
+                            ? "waiting for attachment to finish extracting"
+                            : "send"
+                      }
+                      aria-label={
+                        isStopMode
+                          ? "stop reply"
+                          : hasPendingDocs
+                            ? "send disabled while attachment is extracting"
+                            : "send message"
+                      }
+                    >
+                      {isStopMode ? (
+                        <Square className="h-4 w-4" />
+                      ) : hasPendingDocs ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Send className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </>
                 );
               })()}
             </div>

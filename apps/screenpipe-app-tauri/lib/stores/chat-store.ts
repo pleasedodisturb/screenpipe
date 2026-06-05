@@ -22,6 +22,13 @@
 
 import { create } from "zustand";
 import type { ConversationKind, PipeContext } from "@/lib/hooks/use-settings";
+import type { ConversationMeta } from "@/lib/chat-storage";
+import type { ChatTitleSource } from "@/lib/utils/chat-title";
+import {
+  CONVERSATION_DEDUP_WINDOW_MS,
+  conversationDedupKey,
+  messagesHaveCompletedReply,
+} from "@/lib/chat-dedup";
 
 export type SessionStatus =
   | "idle" // not currently producing output
@@ -40,12 +47,38 @@ export type SessionStatus =
  */
 export type StoredMessage = unknown;
 export type StoredContentBlock = unknown;
+// Opaque shapes for the per-session composer draft. The store doesn't
+// know what an attachment or extracted-doc actually contains — the chat
+// panel narrows these at the read site. Same isolation pattern as
+// StoredMessage. Drafts are in-memory only (never persisted to disk) so
+// a relaunch starts with empty composers — mirrors how `messages` /
+// `streamingText` are stored.
+export type StoredPastedImage = unknown;
+export type StoredAttachedDoc = unknown;
+export type StoredPendingDoc = unknown;
+export interface SessionDraft {
+  input: string;
+  pastedImages: StoredPastedImage[];
+  attachedDocs: StoredAttachedDoc[];
+  pendingDocs: StoredPendingDoc[];
+}
 
 export interface SessionRecord {
   /** Pi `session_id` — also the uuid used by `commands.piStart`. */
   id: string;
-  /** Display title — derived from first user message or `"new chat"`. */
+  /** Display title — derived from first user message or `"untitled"`. */
   title: string;
+  /** Who currently owns the title. User titles always win over AI/fallback. */
+  titleSource?: ChatTitleSource;
+  /** Normalized first user message — the cross-window duplicate key. Set for
+   *  rows hydrated/synced from disk (which carry no `messages`), so the sidebar
+   *  dedup can still match them; foreground rows that DO hold `messages` derive
+   *  the key live instead. Never persisted. */
+  dedupKey?: string;
+  /** Partial AI title being streamed — displayed in sidebar/header while
+   *  generation is in progress. Cleared on completion or failure.
+   *  Never persisted to disk. */
+  streamingTitle?: string;
   /** Last assistant or user message preview, truncated for the sidebar. */
   preview: string;
   /** Current liveness state (drives the sidebar dot / pulse). */
@@ -70,6 +103,12 @@ export interface SessionRecord {
   lastUserMessageAt?: number;
   /** User pinned this conversation to the top of the sidebar. */
   pinned: boolean;
+  /** Archived conversation hidden from recents. */
+  hidden?: boolean;
+  /** ms since epoch of the most recent time this chat was actively viewed
+   *  in the current app session. Ephemeral UI signal for recent-switching;
+   *  never persisted to disk and does not affect the sidebar order. */
+  lastViewedAt?: number;
   /** True when there's new assistant activity (delta or completion) that
    *  the user hasn't seen yet. Set by the event router when content lands
    *  for a session that is NOT the currently-viewed one; cleared the
@@ -110,6 +149,15 @@ export interface SessionRecord {
    *  the disk round-trip when the user comes back to a session that's
    *  been live in the store. */
   hydratedAt?: number;
+  /** Per-conversation composer draft — what the user had typed +
+   *  staged but not yet sent. Snapshotted on chat switch, restored on
+   *  return. In-memory only; never persisted to disk. Cleared when the
+   *  draft is actually sent (sendMessage already calls setInput("") etc).
+   *  See loadConversation / startNewConversation in use-chat-conversations.ts.
+   *  Named `composerDraft` (not `draft`) to avoid collision with the
+   *  pre-existing boolean `draft` flag above which marks empty
+   *  sidebar-hidden sessions. */
+  composerDraft?: SessionDraft;
 
   // ── Conversation kind + pipe metadata ──────────────────────────────
   // Splits sessions into chat / pipe-watch / pipe-run so the sidebar
@@ -127,6 +175,8 @@ export interface SessionRecord {
 interface ChatStoreState {
   /** All known sessions, keyed by id. Includes both alive and on-disk-only. */
   sessions: Record<string, SessionRecord>;
+  /** True once the initial `~/.screenpipe/chats` scan has finished. */
+  diskHydrated: boolean;
   /** Currently FOCUSED session — i.e. the chat the user is actively
    *  looking at. Cleared when the user navigates away from the chat
    *  view (Pipes/Memories/...) so the sidebar row stops being
@@ -142,6 +192,8 @@ interface ChatStoreState {
 interface ChatStoreActions {
   /** Replace the whole map (used by the on-disk loader). */
   hydrateFromDisk: (records: SessionRecord[]) => void;
+  /** Mark the initial disk scan complete even when storage read fails. */
+  markDiskHydrated: () => void;
   /** Insert / overwrite a single session record. */
   upsert: (record: SessionRecord) => void;
   /** Patch fields on an existing record. No-op if id is unknown. */
@@ -229,12 +281,17 @@ interface ChatStoreActions {
       isLoading: boolean;
     }
   ) => void;
+  /** Write (or clear) the composer draft for a session. Pass
+   *  `undefined` to drop the draft entirely (e.g. on successful send). */
+  setComposerDraft: (id: string, draft: SessionDraft | undefined) => void;
 }
 
 export type ChatStore = ChatStoreState & { actions: ChatStoreActions };
+type ChatSessionsState = Pick<ChatStoreState, "sessions">;
 
 export const useChatStore = create<ChatStore>((set) => ({
   sessions: {},
+  diskHydrated: false,
   currentId: null,
   panelSessionId: null,
   actions: {
@@ -251,16 +308,21 @@ export const useChatStore = create<ChatStore>((set) => ({
             ? {
                 ...existing,
                 title: r.title,
+                titleSource: r.titleSource ?? existing.titleSource,
                 preview: r.preview,
                 messageCount: r.messageCount,
                 pinned: existing.pinned || r.pinned,
+                hidden: existing.hidden ?? r.hidden ?? false,
                 // updatedAt: take the larger so memory doesn't get clobbered
                 updatedAt: Math.max(existing.updatedAt, r.updatedAt),
               }
             : r;
         }
-        return { sessions: next };
+        return { sessions: next, diskHydrated: true };
       }),
+
+    markDiskHydrated: () =>
+      set((s) => (s.diskHydrated ? {} : { diskHydrated: true })),
 
     upsert: (record) =>
       set((s) => {
@@ -296,16 +358,17 @@ export const useChatStore = create<ChatStore>((set) => ({
 
     setCurrent: (id) =>
       set((s) => {
+        const viewedAt = Date.now();
         // Viewing a session counts as reading it — clear the unread flag
         // for the new current. Same atomic update so the row's unread
         // state can't transiently flicker between the setCurrent call and
         // a follow-up markRead call.
-        if (id && s.sessions[id]?.unread) {
+        if (id && s.sessions[id]) {
           return {
             currentId: id,
             sessions: {
               ...s.sessions,
-              [id]: { ...s.sessions[id], unread: false },
+              [id]: { ...s.sessions[id], unread: false, lastViewedAt: viewedAt },
             },
           };
         }
@@ -523,6 +586,32 @@ export const useChatStore = create<ChatStore>((set) => ({
           },
         };
       }),
+
+    setComposerDraft: (id, draft) =>
+      set((s) => {
+        const existing = s.sessions[id];
+        if (!existing) return {};
+        // Treat an "empty" draft as no draft so the store doesn't
+        // accumulate stale objects for every chat the user ever opened.
+        // The composer always re-initializes to empty on switch when
+        // there's no saved draft, so dropping == restoring-empty.
+        const isEmpty =
+          !draft ||
+          (draft.input === "" &&
+            (draft.pastedImages?.length ?? 0) === 0 &&
+            (draft.attachedDocs?.length ?? 0) === 0 &&
+            (draft.pendingDocs?.length ?? 0) === 0);
+        if (isEmpty && !existing.composerDraft) return {};
+        const next = isEmpty ? undefined : draft;
+        return {
+          sessions: {
+            ...s.sessions,
+            [id]: { ...existing, composerDraft: next },
+          },
+        };
+        // No updatedAt bump — typing a draft is not user-visible
+        // activity for the sidebar's recency sort.
+      }),
   },
 }));
 
@@ -530,6 +619,30 @@ export const useChatStore = create<ChatStore>((set) => ({
  *  `actions` is set once in the create() call and never replaced, so this
  *  selector returns the same reference forever. Safe to use in deps. */
 export const useChatActions = () => useChatStore((s) => s.actions);
+
+/** Build a fresh SessionRecord from on-disk metadata. Used by both the
+ *  boot-time hydrate path and the pipe-run recorder so the sidebar sees
+ *  identically-shaped rows whether they were loaded at startup or upserted
+ *  the moment a pipe finishes. unread is false: persisted-from-disk rows
+ *  aren't user-actionable in the inbox sense. */
+export function sessionRecordFromMeta(m: ConversationMeta): SessionRecord {
+  return {
+    id: m.id,
+    title: m.title || "untitled",
+    titleSource: m.titleSource,
+    preview: "",
+    status: "idle",
+    messageCount: m.messageCount,
+    createdAt: m.createdAt,
+    updatedAt: m.updatedAt,
+    pinned: m.pinned,
+    unread: false,
+    lastUserMessageAt: m.lastUserMessageAt,
+    kind: m.kind,
+    pipeContext: m.pipeContext,
+    dedupKey: m.dedupKey,
+  };
+}
 
 /**
  * "+ new chat" semantics. If the user already has an empty chat
@@ -581,7 +694,7 @@ export function getOrCreateEmptyChatId(): { id: string; isNew: boolean } {
  *   // 2. raw: subscribe to the underlying map and memoize per-component
  *   const sessionsMap = useChatStore((s) => s.sessions);
  *   const sessions = useMemo(
- *     () => selectOrderedSessions({ sessions: sessionsMap } as ChatStore),
+ *     () => selectOrderedSessions({ sessions: sessionsMap }),
  *     [sessionsMap]
  *   );
  */
@@ -605,11 +718,101 @@ function compareForSidebar(a: SessionRecord, b: SessionRecord): number {
   return tier(a) - tier(b) || sortKey(b) - sortKey(a);
 }
 
-export function selectOrderedSessions(state: ChatStore): SessionRecord[] {
-  const all = Object.values(state.sessions);
+// ---------------------------------------------------------------------------
+// Read-time duplicate collapsing for the in-memory sidebar.
+//
+// `listConversations` dedups on-disk rows (dedupeConversationMetas) so the
+// History list never shows a cross-window twin twice — but the sidebar RECENTS
+// and the recent-switcher render straight from THIS store via the selectors
+// below, which that disk dedup never touches. A twin upserted into the store
+// (e.g. via chat-sidebar's `chat-conversation-saved` → syncConversationFromDisk)
+// would otherwise show as a second row for one conversation. Mirror the disk
+// dedup here: same key (normalized first user message), same 30-min window,
+// pipe runs exempt. Shared primitives live in `@/lib/chat-dedup`.
+// ---------------------------------------------------------------------------
+
+/** First-user-message dedup key for a store session. Prefer the key derived
+ *  from in-store `messages` (foreground / hydrated rows); fall back to the
+ *  `dedupKey` carried from disk meta (metadata-only rows — a boot-hydrated row
+ *  or a cross-window twin). Null exempts the row (pipe runs, or a chat with no
+ *  user message yet). */
+function sessionDedupKey(s: SessionRecord): string | null {
+  if (s.kind === "pipe-watch" || s.kind === "pipe-run") return null;
+  return conversationDedupKey({ kind: s.kind, messages: s.messages }) ?? s.dedupKey ?? null;
+}
+
+/** Which of two same-conversation rows to keep: the copy the user should see.
+ *  Prefer a visible (non-archived) row, then pinned, then a row with a real
+ *  (non-"Processing…") reply, then more messages, then most-recent activity.
+ *  Mirrors dedupCandidateIsBetter in chat-storage, plus visible-wins / pinned-
+ *  wins guards the disk side doesn't need — on disk, hidden and visible rows
+ *  are filtered into separate candidate sets BEFORE dedup, but the store holds
+ *  both at once, so a visible twin must never lose to a hidden one (that would
+ *  drop the conversation from the sidebar entirely). */
+function sessionIsBetterDuplicate(a: SessionRecord, b: SessionRecord): boolean {
+  if (!!a.hidden !== !!b.hidden) return !a.hidden;
+  if (a.pinned !== b.pinned) return a.pinned;
+  const aReply = messagesHaveCompletedReply(a.messages);
+  const bReply = messagesHaveCompletedReply(b.messages);
+  if (aReply !== bReply) return aReply;
+  if (a.messageCount !== b.messageCount) return a.messageCount > b.messageCount;
+  return (a.lastUserMessageAt ?? a.updatedAt) > (b.lastUserMessageAt ?? b.updatedAt);
+}
+
+/** Collapse store sessions that are the same conversation persisted under two
+ *  ids (cross-window save race). Order-preserving; keeps the more complete
+ *  copy. Pure — unit-testable in isolation. */
+export function dedupeSessionRecords(records: SessionRecord[]): SessionRecord[] {
+  const kept: SessionRecord[] = [];
+  const indicesByKey = new Map<string, number[]>();
+  for (const rec of records) {
+    const key = sessionDedupKey(rec);
+    if (!key) {
+      kept.push(rec);
+      continue;
+    }
+    const indices = indicesByKey.get(key);
+    let mergeIndex = -1;
+    if (indices) {
+      for (const index of indices) {
+        const a = rec.createdAt;
+        const b = kept[index].createdAt;
+        // Only merge when both timestamps are real and close together.
+        if (a && b && Math.abs(a - b) <= CONVERSATION_DEDUP_WINDOW_MS) {
+          mergeIndex = index;
+          break;
+        }
+      }
+    }
+    if (mergeIndex >= 0) {
+      if (sessionIsBetterDuplicate(rec, kept[mergeIndex])) kept[mergeIndex] = rec;
+      continue;
+    }
+    kept.push(rec);
+    const bucket = indicesByKey.get(key);
+    if (bucket) bucket.push(kept.length - 1);
+    else indicesByKey.set(key, [kept.length - 1]);
+  }
+  return kept;
+}
+
+export function selectOrderedSessions(state: ChatSessionsState): SessionRecord[] {
+  const all = dedupeSessionRecords(Object.values(state.sessions));
   const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
   const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
   return [...pinned, ...recents];
+}
+
+export function selectRecentSwitcherSessions(state: ChatSessionsState): SessionRecord[] {
+  const ordered = selectOrderedSessions(state);
+  const isEligibleSwitcherSession = (session: SessionRecord) =>
+    !session.hidden &&
+    !session.draft &&
+    session.kind !== "pipe-watch" &&
+    session.kind !== "pipe-run";
+  return ordered
+    .filter((session) => isEligibleSwitcherSession(session) && session.lastViewedAt)
+    .sort((a, b) => (b.lastViewedAt ?? 0) - (a.lastViewedAt ?? 0));
 }
 
 /**
@@ -621,10 +824,8 @@ export function selectOrderedSessions(state: ChatStore): SessionRecord[] {
 import { useMemo } from "react";
 export function useOrderedSessions(): SessionRecord[] {
   const sessionsMap = useChatStore((s) => s.sessions);
-  return useMemo(() => {
-    const all = Object.values(sessionsMap);
-    const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
-    const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
-    return [...pinned, ...recents];
-  }, [sessionsMap]);
+  return useMemo(
+    () => selectOrderedSessions({ sessions: sessionsMap }),
+    [sessionsMap],
+  );
 }

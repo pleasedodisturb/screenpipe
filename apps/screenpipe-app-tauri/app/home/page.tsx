@@ -14,7 +14,9 @@ import {
   UserPlus,
   Monitor,
   Mic,
+  MicOff,
   Volume2,
+  VolumeX,
   PanelLeftClose,
   PanelLeftOpen,
   Search,
@@ -24,10 +26,19 @@ import {
   NotebookPen,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
-import { useChatStore } from "@/lib/stores/chat-store";
+import {
+  sessionRecordFromMeta,
+  useChatStore,
+  type SessionStatus,
+} from "@/lib/stores/chat-store";
+import {
+  conversationMetaFromJson,
+  loadConversationFile,
+} from "@/lib/chat-storage";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
 import { AppSidebar, SidebarProvider, useSidebarContext } from "@/components/app-sidebar";
+import { UpdateBanner } from "@/components/update-banner";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 import { FeedbackSection } from "@/components/settings/feedback-section";
@@ -40,6 +51,7 @@ import {
   ChatSidebar,
   CollapsedChatSidebarButton,
 } from "@/components/chat-sidebar";
+import { ChatHistoryView } from "@/components/chat/chat-history-view";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
@@ -50,13 +62,19 @@ import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useRunningPipes } from "@/lib/hooks/use-running-pipes";
 import { commands } from "@/lib/utils/tauri";
-import { formatShortcutDisplay } from "@/lib/chat-utils";
+import { shouldAcceptTitleSource } from "@/lib/utils/chat-title";
+import {
+  formatShortcutDisplay,
+  type ChatLoadConversationPayload,
+  shouldActivateHomeSectionForChatLoadConversation,
+} from "@/lib/chat-utils";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
 import { PipeActivityIndicator } from "@/components/pipe-activity-indicator";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
+import type { MeetingRecord } from "@/lib/utils/meeting-format";
 import { useRouter } from "next/navigation";
 import { appendAuthToken, ensureApiReady, getApiBaseUrl, localFetch } from "@/lib/api";
 import {
@@ -67,10 +85,15 @@ import {
 } from "@/components/ui/tooltip";
 
 type MainSection = "home" | "timeline" | "memories" | "pipes" | "connections" | "meetings" | "help";
+type ConnectionFocusRequest = {
+  id: string | null;
+  category: string | null;
+  requestId: number;
+};
 
 // All valid URL sections for the home page
 const ALL_SECTIONS = [
-  "home", "timeline", "pipes", "help", "memories", "connections", "meetings",
+  "home", "timeline", "pipes", "help", "memories", "connections", "meetings", "history",
   "feedback", // backwards compat → maps to "help"
 ];
 
@@ -98,6 +121,7 @@ function HomeContent() {
     },
     serialize: (value) => value,
   });
+  const [connectionFocusRequest, setConnectionFocusRequest] = useState<ConnectionFocusRequest | null>(null);
 
   const { settings } = useSettings();
   const { isTranslucent } = useSidebarContext();
@@ -108,6 +132,28 @@ function HomeContent() {
   const selectChatConversation = useCallback((id: string) => {
     setActiveSection("home");
     useChatStore.getState().actions.setCurrent(id);
+    void emit("chat-load-conversation", { conversationId: id });
+  }, [setActiveSection]);
+
+  const startNewChat = useCallback(() => {
+    const id = crypto.randomUUID();
+    const store = useChatStore.getState();
+    Object.values(store.sessions).forEach((s) => {
+      if (s.draft) store.actions.drop(s.id);
+    });
+    store.actions.upsert({
+      id,
+      title: "untitled",
+      preview: "",
+      status: "idle",
+      messageCount: 0,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      pinned: false,
+      unread: false,
+      draft: true,
+    });
+    store.actions.setCurrent(id);
     void emit("chat-load-conversation", { conversationId: id });
   }, [setActiveSection]);
 
@@ -127,6 +173,14 @@ function HomeContent() {
     const fallback = ["home", "timeline", "pipes"].find((s) => !isSectionHidden(s));
     setActiveSection(fallback ?? "home");
   }, [activeSection, isSectionHidden, setActiveSection]);
+
+  // Timeline can be turned off in Display settings. When it is, the nav item is
+  // gone, so bounce out of the (now unreachable) timeline section to chat.
+  useEffect(() => {
+    if ((settings.disableTimeline ?? false) && activeSection === "timeline") {
+      setActiveSection("home");
+    }
+  }, [settings.disableTimeline, activeSection, setActiveSection]);
 
   // Mount the Pi event router once, app-wide. Listens for `pi_event` /
   // `pi_session_evicted` outside any chat-component lifecycle and mirrors
@@ -148,6 +202,150 @@ function HomeContent() {
     void mountPipeWatchWriter();
   }, []);
 
+  // Overlay-side foreground sessions don't pass through this window's
+  // background router path. Mirror lightweight activity (status + preview)
+  // so the home sidebar stays live without mirroring full message bodies.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFn: (() => void) | undefined;
+    (async () => {
+      const unlisten = await listen<{
+        id: string;
+        status?: SessionStatus;
+        preview?: string;
+        title?: string;
+        updatedAt: number;
+        lastError?: string;
+        unreadHint?: boolean;
+      }>("chat-session-activity", (event) => {
+        if (cancelled) return;
+        const { id, status, preview, title, updatedAt, lastError, unreadHint } = event.payload ?? {};
+        if (!id || !updatedAt) return;
+        const store = useChatStore.getState();
+        const existing = store.sessions[id];
+        if (!existing) {
+          store.actions.upsert({
+            id,
+            title: title?.trim() || "untitled",
+            preview: preview ?? "",
+            status: status ?? "idle",
+            lastError,
+            messageCount: 0,
+            createdAt: updatedAt,
+            updatedAt,
+            pinned: false,
+            hidden: false,
+            unread: false,
+          });
+        } else {
+          if (existing.updatedAt > updatedAt) return;
+          const nextTitle = title?.trim() || existing.title;
+          const nextPreview = preview ?? existing.preview;
+          const nextStatus = status ?? existing.status;
+          const nextLastError =
+            lastError !== undefined
+              ? lastError || undefined
+              : nextStatus === "error"
+                ? existing.lastError
+                : undefined;
+          if (
+            existing.title === nextTitle &&
+            existing.preview === nextPreview &&
+            existing.status === nextStatus &&
+            existing.lastError === nextLastError &&
+            existing.updatedAt === updatedAt
+          ) return;
+          store.actions.patch(id, {
+            title: nextTitle,
+            preview: nextPreview,
+            status: nextStatus,
+            lastError: nextLastError,
+            updatedAt,
+          });
+        }
+        if (unreadHint && store.currentId !== id && store.panelSessionId !== id) {
+          store.actions.markUnread(id);
+        }
+      });
+      unlistenFn = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
+  }, []);
+
+  // Saved-title correction path. Activity updates are best-effort during
+  // streaming; this event is emitted after canonical on-disk save, so use it
+  // to guarantee Main row title converges from "new chat" to real title.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFn: (() => void) | undefined;
+    (async () => {
+      const unlisten = await listen<{ id: string; title?: string; titleSource?: "fallback" | "ai" | "user" }>(
+        "chat-conversation-saved",
+        async (event) => {
+          if (cancelled) return;
+          const { id, title, titleSource } = event.payload ?? {};
+          const nextTitle = title?.trim();
+          if (!id || !nextTitle) return;
+
+          const store = useChatStore.getState();
+          const existing = store.sessions[id];
+          if (!existing) {
+            const conv = await loadConversationFile(id);
+            if (cancelled) return;
+            const meta = conversationMetaFromJson(conv);
+            if (meta) {
+              store.actions.upsert(sessionRecordFromMeta(meta));
+              return;
+            }
+            store.actions.upsert({
+              id,
+              title: nextTitle,
+              ...(titleSource ? { titleSource } : {}),
+              preview: "",
+              status: "idle",
+              messageCount: 0,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              pinned: false,
+              hidden: false,
+              unread: false,
+            });
+            return;
+          }
+          let dedupKey: string | undefined;
+          if (!existing.dedupKey && !existing.messages?.length) {
+            const conv = await loadConversationFile(id);
+            if (cancelled) return;
+            dedupKey = conversationMetaFromJson(conv)?.dedupKey;
+          }
+          // Respect titleSource priority: user > ai > fallback.
+          // Never downgrade an existing higher-priority source.
+          if (!shouldAcceptTitleSource(existing.titleSource, titleSource)) {
+            if (dedupKey) store.actions.patch(id, { dedupKey });
+            return;
+          }
+          if (existing.title !== nextTitle || (titleSource && existing.titleSource !== titleSource)) {
+            store.actions.patch(id, {
+              title: nextTitle,
+              ...(titleSource ? { titleSource } : {}),
+              ...(dedupKey ? { dedupKey } : {}),
+            });
+          } else if (dedupKey) {
+            store.actions.patch(id, { dedupKey });
+          }
+        },
+      );
+      unlistenFn = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
+  }, []);
+
   // Selecting a chat from the sidebar (or any other source that emits
   // chat-load-conversation) should also FLIP the active view to the chat
   // panel. Without this, clicking a chat from the Pipes / Timeline /
@@ -161,8 +359,9 @@ function HomeContent() {
     let cancelled = false;
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      const u = await listen("chat-load-conversation", () => {
+      const u = await listen<ChatLoadConversationPayload>("chat-load-conversation", (event) => {
         if (cancelled) return;
+        if (!shouldActivateHomeSectionForChatLoadConversation(event.payload)) return;
         setActiveSection("home");
       });
       unlistenFn = u;
@@ -251,22 +450,65 @@ function HomeContent() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [toggleSidebar]);
-  const overlayData = useOverlayData();
 
-  // Fetch actual recording devices from health endpoint (same source as tray menu)
-  interface RecordingDevice { name: string; kind: "monitor" | "input" | "output"; active: boolean }
+  // Cmd+N / Ctrl+N to start a new chat (matches the "New chat" sidebar button)
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        setActiveSection("home");
+        startNewChat();
+        // Focus the chat input. When standalone-chat is already mounted (home→home)
+        // it catches this; when mounting fresh from another section, its on-mount
+        // auto-focus handles it instead.
+        void emit("chat-focus-input", {});
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [setActiveSection, startNewChat]);
+  const overlayData = useOverlayData({
+    includeDeviceLevels: false,
+    includeOcrPulse: false,
+    minIntervalMs: 1000,
+    quantize: true,
+  });
+
+  // Fetch actual recording devices. Audio comes from /audio/device/status so
+  // user-paused devices stay visible and can be resumed from the same control.
+  interface RecordingDevice {
+    name: string;
+    fullName: string;
+    kind: "monitor" | "input" | "output";
+    active: boolean;
+  }
+  interface AudioDeviceStatus {
+    name: string;
+    is_running: boolean;
+    is_user_disabled?: boolean;
+  }
   const [recordingDevices, setRecordingDevices] = useState<RecordingDevice[]>([]);
+  const recordingDevicesSnapshotRef = useRef("");
 
   useEffect(() => {
     let cancelled = false;
     const fetchDevices = () => {
-      localFetch("/health")
-        .then((r) => r.ok ? r.json() : null)
-        .then((health: { monitors?: string[]; device_status_details?: string } | null) => {
-          if (cancelled || !health) return;
+      Promise.all([
+        localFetch("/health")
+          .then((r) => r.ok ? r.json() : null)
+          .catch(() => null),
+        localFetch("/audio/device/status")
+          .then((r) => r.ok ? r.json() : null)
+          .catch(() => null),
+      ])
+        .then(([health, audioStatus]: [
+          { monitors?: string[]; device_status_details?: string } | null,
+          AudioDeviceStatus[] | null,
+        ]) => {
+          if (cancelled) return;
           const devices: RecordingDevice[] = [];
           // Parse monitors — filter to only those actually being recorded
-          if (health.monitors) {
+          if (health?.monitors) {
             const monitorIds: string[] = settings.monitorIds ?? ["default"];
             const useAll = settings.useAllMonitors ?? true;
             for (const name of health.monitors) {
@@ -281,12 +523,28 @@ function HomeContent() {
                 });
                 if (!matched) continue;
               }
-              devices.push({ name, kind: "monitor", active: true });
+              devices.push({ name, fullName: name, kind: "monitor", active: true });
             }
           }
-          // Parse audio devices from device_status_details
-          // Format: "DeviceName (input): active (last activity: 2s ago), DeviceName (output): inactive"
-          if (health.device_status_details) {
+
+          const visibleAudioDevices = Array.isArray(audioStatus)
+            ? audioStatus.filter((d) => d.is_running || d.is_user_disabled)
+            : [];
+
+          if (visibleAudioDevices.length > 0) {
+            for (const device of visibleAudioDevices) {
+              const kind = device.name.includes("(output)") ? "output" as const : "input" as const;
+              const name = device.name.replace(/\s*\((input|output)\)\s*/gi, "").trim();
+              devices.push({
+                name,
+                fullName: device.name,
+                kind,
+                active: device.is_running,
+              });
+            }
+          } else if (health?.device_status_details) {
+            // Fallback for older sidecars that do not expose /audio/device/status.
+            // Format: "DeviceName (input): active (last activity: 2s ago)"
             for (const part of health.device_status_details.split(", ")) {
               const match = part.split(": ");
               if (match.length < 2) continue;
@@ -296,10 +554,15 @@ function HomeContent() {
                 : nameAndType.includes("(output)") ? "output" as const
                 : "input" as const;
               const name = nameAndType.replace(/\s*\((input|output)\)\s*/gi, "").trim();
-              devices.push({ name, kind, active });
+              const suffix = kind === "input" ? "input" : "output";
+              devices.push({ name, fullName: `${name} (${suffix})`, kind, active });
             }
           }
-          setRecordingDevices(devices);
+          const snapshot = JSON.stringify(devices);
+          if (snapshot !== recordingDevicesSnapshotRef.current) {
+            recordingDevicesSnapshotRef.current = snapshot;
+            setRecordingDevices(devices);
+          }
         })
         .catch(() => {});
     };
@@ -378,7 +641,7 @@ function HomeContent() {
     };
   }, []);
 
-  const toggleMeeting = useCallback(async (seed?: { title?: string; attendees?: string }) => {
+  const toggleMeeting = useCallback(async (seed?: { title?: string; attendees?: string; resumeMeetingId?: number }) => {
     setMeetingLoading(true);
     try {
       if (meetingState.active) {
@@ -387,9 +650,13 @@ function HomeContent() {
         const res = await localFetch("/meetings/stop", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: targetId }),
+          body: JSON.stringify({
+            id: targetId,
+            append_typed_text: settings.appendTypedTextToMeetingNote ?? true,
+          }),
         });
         if (res.ok) {
+          const meeting: MeetingRecord = await res.json();
           manualMeetingStartedAt.current = 0;
           setMeetingState({
             active: false,
@@ -399,11 +666,17 @@ function HomeContent() {
             meetingApp: null,
             detectionSource: null,
           });
+          return meeting;
         }
+        const bodyText = await res.text().catch(() => "");
+        throw new Error(
+          `stop meeting failed: HTTP ${res.status}${bodyText ? ` — ${bodyText}` : ""}`,
+        );
       } else {
         // No meeting active — start a manual one (optionally seeded from a
-        // calendar event when the caller has it).
-        const body: Record<string, string> = { app: "manual" };
+        // calendar event when the caller has it), or resume an existing note.
+        const body: Record<string, string | number> = { app: "manual" };
+        if (seed?.resumeMeetingId) body.id = seed.resumeMeetingId;
         if (seed?.title) body.title = seed.title;
         if (seed?.attendees) body.attendees = seed.attendees;
         const res = await localFetch("/meetings/start", {
@@ -412,23 +685,30 @@ function HomeContent() {
           body: JSON.stringify(body),
         });
         if (res.ok) {
+          const meeting: MeetingRecord = await res.json();
           manualMeetingStartedAt.current = Date.now();
           setMeetingState({
             active: true,
             manualActive: true,
-            activeMeetingId: null,
-            stoppableMeetingId: null,
-            meetingApp: "manual",
-            detectionSource: "manual",
+            activeMeetingId: meeting.id,
+            stoppableMeetingId: meeting.id,
+            meetingApp: meeting.meeting_app,
+            detectionSource: meeting.detection_source,
           });
+          return meeting;
         }
+        const bodyText = await res.text().catch(() => "");
+        throw new Error(
+          `start meeting failed: HTTP ${res.status}${bodyText ? ` — ${bodyText}` : ""}`,
+        );
       }
     } catch (e) {
       console.error("meeting toggle failed:", e);
+      throw e;
     } finally {
       setMeetingLoading(false);
     }
-  }, [meetingState]);
+  }, [meetingState, settings.appendTypedTextToMeetingNote]);
 
   // Native overlay already toggles the meeting in Rust. Refresh local state
   // here instead of toggling again, otherwise one click can create or stop
@@ -478,6 +758,9 @@ function HomeContent() {
   const openSettings = useCallback((section: string = "general") => {
     router.push(`/settings?section=${section}`);
   }, [router]);
+  const clearConnectionFocusRequest = useCallback(() => {
+    setConnectionFocusRequest(null);
+  }, []);
 
   // Listen for open-settings events from child components (e.g. connections strip)
   useEffect(() => {
@@ -486,6 +769,11 @@ function HomeContent() {
       const section = detail?.section ?? "general";
       // connections is a top-level main-sidebar section now, not in settings
       if (section === "connections") {
+        setConnectionFocusRequest({
+          id: typeof detail?.connectionId === "string" ? detail.connectionId : null,
+          category: typeof detail?.category === "string" ? detail.category : null,
+          requestId: Date.now(),
+        });
         setActiveSection("connections");
         return;
       }
@@ -511,13 +799,24 @@ function HomeContent() {
         // means the case branch falls through to the always-mounted chat.
         return null;
       case "timeline":
+        // Timeline can be disabled in Display settings; when it is, fall through
+        // to chat (the redirect effect also resets activeSection to "home"). This
+        // avoids a flash of the disabled placeholder on reload.
+        if (settings.disableTimeline) return null;
         return <Timeline embedded />;
       case "memories":
         return <MemoriesSection />;
       case "pipes":
         return <PipeStoreView />;
       case "connections":
-        return <ConnectionsSection />;
+        return (
+          <ConnectionsSection
+            focusConnectionId={connectionFocusRequest?.id ?? null}
+            focusCategory={connectionFocusRequest?.category ?? null}
+            focusRequestId={connectionFocusRequest?.requestId ?? 0}
+            onFocusRequestConsumed={clearConnectionFocusRequest}
+          />
+        );
       case "meetings":
         return (
           <MeetingNotesSection
@@ -529,6 +828,16 @@ function HomeContent() {
         );
       case "help":
         return <FeedbackSection />;
+      case "history":
+        return (
+          <ChatHistoryView
+            onBack={() => setActiveSection("home")}
+            onNewChat={() => startNewChat()}
+            onSelectConversation={(id) => {
+              selectChatConversation(id);
+            }}
+          />
+        );
       default:
         return (
           <div className="flex flex-col items-center justify-center h-full text-muted-foreground">
@@ -550,7 +859,11 @@ function HomeContent() {
     { id: "meetings", label: "Meeting notes", icon: <NotebookPen className="h-3.5 w-3.5" /> },
     { id: "memories", label: "Memories", icon: <Sparkles className="h-3.5 w-3.5" /> },
     { id: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
-  ].filter((s) => !isSectionHidden(s.id));
+  ]
+    .filter((s) => !isSectionHidden(s.id))
+    // Timeline can be turned off in Display settings — when it is, drop it from
+    // the sidebar entirely (the "Timeline Disabled" placeholder was poor UX).
+    .filter((s) => !(s.id === "timeline" && (settings.disableTimeline ?? false)));
 
   // Listen for navigation events from other windows (e.g. tray, Rust-side links)
   useEffect(() => {
@@ -573,7 +886,8 @@ function HomeContent() {
   const isFullHeight =
     activeSection === "home" ||
     activeSection === "timeline" ||
-    activeSection === "meetings";
+    activeSection === "meetings" ||
+    activeSection === "history";
 
   return (
     <div className={cn("bg-transparent", isFullHeight ? "h-screen overflow-hidden" : "min-h-screen")} data-testid="home-page">
@@ -633,12 +947,12 @@ function HomeContent() {
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="text-xs">
                   search
-                  <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
-                    {formatShortcutDisplay(
-                      settings.searchShortcut || (isMac ? "Control+Super+K" : "Alt+K"),
-                      isMac,
-                    )}
-                  </kbd>
+                  {!settings.disabledShortcuts.includes("searchShortcut") &&
+                  settings.searchShortcut ? (
+                    <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
+                      {formatShortcutDisplay(settings.searchShortcut, isMac)}
+                    </kbd>
+                  ) : null}
                 </TooltipContent>
               </Tooltip>
             </>
@@ -660,57 +974,109 @@ function HomeContent() {
                 const screenOpacity = overlayData.screenActive ? 0.5 + Math.min(overlayData.captureFps / 2, 0.5) : 0.2;
                 const audioOpacity = overlayData.audioActive ? 0.5 + Math.min(overlayData.speechRatio, 0.5) : 0.2;
 
-                const groups: { key: string; icon: typeof Monitor; count: number; title: string; opacity: number; devices: RecordingDevice[] }[] = [];
+                const groups: {
+                  key: "monitor" | "mic" | "output";
+                  icon: typeof Monitor;
+                  pausedIcon?: typeof Monitor;
+                  count: number;
+                  title: string;
+                  opacity: number;
+                  devices: RecordingDevice[];
+                }[] = [];
                 if (monitors.length > 0) groups.push({ key: "monitor", icon: Monitor, count: monitors.length, title: monitors.map((d) => d.name).join(", "), opacity: screenOpacity, devices: monitors });
-                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: inputs });
-                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: outputs });
+                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, pausedIcon: MicOff, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: inputs });
+                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, pausedIcon: VolumeX, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: outputs });
 
                 return (
                   <div className="flex items-center gap-2 mt-1.5">
-                    {groups.map(({ key, icon: Icon, count, title, opacity, devices: groupDevices }) => (
-                      <Tooltip key={key}>
-                        <TooltipTrigger asChild>
-                          <button
-                            className={cn(
-                              "flex items-center gap-0.5 rounded px-0.5 transition-all",
-                              key === "monitor"
-                                ? "cursor-default"
-                                : cn(
-                                    "cursor-pointer",
-                                    isTranslucent ? "hover:bg-white/10" : "hover:bg-muted"
+                    {groups.map(({ key, icon: ActiveIcon, pausedIcon: PausedIcon, count, title, opacity, devices: groupDevices }) => {
+                      const activeCount = groupDevices.filter((d: RecordingDevice) => d.active).length;
+                      const allActive = groupDevices.every((d: RecordingDevice) => d.active);
+                      const isAudioGroup = key !== "monitor";
+                      const Icon = isAudioGroup && !allActive && PausedIcon ? PausedIcon : ActiveIcon;
+                      const iconOpacity = isAudioGroup && !allActive ? 0.45 : opacity;
+                      const actionLabel = key === "monitor"
+                        ? title
+                        : allActive
+                          ? `${title} — click to pause capture`
+                          : activeCount === 0
+                            ? `${title} paused — click to resume capture`
+                            : `${title} partially paused — click to resume paused devices`;
+                      return (
+                        <Tooltip key={key}>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={actionLabel}
+                              className={cn(
+                                "flex items-center gap-0.5 rounded px-0.5 transition-all",
+                                key === "monitor"
+                                  ? "cursor-default"
+                                  : cn(
+                                      "cursor-pointer",
+                                      isTranslucent ? "hover:bg-white/10" : "hover:bg-muted"
+                                    )
+                              )}
+                              onClick={key === "monitor" ? undefined : async () => {
+                                const endpoint = allActive
+                                  ? "/audio/device/stop"
+                                  : "/audio/device/start";
+                                const targetFullNames = new Set(
+                                  groupDevices
+                                    .filter((d) => allActive || !d.active)
+                                    .map((d) => d.fullName)
+                                );
+                                if (targetFullNames.size === 0) return;
+
+                                const previousDevices = recordingDevices;
+                                setRecordingDevices((prev) =>
+                                  prev.map((device) =>
+                                    targetFullNames.has(device.fullName)
+                                      ? {
+                                          ...device,
+                                          active: !allActive,
+                                        }
+                                      : device
                                   )
-                            )}
-                            onClick={key === "monitor" ? undefined : async () => {
-                              const allActive = groupDevices.every((d: RecordingDevice) => d.active);
-                              const endpoint = allActive
-                                ? "/audio/device/stop"
-                                : "/audio/device/start";
-                              for (const d of groupDevices) {
-                                if (allActive || !d.active) {
-                                  const suffix = d.kind === "input" ? "input" : "output";
-                                  await localFetch(endpoint, {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ device_name: `${d.name} (${suffix})` }),
-                                  }).catch(() => {});
+                                );
+
+                                const results = await Promise.allSettled(
+                                  Array.from(targetFullNames).map((deviceName) =>
+                                    localFetch(endpoint, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ device_name: deviceName }),
+                                    }).then((response) => {
+                                      if (!response.ok) {
+                                        throw new Error(`audio device toggle failed: ${response.status}`);
+                                      }
+                                      return response;
+                                    })
+                                  )
+                                );
+
+                                if (results.some((result) => result.status === "rejected")) {
+                                  setRecordingDevices(previousDevices);
                                 }
-                              }
-                            }}
-                          >
-                            <Icon
-                              className={cn("h-3 w-3 transition-opacity duration-500", isTranslucent ? "vibrant-sidebar-fg" : "text-foreground")}
-                              style={{ opacity }}
-                            />
-                            {count > 1 && (
-                              <span className={cn("text-[9px] font-medium leading-none", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-foreground/50")}>{count}</span>
-                            )}
-                          </button>
-                        </TooltipTrigger>
-                        <TooltipContent side="bottom" className="text-xs">
-                          {key === "monitor" ? title : `${title} — click to ${groupDevices.every((d: RecordingDevice) => d.active) ? "mute" : "unmute"}`}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
+                              }}
+                            >
+                              <Icon
+                                aria-hidden="true"
+                                focusable="false"
+                                className={cn("h-3 w-3 transition-colors", isTranslucent ? "vibrant-sidebar-fg" : "text-foreground")}
+                                style={{ opacity: iconOpacity }}
+                              />
+                              {count > 1 && (
+                                <span className={cn("text-[9px] font-medium leading-none", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-foreground/50")}>{count}</span>
+                              )}
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom" className="text-xs">
+                            {actionLabel}
+                          </TooltipContent>
+                        </Tooltip>
+                      );
+                    })}
                     <div className="w-px h-3 bg-border mx-0.5" />
                     <NotificationBell />
                     <Tooltip>
@@ -718,15 +1084,16 @@ function HomeContent() {
                         <button
                           onClick={() => toggleMeeting()}
                           disabled={meetingLoading}
+                          aria-label={meetingState.active ? "stop meeting" : "start meeting"}
                           className={cn(
                             "relative flex items-center justify-center h-5 w-5 rounded transition-colors",
                             isTranslucent ? "vibrant-nav-item hover:bg-white/10" : "text-muted-foreground hover:text-foreground hover:bg-muted"
                           )}
                         >
                           {meetingState.active && (
-                            <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
+                            <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
                           )}
-                          <Phone className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
+                          <Phone aria-hidden="true" focusable="false" className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
                         </button>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="text-xs">
@@ -795,12 +1162,12 @@ function HomeContent() {
                       </TooltipTrigger>
                       <TooltipContent side="right" className="text-xs">
                         search
-                        <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
-                          {formatShortcutDisplay(
-                            settings.searchShortcut || (isMac ? "Control+Super+K" : "Alt+K"),
-                            isMac,
-                          )}
-                        </kbd>
+                        {!settings.disabledShortcuts.includes("searchShortcut") &&
+                        settings.searchShortcut ? (
+                          <kbd className="ml-1 px-1 py-0.5 bg-muted rounded text-[10px]">
+                            {formatShortcutDisplay(settings.searchShortcut, isMac)}
+                          </kbd>
+                        ) : null}
                       </TooltipContent>
                     </Tooltip>
                     {/* Divider between the search affordance and the
@@ -820,33 +1187,7 @@ function HomeContent() {
                         // clicking it (from any view) always spawns a
                         // new chat session and switches to it.
                         if (section.id === "home") {
-                          // Always start a brand-new session. Reusing an
-                          // empty row (getOrCreateEmptyChatId) felt like
-                          // "nothing happened" / jumping to an old blank
-                          // row in recents instead of a fresh compose view.
-                          const id = crypto.randomUUID();
-                          const store = useChatStore.getState();
-                          // Drop stale drafts before creating a new one so
-                          // repeated "New chat" clicks don't accumulate empty rows.
-                          Object.values(store.sessions).forEach((s) => {
-                            if (s.draft) store.actions.drop(s.id);
-                          });
-                          store.actions.upsert({
-                            id,
-                            title: "new chat",
-                            preview: "",
-                            status: "idle",
-                            messageCount: 0,
-                            createdAt: Date.now(),
-                            updatedAt: Date.now(),
-                            pinned: false,
-                            unread: false,
-                            draft: true,
-                          });
-                          store.actions.setCurrent(id);
-                          void emit("chat-load-conversation", {
-                            conversationId: id,
-                          });
+                          startNewChat();
                         }
                       }}
                       className={cn(
@@ -870,23 +1211,14 @@ function HomeContent() {
                         {section.icon}
                       </div>
                       {!sidebarCollapsed && <span className={cn("text-xs truncate", section.id === "pipes" && runningPipeCount > 0 && "flex-1", isActive && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>{section.label}</span>}
-                      {section.id === "pipes" && runningPipeCount > 0 && (
-                        sidebarCollapsed ? (
-                          <PipeActivityIndicator
-                            kind="running"
-                            iconOnly
-                            className="pointer-events-none absolute right-1 top-1 scale-[0.72]"
-                            ariaLabel={`${runningPipeCount} running pipe${runningPipeCount === 1 ? "" : "s"}`}
-                          />
-                        ) : (
-                          <PipeActivityIndicator
-                            kind="running"
-                            label={runningPipeCount}
-                            className="ml-auto shrink-0"
-                            labelClassName="text-muted-foreground/60"
-                            ariaLabel={`${runningPipeCount} running pipe${runningPipeCount === 1 ? "" : "s"}`}
-                          />
-                        )
+                      {section.id === "pipes" && runningPipeCount > 0 && !sidebarCollapsed && (
+                        <PipeActivityIndicator
+                          kind="running"
+                          label={runningPipeCount}
+                          className="ml-auto shrink-0"
+                          labelClassName="text-muted-foreground/60"
+                          ariaLabel={`${runningPipeCount} running pipe${runningPipeCount === 1 ? "" : "s"}`}
+                        />
                       )}
                     </button>
                   );
@@ -924,11 +1256,13 @@ function HomeContent() {
                     isTranslucent ? "vibrant-sidebar-border" : "border-border/50"
                   )}
                 >
-                  <ChatSidebar />
+                  <ChatSidebar onViewAll={() => setActiveSection("history")} />
                 </div>
               ) : (
                 <div className="flex-1" />
               )}
+
+              {!sidebarCollapsed && <UpdateBanner variant="sidebar" className="mb-2" />}
 
               {/* Bottom items */}
               <div className={cn("space-y-0.5 border-t pt-2", isTranslucent ? "vibrant-sidebar-border" : "border-border")}>

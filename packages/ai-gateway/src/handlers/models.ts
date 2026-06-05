@@ -42,6 +42,14 @@ interface ModelEntry {
   query_weight?: number;
 }
 
+function hasConfiguredSecret(value: unknown): boolean {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  const lower = trimmed.toLowerCase();
+  return !['placeholder', 'changeme', 'change-me', 'todo', 'none', 'null', 'undefined'].includes(lower);
+}
+
 /** Curated model catalog — single source of truth */
 const CURATED_MODELS: ModelEntry[] = [
   // ── Auto — smart routing with fallback ──
@@ -231,6 +239,21 @@ const CURATED_MODELS: ModelEntry[] = [
     recommended_for: ['pipes', 'chat'],
   },
   {
+    id: 'gemini-3.5-flash',
+    object: 'model',
+    owned_by: 'google',
+    name: 'Gemini 3.5 Flash',
+    description: 'latest flash — flash-tier speed, beats pro tier on agent benchmarks',
+    tags: ['free', 'general', 'new'],
+    free: true,
+    context_window: 1000000,
+    best_for: ['general', 'agentic', 'search'],
+    speed: 'fast',
+    intelligence: 'high',
+    cost_tier: 'free',
+    recommended_for: ['pipes', 'chat', 'analysis'],
+  },
+  {
     id: 'gemini-3.1-flash-lite',
     object: 'model',
     owned_by: 'google',
@@ -280,6 +303,7 @@ const CURATED_MODELS: ModelEntry[] = [
     intelligence: 'standard',
     cost_tier: 'low',
     recommended_for: ['chat', 'analysis'],
+    warning: 'confidential chat/audio model, but current enclave vLLM does not support tool calls yet — avoid for skills or pipes that need tools',
   },
   // ── OpenAI API (shown only when OPENAI_API_KEY is configured) ──
   {
@@ -401,12 +425,27 @@ const CURATED_MODELS: ModelEntry[] = [
   },
   // ── Included with screenpipe ──
   {
+    id: 'claude-opus-4-8',
+    object: 'model',
+    owned_by: 'anthropic',
+    name: 'Claude Opus 4.8',
+    description: 'most intelligent, best reasoning — latest opus',
+    tags: ['premium', 'reasoning', 'new'],
+    free: false,
+    context_window: 200000,
+    best_for: ['complex tasks', 'analysis', 'agentic coding'],
+    speed: 'slow',
+    intelligence: 'highest',
+    cost_tier: 'medium',
+    recommended_for: ['chat', 'analysis', 'coding'],
+  },
+  {
     id: 'claude-opus-4-7',
     object: 'model',
     owned_by: 'anthropic',
     name: 'Claude Opus 4.7',
-    description: 'most intelligent, best reasoning — latest opus',
-    tags: ['premium', 'reasoning', 'new'],
+    description: 'previous opus — still very capable',
+    tags: ['premium', 'reasoning'],
     free: false,
     context_window: 200000,
     best_for: ['complex tasks', 'analysis', 'agentic coding'],
@@ -537,7 +576,7 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
 
     // Avoid advertising models that would immediately fail because their
     // provider secret is not configured in the Worker environment yet.
-    models = models.filter(model => !model.requires_env || Boolean(env[model.requires_env]));
+    models = models.filter(model => !model.requires_env || hasConfiguredSecret(env[model.requires_env]));
 
     // Filter models based on tier allowlist
     if (tier !== 'subscribed') {

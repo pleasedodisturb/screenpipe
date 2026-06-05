@@ -4,6 +4,7 @@
 
 use log::{error, info, warn};
 use reqwest::Client;
+use screenpipe_engine::telemetry_context::TelemetryContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -246,6 +247,10 @@ impl AnalyticsManager {
             }
         }
 
+        if let Some(payload_props) = payload["properties"].as_object_mut() {
+            TelemetryContext::from_env().insert_posthog_properties(payload_props);
+        }
+
         let response = self.client.post(posthog_url).json(&payload).send().await?;
 
         if !response.status().is_success() {
@@ -335,9 +340,6 @@ impl AnalyticsManager {
         json!({
             // Screen capture
             "setting_disable_vision": get_bool("disableVision").unwrap_or(false),
-            "setting_disable_ocr": get_bool("disableOcr").unwrap_or(false),
-            "setting_fps": get_f64("fps").unwrap_or(0.5),
-            "setting_adaptive_fps": get_bool("adaptiveFps").unwrap_or(false),
             "setting_ocr_engine": get_str("ocrEngine").unwrap_or("unknown"),
             "setting_use_all_monitors": get_bool("useAllMonitors").unwrap_or(true),
             "setting_monitor_count": get_arr_len("monitorIds"),
@@ -357,7 +359,7 @@ impl AnalyticsManager {
 
             // Other features
             "setting_use_pii_removal": get_bool("usePiiRemoval").unwrap_or(true),
-            "setting_auto_update": get_bool("autoUpdate").unwrap_or(true),
+            "setting_auto_update": get_bool("autoUpdate").unwrap_or(false),
             "setting_languages_count": get_arr_len("languages"),
         })
     }

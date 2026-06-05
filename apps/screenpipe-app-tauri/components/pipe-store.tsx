@@ -57,6 +57,7 @@ import {
   Star,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { pickPipePreset } from "@/lib/utils/pick-pipe-preset";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useToast } from "@/components/ui/use-toast";
 import { MemoizedReactMarkdown } from "@/components/markdown";
@@ -64,17 +65,7 @@ import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
 import { ChatPrefillData } from "@/lib/chat-utils";
-import {
-  IntegrationIcon,
-  IntegrationInfo,
-} from "@/components/settings/connections-section";
-import { useHardcodedTiles } from "@/lib/hooks/use-hardcoded-tiles";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-  TooltipProvider,
-} from "@/components/ui/tooltip";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 // --- Types ---
 
 interface StorePipe {
@@ -193,6 +184,16 @@ function navigateHomeAndPrefill(data: ChatPrefillData): void {
   window.location.href = url.toString();
 }
 
+function buildForkPipeDisplayLabel(pipeTitle: string): string {
+  const title = pipeTitle.trim();
+  return title ? `Fork pipe: ${title}` : "Fork pipe";
+}
+
+function buildPublishPipeDisplayLabel(pipeName: string): string {
+  const name = pipeName.trim();
+  return name ? `Publish pipe: ${name}` : "Publish pipe";
+}
+
 
 
 function formatCount(n: number): string {
@@ -235,107 +236,6 @@ function normalizePipe(raw: any): any {
     description: raw.description || "",
     icon: raw.icon || "🔧",
   };
-}
-
-// --- Main Unified Component ---
-
-function ConnectionsStrip() {
-  const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
-  const hardcodedTiles = useHardcodedTiles();
-
-  useEffect(() => {
-    const cacheKey = "connections/list";
-    const cached = apiCache.get<IntegrationInfo[]>(cacheKey);
-    if (cached) {
-      setIntegrations(cached.filter((i) => i.id !== "owned-default"));
-      return;
-    }
-    localFetch("/connections")
-      .then((r) => r.json())
-      .then((data) => {
-        const list: IntegrationInfo[] = data.data || [];
-        apiCache.set(cacheKey, list, 30_000);
-        setIntegrations(list.filter((i) => i.id !== "owned-default"));
-      })
-      .catch(() => {});
-  }, []);
-
-  // Merge: for tiles in both backend and hardcoded, use backend's connected state
-  // but hardcoded's name/icon (which are OS-specific, e.g. windows-calendar vs apple-calendar).
-  // For tiles only in hardcoded (cursor, claude, etc.), append them directly.
-  const hardcodedMap = new Map(hardcodedTiles.map((h) => [h.id, h]));
-  const mergedBackend: IntegrationInfo[] = integrations.map((i) => {
-    const h = hardcodedMap.get(i.id);
-    if (!h) return i;
-    // Use OS-correct name/icon from hardcoded; AND the connected states so an
-    // explicit user disconnect (e.g. calendarUserDisconnected in store) overrides
-    // the backend's "OS calendar is accessible" true.
-    return { ...i, name: h.name, icon: h.icon, connected: i.connected && h.connected };
-  });
-  const backendIds = new Set(integrations.map((i) => i.id));
-  const extraTiles: IntegrationInfo[] = hardcodedTiles
-    .filter((h) => !backendIds.has(h.id))
-    .map((h) => ({ ...h, fields: [], is_oauth: false, category: "", description: "" }));
-  const allIntegrations = [...mergedBackend, ...extraTiles];
-
-  if (allIntegrations.length === 0) return null;
-
-  const connected = allIntegrations.filter((i) => i.connected);
-  const disconnected = allIntegrations.filter((i) => !i.connected);
-  const sorted = [...connected, ...disconnected];
-
-  const openConnections = () => {
-    window.dispatchEvent(
-      new CustomEvent("open-settings", {
-        detail: { section: "connections" },
-      })
-    );
-  };
-
-  return (
-    <TooltipProvider delayDuration={200}>
-      <div className="flex items-center gap-2 mb-6">
-        <div className="flex-1 overflow-x-auto scrollbar-hide">
-          <div className="flex items-center gap-1.5 py-1">
-            {sorted.map((integration) => (
-              <Tooltip key={integration.id}>
-                <TooltipTrigger asChild>
-                  <button
-                    onClick={() => {
-                      sessionStorage.setItem("openConnection", integration.id);
-                      openConnections();
-                    }}
-                    className={cn(
-                      "relative flex items-center justify-center w-8 h-8 shrink-0 border rounded transition-colors",
-                      integration.connected
-                        ? "border-foreground/20 hover:border-foreground/40"
-                        : "border-dashed border-muted-foreground/20 opacity-40 hover:opacity-70"
-                    )}
-                  >
-                    <IntegrationIcon icon={integration.icon} />
-                    {integration.connected && (
-                      <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-foreground" />
-                    )}
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" className="text-xs">
-                  {integration.name}
-                  {integration.connected ? " · connected" : " · not set up"}
-                </TooltipContent>
-              </Tooltip>
-            ))}
-          </div>
-        </div>
-        <button
-          onClick={openConnections}
-          className="shrink-0 flex items-center gap-1.5 px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
-          title="manage connections"
-        >
-          <Plug className="w-3 h-3" />
-        </button>
-      </div>
-    </TooltipProvider>
-  );
 }
 
 export function PipeStoreView() {
@@ -390,9 +290,6 @@ export function PipeStoreView() {
 
   return (
     <div className="space-y-4">
-      {/* Connections strip */}
-      <ConnectionsStrip />
-
       {/* Tab bar */}
       <div className="flex items-center gap-6 border-b border-border pb-0 mb-6">
         {tabs.map(({ key, label }) => (
@@ -427,6 +324,7 @@ export function PipeStoreView() {
 function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const { settings } = useSettings();
   const { toast } = useToast();
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
   const token = settings.user?.token;
 
   // Browse state
@@ -635,17 +533,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_installed_from_store", { slug });
 
-      // Override the pipe's preset with the user's default preset so it
-      // works out of the box (published pipes may reference presets the
-      // user doesn't have).
+      // Override the pipe's preset so it works out of the box (published
+      // pipes may reference presets the user doesn't have). Prefer the
+      // dedicated "pipes" preset (auto, tier-safe) over the Opus chat
+      // default — see pickPipePreset() for the full rationale.
       const pipeName = data.name || slug;
-      const defaultPreset = settings.aiPresets?.find((p: any) => p.defaultPreset);
-      if (defaultPreset?.id) {
+      const pipePreset = pickPipePreset(settings.aiPresets);
+      if (pipePreset?.id) {
         try {
           await localFetch(`/pipes/${pipeName}/config`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ preset: defaultPreset.id }),
+            body: JSON.stringify({ preset: pipePreset.id }),
           });
         } catch {}
       }
@@ -668,7 +567,18 @@ function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
-        description: err.message,
+        description: (
+          <span>
+            {err.message}{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 text-inherit opacity-80 hover:opacity-100"
+              onClick={() => openFeedback(`Pipe install failed (${slug}): ${err.message}`)}
+            >
+              report issue
+            </button>
+          </span>
+        ),
         variant: "destructive",
       });
     } finally {
@@ -1211,6 +1121,7 @@ ${pipeSource}
 
 IMPORTANT: first read the screenpipe skill file to understand how pipes work, then ask the user how they want to customize/improve this pipe for their specific needs. do NOT auto-send or auto-create — have a conversation first to understand what they want to change.`,
                     prompt: `i want to fork the "${pipe.title}" pipe and adapt it to my needs. here is the original pipe.md:\n\n${pipeSource}`,
+                    displayLabel: buildForkPipeDisplayLabel(pipe.title),
                     autoSend: true,
                   });
                 }}
@@ -1613,6 +1524,7 @@ STEP 5: PUBLISH (only after user says yes)
 - include Authorization header with Bearer token from settings (read settings first to get user.token)
 - tell the user the result`,
       prompt: `help me publish my pipe "${pipeName}" to the store. make it generic and ready for anyone to use.`,
+      displayLabel: buildPublishPipeDisplayLabel(pipeName),
       autoSend: true,
     });
   };

@@ -5,6 +5,8 @@
 "use client";
 
 import { useEffect } from "react";
+import { commands } from "@/lib/utils/tauri";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 
 export default function GlobalError({
   error,
@@ -13,6 +15,8 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
+
   useEffect(() => {
     // Explicitly extract Error fields — JSON.stringify(error) returns `{}` because
     // `message`, `stack`, `name` are non-enumerable, so the Tauri log bridge
@@ -24,6 +28,17 @@ export default function GlobalError({
       stack: error?.stack,
     };
     console.error("global error boundary caught:", serialized);
+    // Also bypass the buffered console interceptor and write straight to the
+    // Rust log — the buffer flush may never fire if the error boundary
+    // unmounts Providers before the 2s flush timer (which is what was happening
+    // for the enterprise #185 crash on MBP — error.tsx logged but the entry
+    // never reached ~/.screenpipe/screenpipe-app.<date>.log).
+    commands.writeBrowserLogs([
+      {
+        level: "error",
+        message: `error boundary: ${JSON.stringify(serialized)}`,
+      },
+    ]).catch(() => {});
   }, [error]);
 
   return (
@@ -46,6 +61,12 @@ export default function GlobalError({
             className="px-4 py-2 bg-neutral-800 text-white rounded-md text-sm font-medium hover:bg-neutral-700 transition-colors"
           >
             reload
+          </button>
+          <button
+            onClick={() => openFeedback(`App crashed: ${error.message || "unknown error"}`)}
+            className="px-4 py-2 bg-neutral-800 text-white rounded-md text-sm font-medium hover:bg-neutral-700 transition-colors"
+          >
+            report crash
           </button>
         </div>
       </div>

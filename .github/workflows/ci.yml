@@ -21,12 +21,10 @@ on:
       - '.github/scripts/**'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
   # Cancel superseded runs on PR branches (saves minutes when a contributor
-  # rapidly re-pushes), but let main runs always finish — pushes to main
-  # land faster than this workflow's longest job (cargo test on ubuntu, ~30
-  # min), so cancelling-in-progress on main means CI never reports a single
-  # green/red signal for any commit (we hit 30 consecutive cancellations).
+  # rapidly re-pushes). Main pushes use the commit SHA in the group so a
+  # newer merge does not sit pending behind a stale long-running commit.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
@@ -257,8 +255,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~\AppData\Local\cargo\
-            target\
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Set up Rust
@@ -269,15 +270,37 @@ jobs:
           cache: true
           rustflags: ""
 
+      - name: Verify Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          cargo_output="$(cargo --version 2>&1 || true)"
+          if [[ "$cargo_output" == *"rustup-init"* || "$cargo_output" != cargo* ]]; then
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+          fi
+
+          rustup default stable
+          rustup override set stable
+          cargo --version
+          rustc --version
+
       - name: setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.2.2
 
+      - name: Install macOS media sidecars
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
       - name: Run pre_build.js
         shell: bash
         env:
           SKIP_SCREENPIPE_SETUP: true # avoid trying to copy screenpipe binaries, not yet built (next step)
+          SCREENPIPE_RELEASE_TARGET: ${{ runner.arch == 'ARM64' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin' }}
         run: bun ./scripts/pre_build.js
         working-directory: ./apps/screenpipe-app-tauri
 

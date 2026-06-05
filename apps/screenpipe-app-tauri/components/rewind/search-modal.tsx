@@ -9,7 +9,6 @@ import { useKeywordSearchStore, SearchMatch, UiEventResult } from "@/lib/hooks/u
 import { useSearchHighlight } from "@/lib/hooks/use-search-highlight";
 import { useSearchFocus } from "./hooks/use-search-focus";
 import { listen, emit } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
 import {
   CHAT_HISTORY_INITIAL_LIMIT,
   listConversations,
@@ -137,6 +136,20 @@ const CHAT_BUCKET_LABELS: Record<string, string> = {
   older: "older",
 };
 const CHAT_BUCKET_ORDER = ["today", "yesterday", "week", "older"] as const;
+
+function sanitizeFts5Query(query: string): string {
+  return query
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => token.replace(/[\\"]/g, "").trim())
+    .filter(Boolean)
+    .map((token) => `"${token}"`)
+    .join(" ");
+}
+
+function escapeSqlString(value: string): string {
+  return value.replace(/'/g, "''");
+}
 
 function useSuggestions(isOpen: boolean) {
   const [suggestions, setSuggestions] = useState<string[]>([]);
@@ -569,8 +582,15 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     setFacetsLoading(true);
     let pending = 3;
     const onFacetDone = () => { pending--; if (pending === 0 && !cancelled) setFacetsLoading(false); };
-    const escaped = q.replace(/"/g, '""');
-    const ftsQuery = q.split(/\s+/).map(w => `"${w.replace(/"/g, '""')}"`).join(" OR ");
+    const ftsQuery = sanitizeFts5Query(q);
+    if (!ftsQuery) {
+      setFacetApps([]);
+      setFacetDomains([]);
+      setFacetTimeRanges([]);
+      setFacetsLoading(false);
+      return;
+    }
+    const escapedFtsQuery = escapeSqlString(ftsQuery);
 
     // Fire all three facet queries in parallel
     const fetchFacet = async (sql: string) => {
@@ -587,7 +607,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     fetchFacet(
       `SELECT app_name as app, COUNT(*) as cnt
        FROM frames_fts
-       WHERE frames_fts MATCH '${escaped}'
+       WHERE frames_fts MATCH '${escapedFtsQuery}'
        AND app_name != ''
        GROUP BY app_name ORDER BY cnt DESC LIMIT 15`
     ).then((rows: { app: string; cnt: number }[]) => {
@@ -600,7 +620,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       `SELECT f.browser_url as url, COUNT(*) as cnt
        FROM frames_fts
        JOIN frames f ON f.id = frames_fts.rowid
-       WHERE frames_fts MATCH '${escaped}'
+       WHERE frames_fts MATCH '${escapedFtsQuery}'
        AND f.browser_url IS NOT NULL AND f.browser_url != ''
        GROUP BY f.browser_url ORDER BY cnt DESC LIMIT 200`
     ).then((rows: { url: string; cnt: number }[]) => {
@@ -621,7 +641,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       `SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
        FROM frames_fts
        JOIN frames f ON f.id = frames_fts.rowid
-       WHERE frames_fts MATCH '${escaped}'
+       WHERE frames_fts MATCH '${escapedFtsQuery}'
        GROUP BY DATE(f.timestamp)
        ORDER BY d DESC LIMIT 30`
     ).then((rows: { d: string; ts: string; cnt: number }[]) => {
@@ -801,7 +821,10 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   useEffect(() => {
     if (isOpen) {
       setSelectedIndex(0);
-      setQuery("");
+      const initialQuery = standalone
+        ? new URLSearchParams(window.location.search).get("q") ?? ""
+        : "";
+      setQuery(initialQuery);
       resetSearch();
       setSearchEpoch(e => e + 1);
       clearHighlight();
@@ -820,7 +843,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       setTranscriptionOffset(0);
       setHasMoreTranscriptions(true);
     }
-  }, [isOpen, resetSearch]);
+  }, [isOpen, resetSearch, standalone]);
 
   // Perform search when query changes
   useEffect(() => {
@@ -1313,7 +1336,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
   useEffect(() => {
     if (!standalone || !isOpen) return;
-    invoke("resize_search_window", { width: 680, height: standaloneTargetH }).catch(() => {});
+    commands.resizeSearchWindow(680, standaloneTargetH).catch(() => {});
   }, [standalone, isOpen, standaloneTargetH]);
 
   if (!isOpen) return null;

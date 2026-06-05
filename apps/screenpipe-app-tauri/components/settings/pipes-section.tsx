@@ -20,7 +20,6 @@ import {
   Loader2,
   ExternalLink,
   Check,
-  Users,
   MoreHorizontal,
   Plus,
   Search,
@@ -74,7 +73,6 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
-import { useTeam } from "@/lib/hooks/use-team";
 import { useToast } from "@/components/ui/use-toast";
 import { useQueryState } from "nuqs";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
@@ -175,6 +173,13 @@ function navigateHomeAndPrefill(data: ChatPrefillData): void {
   window.location.href = url.toString();
 }
 
+function buildCreatePipeDisplayLabel(prompt: string): string {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  if (!normalized) return "Create pipe";
+  const compact = normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}...` : normalized;
+  return `Create pipe: ${compact}`;
+}
+
 /** Convert a raw schedule string to a short human-readable label. */
 function humanizeSchedule(schedule: string | undefined): string {
   if (!schedule || schedule === "manual") return "manual";
@@ -270,6 +275,10 @@ follow these prompt engineering best practices (from anthropic's guide):
 - no error handling for empty API responses (agent exits successfully with no output)
 
 after analyzing, show me the improved pipe.md and explain what you changed and why.`;
+}
+
+function buildOptimizeDisplayLabel(pipeName: string): string {
+  return `Optimize pipe: ${pipeName.trim()}`;
 }
 
 function parsePipeError(stderr: string): {
@@ -736,19 +745,10 @@ export function PipesSection() {
   // Track in-flight config saves so runPipe can await them
   const pendingConfigSaves = useRef<Record<string, Promise<void>>>({});
   const { settings, updateSettings } = useSettings();
-  const team = useTeam();
   const { toast } = useToast();
   const [, setSection] = useQueryState("section");
-  const isTeamAdmin = !!team.team && team.role === "admin";
-  const [sharingPipe, setSharingPipe] = useState<string | null>(null);
   const [sharingPublic, setSharingPublic] = useState<string | null>(null);
   const [publishPipeName, setPublishPipeName] = useState<string | null>(null);
-  const [pipeFilter, setPipeFilter] = useState<"all" | "personal" | "team">(() => {
-    if (typeof window !== "undefined") {
-      return (localStorage.getItem("pipes-pipe-filter") as "all" | "personal" | "team") || "all";
-    }
-    return "all";
-  });
   const [searchQuery, setSearchQuery] = useState("");
   const [pipeTypeFilter, setPipeTypeFilter] = useState<"scheduled" | "triggered" | "manual">("scheduled");
   // Favorites — per-machine preference persisted via /pipes/favorites.
@@ -767,16 +767,6 @@ export function PipesSection() {
   // Live streaming output for running executions: key = "pipeName:executionId"
   const [liveOutput, setLiveOutput] = useState<Record<string, string[]>>({});
   const liveOutputRef = useRef<Record<string, string[]>>({});
-  const sharedPipeNames = React.useMemo(
-    () =>
-      new Set(
-        team.configs
-          .filter((c) => c.config_type === "pipe" && c.scope === "team")
-          .map((c) => c.key)
-      ),
-    [team.configs]
-  );
-
   const isTriggeredPipe = (p: PipeStatus) =>
     !!(p.config.trigger?.events?.length) ||
     !!(p.config.trigger?.custom?.length);
@@ -789,9 +779,6 @@ export function PipesSection() {
     () =>
       pipes
         .filter((p) => {
-          if (pipeFilter === "team" && !sharedPipeNames.has(p.config.name)) return false;
-          if (pipeFilter === "personal" && sharedPipeNames.has(p.config.name)) return false;
-
           if (searchQuery) {
             const q = searchQuery.toLowerCase();
             if (!p.config.name.toLowerCase().includes(q)) return false;
@@ -824,44 +811,26 @@ export function PipesSection() {
           return 0;
         }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [pipes, pipeFilter, searchQuery, pipeTypeFilter, pipeFavorites.showOnly, pipeFavorites.isFavorite, pipeExecutions, sharedPipeNames]
+    [pipes, searchQuery, pipeTypeFilter, pipeFavorites.showOnly, pipeFavorites.isFavorite, pipeExecutions]
   );
 
   // Counts for sub-tab badges — memoized so the filter doesn't re-run on every render
   const tabCounts = React.useMemo(() => {
-    const base = pipes.filter((p) => {
-      if (pipeFilter === "team" && !sharedPipeNames.has(p.config.name)) return false;
-      if (pipeFilter === "personal" && sharedPipeNames.has(p.config.name)) return false;
-      return true;
-    });
     return {
-      scheduled: base.filter(isScheduledPipe).length,
-      triggered: base.filter(isTriggeredPipe).length,
-      manual: base.filter(isManualPipe).length,
+      scheduled: pipes.filter(isScheduledPipe).length,
+      triggered: pipes.filter(isTriggeredPipe).length,
+      manual: pipes.filter(isManualPipe).length,
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pipes, pipeFilter, sharedPipeNames]);
+  }, [pipes]);
 
-  // Counts for filter chips
+  const starredEmptyTitle = React.useMemo(() => {
+    if (!pipeFavorites.showOnly) return null;
 
-  const sharePipeToTeam = async (pipe: PipeStatus) => {
-    setSharingPipe(pipe.config.name);
-    try {
-      await team.pushConfig("pipe", pipe.config.name, {
-        name: pipe.config.name,
-        raw_content: pipe.raw_content,
-        config: pipe.config,
-      });
-      posthog.capture("team_config_pushed", { config_type: "pipe", pipe_name: pipe.config.name });
-      toast({
-        title: sharedPipeNames.has(pipe.config.name) ? "updated team pipe" : "shared to team",
-      });
-    } catch (err: any) {
-      toast({ title: "failed to share to team", description: err.message, variant: "destructive" });
-    } finally {
-      setSharingPipe(null);
-    }
-  };
+    if (pipeTypeFilter === "triggered") return "no starred triggered pipes";
+    if (pipeTypeFilter === "manual") return "no starred manual pipes";
+    return "no starred scheduled pipes";
+  }, [pipeFavorites.showOnly, pipeTypeFilter]);
 
   const sharePipePublic = async (pipe: PipeStatus) => {
     setSharingPublic(pipe.config.name);
@@ -1426,145 +1395,9 @@ export function PipesSection() {
 
   return (
     <div className="space-y-4" data-testid="section-pipes">
-      <div className="space-y-3">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            {/* Device selector dropdown — always visible */}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button variant="outline" size="sm" className="gap-1.5 h-7 text-xs">
-                  <Monitor className="h-3 w-3" />
-                  {selectedDevice
-                    ? devices.find((d) => d.address === selectedDevice)?.label || selectedDevice
-                    : "this device"}
-                  <ChevronDown className="h-3 w-3 opacity-50" />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem
-                  onClick={() => { setSelectedDevice(null); setLoading(true); }}
-                  className={cn("gap-2", !selectedDevice && "font-medium")}
-                >
-                  <Monitor className="h-3.5 w-3.5" />
-                  <span className="flex-1">this device</span>
-                  <span className="h-2 w-2 rounded-full bg-green-500 shrink-0" />
-                  {!selectedDevice && <Check className="h-3.5 w-3.5 ml-1" />}
-                </DropdownMenuItem>
-                {devices.map((d) => (
-                  <DropdownMenuItem
-                    key={d.address}
-                    onClick={() => { setSelectedDevice(d.address); if (d.status !== "offline") setLoading(true); }}
-                    className={cn("gap-2", selectedDevice === d.address && "font-medium")}
-                  >
-                    <Monitor className="h-3.5 w-3.5" />
-                    <span className="flex-1">{d.label}</span>
-                    <span className={cn(
-                      "h-2 w-2 rounded-full shrink-0",
-                      d.status === "online" ? "bg-green-500" : d.status === "loading" ? "bg-yellow-500 animate-pulse" : "bg-muted-foreground/40"
-                    )} />
-                    {selectedDevice === d.address && <Check className="h-3.5 w-3.5 ml-1" />}
-                  </DropdownMenuItem>
-                ))}
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    if (discovering) return;
-                    setDiscoverResult(null);
-                    if (discoverResultTimer.current) clearTimeout(discoverResultTimer.current);
-                    discoverDevices().then((count) => {
-                      setDiscoverResult(count);
-                      discoverResultTimer.current = setTimeout(() => setDiscoverResult(null), 4_000);
-                    });
-                  }}
-                  disabled={discovering}
-                >
-                  <ScanSearch className={cn("h-3.5 w-3.5 mr-2", discovering && "animate-spin")} />
-                  {discovering
-                    ? "scanning..."
-                    : discoverResult === null
-                    ? "discover devices"
-                    : discoverResult === 0
-                    ? "no new devices found"
-                    : `found ${discoverResult} device${discoverResult > 1 ? "s" : ""}`}
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
-            <Button variant="outline" size="icon" className={`h-7 w-7 ${refreshing ? "pointer-events-none opacity-70" : ""}`} onClick={async () => {
-              if (refreshing) return;
-              setRefreshing(true);
-              await Promise.all([
-                fetchPipes(),
-                new Promise((r) => setTimeout(r, 2000)),
-              ]);
-              setRefreshing(false);
-            }}>
-              {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" /> : <RefreshCw className="h-3.5 w-3.5" />}
-            </Button>
-          </div>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          {pipeTypeFilter === "scheduled"
-            ? "scheduled agents that run on your screen data"
-            : pipeTypeFilter === "triggered"
-            ? "pipes triggered by events like meetings or other pipes"
-            : "pipes you trigger manually"}
-          {" · "}
-          <a
-            href="https://docs.screenpi.pe/pipes"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 underline underline-offset-2 hover:text-foreground transition-colors"
-          >
-            docs
-            <ExternalLink className="h-3 w-3" />
-          </a>
-        </p>
-      </div>
-
-      {/* Scheduled / Triggered / Manual sub-tabs */}
-      <div className="flex items-center gap-4 border-b border-border">
-        {(["scheduled", "triggered", "manual"] as const).map((tab) => {
-          const count = tabCounts[tab];
-          return (
-            <button
-              key={tab}
-              onClick={() => setPipeTypeFilter(tab)}
-              className={cn(
-                "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px capitalize",
-                pipeTypeFilter === tab
-                  ? "border-foreground text-foreground font-medium"
-                  : "border-transparent text-muted-foreground hover:text-foreground"
-              )}
-            >
-              {tab} ({count})
-            </button>
-          );
-        })}
-        {/* Favorites filter — pushed right; composes with the type tabs. */}
-        <button
-          onClick={() => pipeFavorites.setShowOnly(!pipeFavorites.showOnly)}
-          className={cn(
-            "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px inline-flex items-center gap-1 ml-auto",
-            pipeFavorites.showOnly
-              ? "border-foreground text-foreground font-medium"
-              : "border-transparent text-muted-foreground hover:text-foreground"
-          )}
-          title={pipeFavorites.showOnly ? "show all pipes" : "show only starred pipes"}
-        >
-          <Star
-            className={cn(
-              "h-3.5 w-3.5",
-              pipeFavorites.showOnly && "fill-foreground"
-            )}
-          />
-          favorites ({pipeFavorites.favorites.size})
-        </button>
-      </div>
-
-      {/* Search + filter chips */}
-      <div className="space-y-2">
-        <div className="relative">
+      {/* Single toolbar: search + type filter + favorites + refresh */}
+      <div className="flex items-center gap-2">
+        <div className="relative flex-1">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
           <Input
             placeholder="search pipes..."
@@ -1575,33 +1408,53 @@ export function PipesSection() {
             autoCorrect="off"
           />
         </div>
-      </div>
-
-      {/* All | Personal | Shared with team tabs */}
-      {team.team && (
-        <div className="flex items-center gap-4 border-b border-border">
-          {(["all", "personal", "team"] as const).map((tab) => {
-            const label = tab === "all" ? "All" : tab === "personal" ? "Personal" : "Shared with team";
-            const count = tab === "all" ? pipes.length : tab === "team"
-              ? pipes.filter((p) => sharedPipeNames.has(p.config.name)).length
-              : pipes.filter((p) => !sharedPipeNames.has(p.config.name)).length;
-            return (
-              <button
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button variant="outline" size="sm" className="gap-1.5 h-8 text-xs capitalize">
+              {pipeTypeFilter} ({tabCounts[pipeTypeFilter]})
+              <ChevronDown className="h-3 w-3 opacity-50" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {(["scheduled", "triggered", "manual"] as const).map((tab) => (
+              <DropdownMenuItem
                 key={tab}
-                onClick={() => { setPipeFilter(tab); localStorage.setItem("pipes-pipe-filter", tab); }}
-                className={cn(
-                  "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px",
-                  pipeFilter === tab
-                    ? "border-foreground text-foreground font-medium"
-                    : "border-transparent text-muted-foreground hover:text-foreground"
-                )}
+                onClick={() => setPipeTypeFilter(tab)}
+                className={cn("capitalize gap-2", pipeTypeFilter === tab && "font-medium")}
               >
-                {label} ({count})
-              </button>
-            );
-          })}
-        </div>
-      )}
+                <span className="flex-1">{tab}</span>
+                <span className="text-muted-foreground text-xs">{tabCounts[tab]}</span>
+                {pipeTypeFilter === tab && <Check className="h-3.5 w-3.5 ml-1" />}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        <Button
+          variant="outline"
+          size="icon"
+          className="h-8 w-8"
+          onClick={() => pipeFavorites.setShowOnly(!pipeFavorites.showOnly)}
+          title={pipeFavorites.showOnly ? "show all pipes" : "show only starred pipes"}
+        >
+          <Star
+            className={cn(
+              "h-3.5 w-3.5",
+              pipeFavorites.showOnly && "fill-foreground"
+            )}
+          />
+        </Button>
+        <Button variant="outline" size="icon" className={`h-8 w-8 ${refreshing ? "pointer-events-none opacity-70" : ""}`} onClick={async () => {
+          if (refreshing) return;
+          setRefreshing(true);
+          await Promise.all([
+            fetchPipes(),
+            new Promise((r) => setTimeout(r, 2000)),
+          ]);
+          setRefreshing(false);
+        }}>
+          {refreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" /> : <RefreshCw className="h-3.5 w-3.5" />}
+        </Button>
+      </div>
 
       {loading ? (
         <div className="space-y-2">
@@ -1635,6 +1488,28 @@ export function PipesSection() {
           <CardContent className="py-8 text-center text-muted-foreground">
             {searchQuery ? (
               <p>no pipes match your search</p>
+            ) : pipeFavorites.showOnly && tabCounts[pipeTypeFilter] > 0 ? (
+              <div className="space-y-4">
+                <div>
+                  <p className="text-foreground font-medium text-base">
+                    {starredEmptyTitle}
+                  </p>
+                  <p className="text-sm mt-1">
+                    {pipeFavorites.favorites.size === 0
+                      ? "star any pipe to keep your favorites here"
+                      : "none of your starred pipes match this filter right now"}
+                  </p>
+                </div>
+                <div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => pipeFavorites.setShowOnly(false)}
+                  >
+                    show all pipes
+                  </Button>
+                </div>
+              </div>
             ) : pipeTypeFilter === "triggered" ? (
               <>
                 <p>no triggered pipes installed</p>
@@ -1657,7 +1532,7 @@ export function PipesSection() {
                   {" "}in their frontmatter
                 </p>
               </>
-            ) : pipeFilter === "all" ? (
+            ) : (
               <div className="space-y-4">
                 <div>
                   <p className="text-foreground font-medium text-base">no pipes installed yet</p>
@@ -1690,10 +1565,6 @@ export function PipesSection() {
                   browse the pipe store →
                 </button>
               </div>
-            ) : pipeFilter === "team" ? (
-              <p>no pipes shared with team yet</p>
-            ) : (
-              <p>no personal-only pipes</p>
             )}
           </CardContent>
         </Card>
@@ -1921,6 +1792,7 @@ export function PipesSection() {
                           navigateHomeAndPrefill({
                             context: "the user wants to optimize their pipe",
                             prompt: buildOptimizePrompt(pipe.config.name),
+                            displayLabel: buildOptimizeDisplayLabel(pipe.config.name),
                             autoSend: true,
                           });
                         }}
@@ -1939,21 +1811,6 @@ export function PipesSection() {
                         )}
                         copy share link
                       </DropdownMenuItem>
-                      {isTeamAdmin && (
-                        <>
-                          <DropdownMenuItem
-                            disabled={sharingPipe === pipe.config.name}
-                            onClick={() => sharePipeToTeam(pipe)}
-                          >
-                            {sharedPipeNames.has(pipe.config.name) ? (
-                              <Check className="h-3.5 w-3.5 mr-2" />
-                            ) : (
-                              <Users className="h-3.5 w-3.5 mr-2" />
-                            )}
-                            {sharedPipeNames.has(pipe.config.name) ? "update team copy" : "share to team"}
-                          </DropdownMenuItem>
-                        </>
-                      )}
                       {(pipe.source_slug || (pipe.config as any).config?.source_slug) && (
                         <DropdownMenuItem
                           onClick={() => {
@@ -2852,6 +2709,7 @@ export function PipesSection() {
           navigateHomeAndPrefill({
             context: PIPE_CREATION_PROMPT,
             prompt: value,
+            displayLabel: buildCreatePipeDisplayLabel(value),
             autoSend: true,
           });
         }}

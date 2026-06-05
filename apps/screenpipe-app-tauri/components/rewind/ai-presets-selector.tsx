@@ -121,8 +121,9 @@ interface OpenAIModel {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
-- Use the exact absolute file_path from search results, do not modify it
+- Media: use standard markdown with angle-bracket local paths, like ![description](</path/to/file.mp4>) for videos and ![description](</path/to/image.jpg>) for images
+- Use the exact absolute file_path from search results inside the angle brackets, do not modify it
+- Always wrap local file paths in angle brackets because screenpipe paths often contain spaces or parentheses
 - Always answer my question/intent, do not make up things
 `;
 
@@ -205,12 +206,13 @@ export function AIProviderConfig({
     const fetchPiModels = async () => {
       try {
         const token = settings?.user?.token || "";
-        const resp = await fetch("https://api.screenpi.pe/v1/models", {
+        const resp = await fetch("https://api.screenpipe.com/v1/models", {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
         if (resp.ok) {
           const data = await resp.json();
-          const models = (data.data || []).map((m: any) => ({
+          const models = (data.data || [])
+            .map((m: any) => ({
             id: m.id,
             name: m.name || m.id,
             free: m.free,
@@ -218,7 +220,8 @@ export function AIProviderConfig({
             recommended_for: m.recommended_for,
             warning: m.warning,
             health: m.health,
-          }));
+            }))
+            .filter((m: { id: string }, idx: number, arr: { id: string }[]) => arr.findIndex((x) => x.id === m.id) === idx);
           setPiModels(models);
         }
       } catch {
@@ -404,8 +407,9 @@ export function AIProviderConfig({
             });
             if (resp.ok) {
               const data = await resp.json();
-              if (data.data?.length > 0) {
-                setOpenAIModels(data.data);
+              const uniqueModels = (data.data as { id: string }[]).filter((m, idx, arr) => arr.findIndex((x) => x.id === m.id) === idx);
+              if (uniqueModels.length > 0) {
+                setOpenAIModels(uniqueModels);
                 setIsLoadingModels(false);
                 return;
               }
@@ -833,7 +837,7 @@ export function AIProviderConfig({
                   <SelectValue placeholder="select model" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="claude-opus-4-6">claude opus 4.6</SelectItem>
+                  <SelectItem value="claude-opus-4-8">claude opus 4.8</SelectItem>
                   <SelectItem value="claude-sonnet-4-6">claude sonnet 4.5</SelectItem>
                   <SelectItem value="claude-haiku-4-5-20251001">claude haiku 4.5</SelectItem>
                 </SelectContent>
@@ -972,6 +976,12 @@ interface AIPresetsSelectorProps {
   noneLabel?: string;
   /** Compact size variant for inline usage */
   compact?: boolean;
+  /** Class applied to the outer selector wrapper. */
+  containerClassName?: string;
+  /** Class applied to the trigger button. */
+  triggerClassName?: string;
+  /** For tight composer UIs, show the active model instead of preset details. */
+  showModelOnly?: boolean;
 }
 
 export const AIPresetDialog = ({
@@ -1060,6 +1070,9 @@ export const AIPresetsSelector = ({
   allowNone = false,
   noneLabel = "none (use pipe defaults)",
   compact = false,
+  containerClassName,
+  triggerClassName,
+  showModelOnly = false,
 }: AIPresetsSelectorProps) => {
   const { settings, updateSettings } = useSettings();
   const [open, setOpen] = useState(false);
@@ -1094,6 +1107,11 @@ export const AIPresetsSelector = ({
     return preset?.provider === "screenpipe-cloud" && !settings?.user?.token;
   }, [aiPresets, selectedPreset, settings?.user?.token]);
 
+  const selectedPresetData = useMemo(
+    () => aiPresets.find((p) => p.id === selectedPreset),
+    [aiPresets, selectedPreset]
+  );
+
   useEffect(() => {
     if (onPresetChange) {
       onPresetChange(aiPresets.find((p) => p.id === selectedPreset) as AIPreset);
@@ -1114,17 +1132,18 @@ export const AIPresetsSelector = ({
         const nextIndex = (currentIndex + 1) % aiPresets.length;
         const nextPreset = aiPresets[nextIndex];
 
-        // Set the next preset as default
-        const updatedPresets = aiPresets.map((p) => ({
-          ...p,
-          defaultPreset: p.id === nextPreset.id,
-        }));
-
-        updateSettings({
-          aiPresets: updatedPresets,
-        });
-
-        onPresetSaved?.(nextPreset);
+        if (isControlled) {
+          // Controlled (e.g. chat composer): cycle the host's local selection
+          // without rewriting the user's default preset in settings.
+          onControlledSelect?.(nextPreset.id);
+        } else {
+          const updatedPresets = aiPresets.map((p) => ({
+            ...p,
+            defaultPreset: p.id === nextPreset.id,
+          }));
+          updateSettings({ aiPresets: updatedPresets });
+          onPresetSaved?.(nextPreset);
+        }
 
         toast.success("Preset changed", {
           description: `Switched to ${nextPreset.id} (${nextPreset.model})`,
@@ -1134,7 +1153,7 @@ export const AIPresetsSelector = ({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [aiPresets, selectedPreset, updateSettings, shortcutKey, onPresetSaved]);
+  }, [aiPresets, selectedPreset, updateSettings, shortcutKey, onPresetSaved, isControlled, onControlledSelect]);
 
   const handleSavePreset = (preset: Partial<AIPreset>) => {
     if (!canManageEmployeePresets) {
@@ -1370,8 +1389,8 @@ export const AIPresetsSelector = ({
 
   return (
     <>
-      <div className="flex flex-col w-full gap-2">
-        {!isControlled && selectedPresetRequiresLogin && (
+      <div className={cn("flex flex-col w-full gap-2", containerClassName)}>
+        {!isControlled && selectedPresetRequiresLogin && !showModelOnly && (
           <div className="flex items-center gap-2 p-2 text-sm bg-muted border border-border rounded-lg">
             <AlertTriangle className="h-4 w-4 text-muted-foreground shrink-0" />
             <span className="text-foreground flex-1">
@@ -1398,46 +1417,54 @@ export const AIPresetsSelector = ({
             <Tooltip>
               <PopoverTrigger asChild>
                 <Button
+                  type="button"
                   variant="outline"
                   role="combobox"
                   aria-expanded={open}
                   className={cn(
                     "w-full justify-between hover:bg-accent hover:text-accent-foreground",
                     compact && "h-8 text-xs",
-                    selectedPresetRequiresLogin && "border-amber-500/50"
+                    selectedPresetRequiresLogin && "border-amber-500/50",
+                    triggerClassName
                   )}
                 >
                   {selectedPreset ? (
-                    <div className="flex w-full items-center justify-between gap-2 overflow-hidden min-w-0">
-                      <div className="flex items-center gap-2 min-w-0 flex-shrink overflow-hidden">
+                    showModelOnly ? (
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                         {selectedPresetRequiresLogin && (
                           <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                         )}
-                        <span className="font-medium truncate text-left">
-                          {formatPresetName(
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.id || ''
+                        <span
+                          className="truncate text-left font-medium"
+                          title={
+                            selectedPresetData
+                              ? `${selectedPresetData.id} (${selectedPresetData.model})`
+                              : undefined
+                          }
+                        >
+                          {selectedPresetData?.model || formatPresetName(selectedPreset)}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex w-full items-center justify-between gap-2 overflow-hidden min-w-0">
+                        <div className="flex items-center gap-2 min-w-0 flex-shrink overflow-hidden">
+                          {selectedPresetRequiresLogin && (
+                            <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                           )}
-                        </span>
+                          <span className="font-medium truncate text-left">
+                            {formatPresetName(selectedPresetData?.id || '')}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0 flex-1 justify-end overflow-hidden">
+                          <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap shrink-0">
+                            {selectedPresetData?.provider}
+                          </span>
+                          <span className="hidden sm:block truncate min-w-0" title={selectedPresetData?.model}>
+                            {selectedPresetData?.model}
+                          </span>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0 flex-1 justify-end overflow-hidden">
-                        <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap shrink-0">
-                          {
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.provider
-                          }
-                        </span>
-                        <span className="hidden sm:block truncate min-w-0" title={aiPresets.find((p) => p.id === selectedPreset)?.model}>
-                          {
-                            aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.model
-                          }
-                        </span>
-                      </div>
-                    </div>
+                    )
                   ) : allowNone && isControlled ? (
                     <span className="text-muted-foreground">{noneLabel}</span>
                   ) : (
@@ -1463,7 +1490,13 @@ export const AIPresetsSelector = ({
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
-          <PopoverContent side="top" sideOffset={6} className="min-w-[500px] w-[--radix-popover-trigger-width] p-0">
+          <PopoverContent
+            side="top"
+            sideOffset={6}
+            align={showModelOnly ? "end" : "center"}
+            alignOffset={showModelOnly ? -16 : 0}
+            className="min-w-[500px] w-[--radix-popover-trigger-width] p-0"
+          >
             <Command>
               <CommandInput placeholder="search presets..." />
               <CommandList>

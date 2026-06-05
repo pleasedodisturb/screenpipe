@@ -36,6 +36,33 @@ export class UpstreamError extends Error {
 	}
 }
 
+function nonEmptyText(value: unknown): string | null {
+	if (typeof value !== 'string') return null;
+	return value.trim().length > 0 ? value : null;
+}
+
+function safeJson(value: unknown): string {
+	if (typeof value === 'string') return value;
+	try {
+		return JSON.stringify(value ?? {});
+	} catch {
+		return '{}';
+	}
+}
+
+export async function parseVertexMaasJsonResponse(response: Response, model: string): Promise<any> {
+	const text = await response.text();
+	if (!text.trim()) {
+		throw new UpstreamError(`Vertex MaaS returned an empty response body (${model})`, 502);
+	}
+	try {
+		return JSON.parse(text);
+	} catch (error: any) {
+		const msg = error?.message ? `: ${error.message}` : '';
+		throw new UpstreamError(`Vertex MaaS returned invalid JSON (${model})${msg}`, 502);
+	}
+}
+
 async function fetchWithRetry(url: string, init: RequestInit, label: string): Promise<Response> {
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
 		const response = await fetch(url, init);
@@ -251,7 +278,7 @@ export class VertexMaasProvider implements AIProvider {
 			);
 		}
 
-		const result = await response.json();
+		const result = await parseVertexMaasJsonResponse(response, resolved.vertexId);
 		promoteReasoningToContent(result);
 		return new Response(JSON.stringify(result), {
 			headers: { 'Content-Type': 'application/json' },
@@ -303,45 +330,119 @@ export class VertexMaasProvider implements AIProvider {
 	}
 
 	formatMessages(messages: Message[]): any[] {
-		return messages.map((msg) => ({
+		// Drop orphan tool messages (tool_call_id with no matching assistant
+		// tool_calls earlier in the array, or a content `tool_result` part on
+		// a user/tool message whose id was never emitted). Vertex MaaS rejects
+		// the whole batch with 400 "No tool calls but found tool output" if
+		// even one orphan slips through — typically after chat history pruning
+		// or message edits.
+		const knownToolCallIds = new Set<string>();
+		const collectIds = (msg: Message) => {
+			if (msg.role !== 'assistant') return;
+			for (const call of ((msg as any).tool_calls ?? [])) {
+				if (call?.id) knownToolCallIds.add(call.id);
+			}
+			if (Array.isArray(msg.content)) {
+				for (const part of msg.content as any[]) {
+					if (part?.type === 'tool_use' && part.id) knownToolCallIds.add(part.id);
+				}
+			}
+		};
+		const isOrphanToolMessage = (msg: Message): boolean => {
+			if (msg.role === 'tool') {
+				// Missing OR unknown tool_call_id — Vertex 400s either way with
+				// "No tool calls but found tool output". The previous guard
+				// (`!!msg.tool_call_id && ...`) kept tool-role messages whose
+				// id was simply absent, which the output mapper below then
+				// stripped via conditional spread — Vertex saw a bare role:'tool'
+				// and rejected the whole batch.
+				return !msg.tool_call_id || !knownToolCallIds.has(msg.tool_call_id);
+			}
+			if (Array.isArray(msg.content)) {
+				const hasToolResult = (msg.content as any[]).some((p) => p?.type === 'tool_result');
+				if (!hasToolResult) return false;
+				return (msg.content as any[]).every(
+					(p) => p?.type !== 'tool_result' || (p?.tool_use_id && !knownToolCallIds.has(p.tool_use_id)),
+				);
+			}
+			return false;
+		};
+		const filtered: Message[] = [];
+		for (const msg of messages) {
+			collectIds(msg);
+			if (isOrphanToolMessage(msg)) continue;
+			filtered.push(msg);
+		}
+		return filtered.map((msg) => ({
 			role: msg.role,
-			content: Array.isArray(msg.content)
-				? msg.content
-						// Vertex MaaS rejects `type: 'thinking'` / `'redacted_thinking'`
-						// content blocks with `400 INVALID_ARGUMENT: Unrecognized 'type'
-						// field in an object element of an array 'content' field`
-						// (SCREENPIPE-AI-PROXY-C). Clients echoing prior assistant
-						// turns can include them; strip before sending. The actual
-						// answer text travels in a sibling `{type:'text'}` block, so
-						// dropping the thinking block doesn't lose the response.
-						// Cast to any: our `MessagePart` union doesn't list these
-						// types (they're Anthropic-specific) but clients send them.
-						.filter((part) => {
-							const t = (part as any)?.type;
-							return t !== 'thinking' && t !== 'redacted_thinking';
-						})
-						.map((part) => {
-							if (part.type === 'text') return { type: 'text', text: part.text || '' };
-							// OpenAI image_url format passthrough
-							if (part.type === 'image_url' && part.image_url?.url) {
-								return { type: 'image_url', image_url: { url: part.image_url.url } };
-							}
-							// Pi native format: { type: "image", data, mimeType }
-							if (part.type === 'image' && part.data && part.mimeType) {
-								return { type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.data}` } };
-							}
-							// Anthropic base64 format
-							if (part.type === 'image' && part.source?.type === 'base64') {
-								const mt = part.source.media_type || part.source.mediaType || 'image/png';
-								return { type: 'image_url', image_url: { url: `data:${mt};base64,${part.source.data}` } };
-							}
-							return part;
-						})
-				: msg.content,
-			...(msg.tool_calls && { tool_calls: msg.tool_calls }),
+			...this.formatMessageContent(msg),
 			...(msg.tool_call_id && { tool_call_id: msg.tool_call_id }),
 			...(msg.name && { name: msg.name }),
 		}));
+	}
+
+	private formatMessageContent(msg: Message): { content: any; tool_calls?: any[] } {
+		// Preserve top-level OpenAI-style tool_calls regardless of content shape.
+		// The common assistant payload is { content: '', tool_calls: [...] }
+		// (string content, not array) — dropping tool_calls here breaks the
+		// next tool-response message because Vertex sees the assistant with
+		// no tool_calls and rejects the batch with "No tool calls but found
+		// tool output".
+		const topLevelToolCalls: any[] = [...((msg as any).tool_calls ?? [])];
+
+		if (!Array.isArray(msg.content)) {
+			const out: { content: any; tool_calls?: any[] } = {
+				content: nonEmptyText(msg.content) ?? (topLevelToolCalls.length > 0 ? null : ''),
+			};
+			if (topLevelToolCalls.length > 0) out.tool_calls = topLevelToolCalls;
+			return out;
+		}
+
+		const content: any[] = [];
+		const toolCalls: any[] = topLevelToolCalls;
+
+		for (const part of msg.content as any[]) {
+			const type = part?.type;
+			if (type === 'text') {
+				const text = nonEmptyText(part.text);
+				if (text) content.push({ type: 'text', text });
+				continue;
+			}
+			if (type === 'image_url' && part.image_url?.url) {
+				content.push({ type: 'image_url', image_url: { url: part.image_url.url } });
+				continue;
+			}
+			if (type === 'image' && part.data && part.mimeType) {
+				content.push({ type: 'image_url', image_url: { url: `data:${part.mimeType};base64,${part.data}` } });
+				continue;
+			}
+			if (type === 'image' && part.source?.type === 'base64') {
+				const mt = part.source.media_type || part.source.mediaType || 'image/png';
+				content.push({ type: 'image_url', image_url: { url: `data:${mt};base64,${part.source.data}` } });
+				continue;
+			}
+			if (type === 'tool_use' && msg.role === 'assistant' && part.name) {
+				toolCalls.push({
+					id: part.id || `call_${toolCalls.length + 1}`,
+					type: 'function',
+					function: {
+						name: part.name,
+						arguments: safeJson(part.input ?? {}),
+					},
+				});
+				continue;
+			}
+			if (type === 'tool_result') {
+				const text = nonEmptyText(typeof part.content === 'string' ? part.content : safeJson(part.content));
+				if (text) content.push({ type: 'text', text });
+			}
+		}
+
+		const formatted: { content: any; tool_calls?: any[] } = {
+			content: content.length > 0 ? content : toolCalls.length > 0 ? null : '',
+		};
+		if (toolCalls.length > 0) formatted.tool_calls = toolCalls;
+		return formatted;
 	}
 
 	formatResponse(response: any): any {

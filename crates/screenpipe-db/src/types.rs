@@ -115,6 +115,10 @@ pub struct OCRResultRaw {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
+    /// Origin of the row's text: `"accessibility"` (OS-native tree, primary)
+    /// or `"ocr"` (fallback for terminals, canvas-rendered apps, weak a11y).
+    /// `None` for legacy rows captured before text_source was tracked.
+    pub text_source: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize)]
@@ -133,6 +137,10 @@ pub struct OCRResult {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
+    /// Origin of `ocr_text`: `"accessibility"` (OS-native tree, primary) or
+    /// `"ocr"` (fallback). `None` for legacy rows. Despite the field name
+    /// `ocr_text`, the content is accessibility-derived for most captures.
+    pub text_source: Option<String>,
 }
 
 /// Content type for search queries.
@@ -175,6 +183,11 @@ pub struct AudioResultRaw {
     pub speaker_id: Option<i64>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub diarization_mode: Option<String>,
+    pub diarization_speaker_label: Option<String>,
+    pub diarization_provider: Option<String>,
+    pub diarization_source: Option<String>,
+    pub diarization_confidence: Option<f64>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -182,6 +195,95 @@ pub struct Speaker {
     pub id: i64,
     pub name: String,
     pub metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDiarizationSegment {
+    pub provider_speaker_label: String,
+    pub speaker_id: Option<i64>,
+    pub source: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub confidence: Option<f64>,
+    pub overlap: bool,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplacementAudioTranscription {
+    pub transcription: String,
+    pub speaker_id: Option<i64>,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
+/// Outcome of processing an audio chunk through the transcription pipeline.
+///
+/// The whole point of this enum is to separate "did we consider this chunk?"
+/// from "did the chunk produce indexable text?". Before this existed, the
+/// reconciliation sweep inferred processing state from the presence of an
+/// `audio_transcriptions` row — which conflated silent/duplicate/transcribed
+/// and caused infinite re-pick loops when STT returned empty.
+///
+/// `record_chunk_outcome` translates one of these variants into an atomic
+/// status update on `audio_chunks` (plus optional row writes / FK cascades)
+/// inside a single TX.
+#[derive(Debug, Clone)]
+pub enum ChunkOutcome {
+    /// STT produced text. The segments are written and chunk is marked done.
+    /// Multiple segments with identical trimmed text collide on the UNIQUE
+    /// `idx_audio_transcription_chunk_text` index — the writer uses
+    /// INSERT OR IGNORE so duplicates are dropped silently (their
+    /// per-speaker timing/identity stays in `diarization_segments`).
+    Transcribed {
+        segments: Vec<ReplacementAudioTranscription>,
+        engine: String,
+        device: String,
+        is_input_device: bool,
+        /// Capture timestamp of the chunk — used for the row's `timestamp`
+        /// column so search/timeline ordering matches the audio, not the
+        /// (possibly much later) reconciliation moment.
+        timestamp: DateTime<Utc>,
+    },
+
+    /// STT returned no text (silent audio, VAD rejected everything, or
+    /// post-dedup empty result). Chunk is marked `silent` so the
+    /// reconciliation sweep doesn't keep re-picking it.
+    Silent,
+
+    /// The transcription was a cross-device duplicate of another recent
+    /// device's transcript and was intentionally not recorded (the
+    /// `has_similar_recent_transcription` check fired). We still mark the
+    /// chunk as processed — semantically "we don't need to retry" — to
+    /// avoid the same loop the Silent variant prevents.
+    Duplicate,
+
+    /// Transient failure (engine crashed, model timeout, etc.). Bumps the
+    /// attempts counter; once attempts reach the cap, the chunk transitions
+    /// to `failed` and stops being picked.
+    Failed { reason: String },
+
+    /// Permanent failure (corrupt audio, decode error). Chunk is marked
+    /// `failed` immediately without attempts retries; downstream cleanup
+    /// can delete the file.
+    FailedPermanent { reason: String },
+}
+
+/// Maximum number of times reconciliation will retry a `Failed` outcome
+/// before giving up and marking the chunk `failed`. Tuned to absorb a
+/// transient engine restart without giving up on real audio.
+pub const MAX_TRANSCRIPTION_ATTEMPTS: i64 = 5;
+
+/// Processing-state counts across a recent window of audio chunks. Powers
+/// the new health diagnostic — direct measurement of a pipeline stall
+/// (pending older than threshold) instead of guessing from pool idleness.
+#[derive(Debug, Clone)]
+pub struct AudioChunkProcessingSnapshot {
+    pub pending: i64,
+    pub transcribed: i64,
+    pub silent: i64,
+    pub failed: i64,
+    pub oldest_pending: Option<DateTime<Utc>>,
 }
 
 /// A persistent memory: fact, preference, decision, or insight.
@@ -229,6 +331,27 @@ pub struct MeetingRecord {
     pub created_at: String,
 }
 
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingTranscriptSegment {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub source: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub item_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub audio_transcription_id: Option<i64>,
+    pub audio_chunk_id: Option<i64>,
+    pub audio_file_path: Option<String>,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub transcript: String,
+    pub captured_at: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ActiveSpeaker {
     pub speaker_id: i64,
@@ -255,8 +378,16 @@ pub struct AudioResult {
     pub device_name: String,
     pub device_type: DeviceType,
     pub speaker: Option<Speaker>,
+    pub speaker_label: Option<String>,
+    pub speaker_source: Option<String>,
+    pub speaker_confidence: Option<f64>,
+    pub speaker_provisional: bool,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub source: Option<String>,
+    pub meeting_id: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Deserialize, PartialEq)]
@@ -401,6 +532,8 @@ pub struct SearchMatch {
     // pub context: Option<String>,
     pub text: String,
     pub url: String,
+    /// Origin of `text`: `"accessibility"` or `"ocr"`. `None` for legacy rows.
+    pub text_source: Option<String>,
 }
 
 #[derive(OaSchema, Serialize)]
@@ -423,6 +556,8 @@ pub struct FrameRow {
     pub text_json: String,
     /// Accessibility tree JSON — used as fallback for bounding boxes when OCR text_json is empty
     pub accessibility_tree_json: Option<String>,
+    /// Origin of `ocr_text`: `"accessibility"` or `"ocr"`. `None` for legacy rows.
+    pub text_source: Option<String>,
 }
 
 /// Lightweight frame row for grouped search — skips text/text_json columns.

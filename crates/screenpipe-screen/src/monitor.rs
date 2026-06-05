@@ -18,6 +18,12 @@ use tracing;
 static CACHED_MONITOR_DESCRIPTIONS: Lazy<RwLock<Vec<String>>> =
     Lazy::new(|| RwLock::new(Vec::new()));
 
+/// macOS display capture is mediated by WindowServer/replayd. Serializing these
+/// calls avoids concurrent multi-monitor spikes while preserving capture order.
+#[cfg(target_os = "macos")]
+static MACOS_CAPTURE_SEMAPHORE: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(1));
+
 /// Get cached monitor descriptions without blocking system calls.
 /// Returns the list last updated by `list_monitors_detailed()`.
 pub fn get_cached_monitor_descriptions() -> Vec<String> {
@@ -57,6 +63,33 @@ use sck_rs::Monitor as SckMonitor;
 
 // xcap is used on non-macOS platforms, and as fallback on older macOS
 use xcap::Monitor as XcapMonitor;
+
+/// Optional cap on captured width for the macOS SCK stream. The GPU
+/// downscales to fit before `replayd` delivers the framebuffer, so
+/// WindowServer composites a smaller surface. `0` = no cap (capture at
+/// native, the previous default).
+///
+/// Set by the vision manager from the user's `video_quality` setting via
+/// `video_quality_to_max_snapshot_width` so the captured resolution
+/// matches the resolution the snapshot writer would downscale to anyway.
+/// Coupling these means screenpipe captures exactly the pixels it stores —
+/// no wasted GPU readback at native res just to throw it away in user
+/// space before JPEG encoding.
+#[cfg(target_os = "macos")]
+static SCK_CAPTURE_MAX_WIDTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the SCK capture-width cap. `0` = no cap. Reads the user's
+/// `video_quality` setting via the snapshot-width mapping; called by the
+/// vision manager when capture starts and when settings change.
+#[cfg(target_os = "macos")]
+pub fn set_sck_capture_max_width(max_width: u32) {
+    SCK_CAPTURE_MAX_WIDTH.store(max_width, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(target_os = "macos")]
+fn sck_capture_max_width() -> u32 {
+    SCK_CAPTURE_MAX_WIDTH.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Clone)]
 pub struct SafeMonitor {
@@ -223,6 +256,10 @@ impl SafeMonitor {
     /// If the cache is empty (shouldn't happen in normal flow), falls back to enumeration.
     #[cfg(target_os = "macos")]
     pub async fn capture_image(&self) -> Result<DynamicImage> {
+        let _permit = MACOS_CAPTURE_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("macOS capture semaphore closed: {}", e))?;
         let monitor_id = self.monitor_id;
         let use_sck = self.use_sck;
         let cached_sck = self.cached_sck.clone();
@@ -257,8 +294,17 @@ impl SafeMonitor {
                         return Err("Invalid monitor dimensions".to_string());
                     }
 
-                    monitor
-                        .capture_image()
+                    // Honor the user's video_quality cap at the SCK layer so
+                    // WindowServer composites + replayd delivers a framebuffer
+                    // at the same resolution the snapshot writer would write
+                    // to disk anyway. `0` = no cap (capture native).
+                    let cap = sck_capture_max_width();
+                    let result = if cap == 0 {
+                        monitor.capture_image()
+                    } else {
+                        monitor.capture_image_scaled(cap)
+                    };
+                    result
                         .map_err(|e| format!("{}", e))
                         .map(DynamicImage::ImageRgba8)
                 } else {
@@ -327,8 +373,13 @@ impl SafeMonitor {
                         return Err("Invalid monitor dimensions".to_string());
                     }
 
-                    monitor
-                        .capture_image_excluding(&ids)
+                    let cap = sck_capture_max_width();
+                    let result = if cap == 0 {
+                        monitor.capture_image_excluding(&ids)
+                    } else {
+                        monitor.capture_image_scaled_excluding(cap, &ids)
+                    };
+                    result
                         .map_err(|e| format!("{}", e))
                         .map(DynamicImage::ImageRgba8)
                 } else {
@@ -447,7 +498,7 @@ impl SafeMonitor {
     }
 
     /// Per-frame xcap capture fallback (no index caching).
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     fn per_frame_capture(monitor_id: u32) -> Result<DynamicImage> {
         let monitors = XcapMonitor::all().map_err(Error::from)?;
         let monitor = monitors
@@ -997,6 +1048,68 @@ pub fn get_capture_backend() -> &'static str {
 #[cfg(not(target_os = "macos"))]
 pub fn get_capture_backend() -> &'static str {
     "xcap"
+}
+
+// ── High-FPS HD capture (macOS / ScreenCaptureKit) ─────────────────
+
+/// A running high-fps HD capture for one monitor: the live SCK stream handle
+/// (drop `stream` to stop) plus the channel of RGBA frames and the encode
+/// geometry. Used by the engine's HD recorder, fully decoupled from the
+/// screenshot/OCR path (it's a second SCStream).
+#[cfg(target_os = "macos")]
+pub struct HdCapture {
+    /// Live capture stream. Drop to stop the OS-level SCStream.
+    pub stream: sck_rs::HdCaptureStream,
+    /// Every captured frame (RGBA); newest dropped under backpressure.
+    pub frames: tokio::sync::mpsc::Receiver<image::RgbaImage>,
+    /// Capture width after the resolution cap.
+    pub width: u32,
+    /// Capture height after the resolution cap.
+    pub height: u32,
+    /// Frame rate the stream was actually started at (post-clamp).
+    pub fps: u32,
+}
+
+/// Cap target dims at `max_width` preserving aspect ratio (mirrors sck-rs's
+/// internal `scaled_dims`). `max_width == 0` or `>= src_w` means native.
+#[cfg(target_os = "macos")]
+fn hd_scaled_dims(src_w: u32, src_h: u32, max_width: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 || max_width == 0 || max_width >= src_w {
+        return (src_w.max(1), src_h.max(1));
+    }
+    let target_h = ((max_width as u64 * src_h as u64) + (src_w as u64 / 2)) / src_w as u64;
+    (max_width, (target_h as u32).max(1))
+}
+
+#[cfg(target_os = "macos")]
+impl SafeMonitor {
+    /// Start a dedicated high-fps HD capture stream for this monitor at `fps`,
+    /// honoring the same resolution cap as screenshots
+    /// (`set_sck_capture_max_width`).
+    ///
+    /// Returns a live [`HdCapture`]: drain `frames` for RGBA frames, drop
+    /// `stream` to stop. This opens a SECOND ScreenCaptureKit stream alongside
+    /// the persistent screenshot stream, so it never disturbs the OCR/screenshot
+    /// path. `excluded_window_ids` are excluded at the OS level — ignored /
+    /// private windows never reach the recorder. Blocks briefly while the
+    /// stream starts; call from a blocking context.
+    pub fn start_hd_capture(&self, fps: u32, excluded_window_ids: &[u32]) -> Result<HdCapture> {
+        let (width, height) = hd_scaled_dims(
+            self.monitor_data.width,
+            self.monitor_data.height,
+            sck_capture_max_width(),
+        );
+        let (stream, frames) =
+            sck_rs::start_hd_capture(self.monitor_id, width, height, fps, excluded_window_ids)
+                .map_err(|e| anyhow::anyhow!("start_hd_capture failed: {e}"))?;
+        Ok(HdCapture {
+            fps: stream.fps(),
+            width,
+            height,
+            stream,
+            frames,
+        })
+    }
 }
 
 #[cfg(test)]

@@ -142,6 +142,29 @@ describe('GeminiProvider tool schema conversion (Sentry SCREENPIPE-AI-PROXY-9)',
 		expect(out.properties.status.enum).toEqual(['ok', 'error']);
 	});
 
+	it('coerces non-string enum values to strings (SCREENPIPE-AI-PROXY-8)', () => {
+		// Gemini requires TYPE_STRING enum entries — upstream tools with
+		// numeric/boolean enums (e.g. priority levels [1,2,3,4]) 400 otherwise.
+		const out = convert({
+			type: 'object',
+			properties: {
+				priority: { type: 'integer', enum: [1, 2, 3, 4] },
+				active: { type: 'boolean', enum: [true, false] },
+			},
+		});
+		expect(out.properties.priority.enum).toEqual(['1', '2', '3', '4']);
+		expect(out.properties.active.enum).toEqual(['true', 'false']);
+	});
+
+	it('drops enum when params.enum is not an array', () => {
+		const out = convert({
+			type: 'string',
+			// malformed upstream schema — `enum` should be array but came as object
+			enum: { invalid: 'shape' } as any,
+		});
+		expect(out.enum).toBeUndefined();
+	});
+
 	it('preserves required arrays at every depth', () => {
 		const out = convert({
 			type: 'object',
@@ -172,5 +195,58 @@ describe('GeminiProvider tool schema conversion (Sentry SCREENPIPE-AI-PROXY-9)',
 			properties: { name: { type: 'string' } },
 		});
 		expect(out.properties.name.items).toBeUndefined();
+	});
+});
+
+describe('GeminiProvider.formatMessages history sanitization', () => {
+	const provider = new GeminiProvider('fake-api-key') as any;
+
+	it('drops empty text parts', () => {
+		const result = provider.formatMessages([{
+			role: 'user',
+			content: [
+				{ type: 'text', text: '' },
+				{ type: 'text', text: '   ' },
+				{ type: 'text', text: 'hello' },
+			] as any,
+		}]);
+
+		expect(result).toEqual([{ role: 'user', parts: [{ text: 'hello' }] }]);
+	});
+
+	it('does not replay Gemini function calls without thought signatures', () => {
+		const result = provider.formatMessages([{
+			role: 'assistant',
+			content: '',
+			tool_calls: [{
+				id: 'call_read_without_signature',
+				type: 'function',
+				function: { name: 'read', arguments: '{"path":"/tmp/a"}' },
+			}],
+		}]);
+
+		expect(result[0].parts[0]).toEqual({
+			text: '[function call: read] {"path":"/tmp/a"}',
+		});
+		expect(result[0].parts[0].functionCall).toBeUndefined();
+	});
+
+	it('replays Gemini function calls when the encoded thought signature is present', () => {
+		const signature = btoa('sig');
+		const result = provider.formatMessages([{
+			role: 'assistant',
+			content: '',
+			tool_calls: [{
+				id: `call_read_ts_${signature}`,
+				type: 'function',
+				function: { name: 'read', arguments: '{"path":"/tmp/a"}' },
+			}],
+		}]);
+
+		expect(result[0].parts[0].functionCall).toEqual({
+			name: 'read',
+			args: { path: '/tmp/a' },
+		});
+		expect(result[0].parts[0].thoughtSignature).toBe('sig');
 	});
 });

@@ -6,7 +6,7 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { type ColorTheme } from "@/lib/constants/colors";
 import { useSettings } from "@/lib/hooks/use-settings";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ThemeProviderProps {
@@ -35,17 +35,16 @@ export function ThemeProvider({
   storageKey = "screenpipe-ui-theme",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setThemeState] = useState<ColorTheme | undefined>(() => {
-    // Read theme synchronously on first render to avoid flash
-    if (typeof window === "undefined") return undefined;
-    try {
-      const stored = localStorage?.getItem(storageKey) as ColorTheme;
-      return stored || "system";
-    } catch {
-      return "system";
-    }
-  });
-  const [isLoaded, setIsLoaded] = useState(() => typeof window !== "undefined");
+  // Deterministic initial state so the rendered tree matches the build-time
+  // HTML. Reading localStorage / `typeof window` in the initializer was the
+  // source of React #419 (hydration mismatch falls back to a full client
+  // re-render of the entire root). FOUC is already prevented by the inline
+  // <script> in app/layout.tsx, which sets the .light/.dark class on <html>
+  // before React mounts — so the visible theme is correct on first paint
+  // regardless of what React state thinks. The useEffect below reads the
+  // stored value and updates state immediately after hydration.
+  const [theme, setThemeState] = useState<ColorTheme | undefined>(undefined);
+  const [isLoaded, setIsLoaded] = useState(false);
   const { updateSettings } = useSettings();
 
   useEffect(() => {
@@ -120,7 +119,7 @@ export function ThemeProvider({
       } catch {}
       setThemeState(newTheme);
       updateSettings({ uiTheme: newTheme });
-      invoke("set_native_theme", { theme: newTheme }).catch(() => {});
+      commands.setNativeTheme(newTheme).catch(() => {});
 
       // If switching to "system" mode, immediately apply the current system theme from Tauri
       if (newTheme === "system") {
@@ -147,7 +146,7 @@ export function ThemeProvider({
       } catch {}
       setThemeState(newTheme);
       updateSettings({ uiTheme: newTheme });
-      invoke("set_native_theme", { theme: newTheme }).catch(() => {});
+      commands.setNativeTheme(newTheme).catch(() => {});
     },
   };
 

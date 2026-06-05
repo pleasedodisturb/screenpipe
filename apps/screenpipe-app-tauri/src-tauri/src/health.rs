@@ -7,7 +7,7 @@ use anyhow::Result;
 use dark_light::Mode;
 use once_cell::sync::Lazy;
 use serde::Deserialize;
-use std::sync::RwLock;
+use std::sync::{atomic::Ordering, RwLock};
 use std::time::Instant;
 use tauri::{path::BaseDirectory, Emitter, Manager};
 use tokio::time::{interval, Duration};
@@ -92,8 +92,11 @@ pub fn set_boot_phase(phase: &str, message: Option<&str>) {
     guard.phase = phase.to_string();
     guard.message = message.map(String::from);
     guard.error = None;
-    info!("boot phase → {}{}", phase,
-        message.map(|m| format!(" ({})", m)).unwrap_or_default());
+    info!(
+        "boot phase → {}{}",
+        phase,
+        message.map(|m| format!(" ({})", m)).unwrap_or_default()
+    );
 }
 
 pub fn set_boot_error(err: &str) {
@@ -105,10 +108,62 @@ pub fn set_boot_error(err: &str) {
 }
 
 pub fn get_boot_phase_snapshot() -> BootPhaseSnapshot {
+    BOOT_PHASE.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Snapshot of where the boot lifecycle currently is.
+///
+/// Used as a gate before actions that race process teardown against
+/// still-initializing native sessions — see #3622 (onnxruntime SIGSEGV during
+/// auto-updater restart while `AudioManager::new` is mid-`create_session`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootReadiness {
+    /// Phase is still pre-ready (`starting`, `migrating_database`,
+    /// `building_audio`, `starting_pipes`). Process teardown is unsafe.
+    Pending,
+    /// Phase is `ready`. Safe to restart.
+    Ready,
+    /// Phase is `error`. Process is in a stuck state; restart won't help and
+    /// callers should fail fast rather than waiting.
+    Errored,
+}
+
+fn read_boot_phase() -> String {
+    // Match existing pattern in this file: recover from poisoning rather than
+    // silently returning a wrong answer (which would cause wait loops to spin
+    // until timeout on a poisoned lock).
     BOOT_PHASE
         .read()
         .unwrap_or_else(|e| e.into_inner())
+        .phase
         .clone()
+}
+
+pub fn boot_readiness() -> BootReadiness {
+    match read_boot_phase().as_str() {
+        "ready" => BootReadiness::Ready,
+        "error" => BootReadiness::Errored,
+        _ => BootReadiness::Pending,
+    }
+}
+
+/// Block until boot reaches a terminal state (`Ready` or `Errored`) or `timeout`
+/// elapses, then return the final readiness. Callers decide what to do with
+/// `Errored` and timed-out `Pending`.
+pub async fn wait_for_boot_ready(timeout: Duration) -> BootReadiness {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match boot_readiness() {
+            BootReadiness::Ready => return BootReadiness::Ready,
+            BootReadiness::Errored => return BootReadiness::Errored,
+            BootReadiness::Pending => {
+                if Instant::now() >= deadline {
+                    return BootReadiness::Pending;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
 }
 
 // Shared recording status that can be read by the tray menu
@@ -192,8 +247,40 @@ pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
     *guard = devices;
 }
 
-#[allow(dead_code)]
-fn set_recording_status(status: RecordingStatus) {
+/// Mirror of `routes::capture::HighFpsState` — what the tray needs to
+/// render the "HD recording" menu item label and checked state.
+/// Updated by the health poll so the tray reads from a local cache
+/// instead of blocking on an HTTP round-trip, AND mutated optimistically
+/// by the tray click handler so rapid clicks compute the next action
+/// from post-click state instead of the 1-sec-stale poll snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct HighFpsCacheEntry {
+    /// True iff an HD session is currently active.
+    pub active: bool,
+    /// Capture debounce (ms). Cached so the label can show "~10 fps".
+    pub interval_ms: u64,
+    /// Session kind serialized as `"meeting"` | `"timer"` | empty.
+    pub session_kind: String,
+    /// Seconds until the active session auto-expires. 0 when idle.
+    pub remaining_secs: u64,
+}
+
+static HIGH_FPS_STATUS: Lazy<RwLock<HighFpsCacheEntry>> =
+    Lazy::new(|| RwLock::new(HighFpsCacheEntry::default()));
+
+pub fn get_high_fps_status() -> HighFpsCacheEntry {
+    HIGH_FPS_STATUS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn set_high_fps_status(entry: HighFpsCacheEntry) {
+    let mut guard = HIGH_FPS_STATUS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = entry;
+}
+
+pub fn set_recording_status(status: RecordingStatus) {
     RECORDING_INFO
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -325,6 +412,30 @@ fn decide_status(
                 RecordingStatus::Stopped
             }
         }
+    }
+}
+
+fn apply_capture_session_status(
+    base_status: RecordingStatus,
+    server_responding: bool,
+    capture_running: Option<bool>,
+    start_in_progress: bool,
+) -> RecordingStatus {
+    if !server_responding {
+        return base_status;
+    }
+
+    if capture_running == Some(true) {
+        return base_status;
+    }
+
+    if start_in_progress {
+        return RecordingStatus::Starting;
+    }
+
+    match capture_running {
+        Some(false) => RecordingStatus::Paused,
+        _ => base_status,
     }
 }
 
@@ -488,13 +599,35 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 current_status,
             );
 
+            let (capture_running, start_in_progress) = if let Some(recording_state) =
+                app.try_state::<crate::recording::RecordingState>()
+            {
+                let start_in_progress = recording_state.is_starting.load(Ordering::SeqCst)
+                    || recording_state.is_starting_capture.load(Ordering::SeqCst);
+                let capture_running = recording_state
+                    .capture
+                    .try_lock()
+                    .ok()
+                    .map(|capture| capture.is_some());
+                (capture_running, start_in_progress)
+            } else {
+                (None, false)
+            };
+
+            let status = apply_capture_session_status(
+                status,
+                health_result.is_ok(),
+                capture_running,
+                start_in_progress,
+            );
+
             // NOTE: Runtime permission-loss detection has moved to
             // `screenpipe-engine::permission_monitor` + capture-module emissions.
             // The old health-based degraded→permission-lost heuristic was removed:
             // it was slow (60s startup + 120s restart grace + 10s debounce) and
             // frequently missed transitions because CGPreflightScreenCaptureAccess
             // returns stale results. The app now subscribes to `permission_lost`
-            // / `permission_restored` events via /ws/events (see permission_events.rs).
+            // / `permission_restored` events via /ws/events (see engine_events.rs).
 
             // Parse device info from health response, filtered by monitor settings
             let mut devices = parse_devices_from_health(&health_result);
@@ -583,6 +716,31 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                     }
 
                     set_audio_device_status(entries);
+                }
+            }
+
+            // Poll the HD controller state for the tray's menu item.
+            // 503 is normal (vision disabled / older engine) — keep last known.
+            if let Ok(res) = api
+                .apply_auth(reqwest::Client::new().get(api.url("/capture/hd")))
+                .send()
+                .await
+            {
+                if res.status().is_success() {
+                    if let Ok(body) = res.json::<serde_json::Value>().await {
+                        let kind = body
+                            .get("session")
+                            .and_then(|s| s.get("kind"))
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        set_high_fps_status(HighFpsCacheEntry {
+                            active: body["active"].as_bool().unwrap_or(false),
+                            interval_ms: body["intervalMs"].as_u64().unwrap_or(100),
+                            session_kind: kind,
+                            remaining_secs: body["remainingSecs"].as_u64().unwrap_or(0),
+                        });
+                    }
                 }
             }
 
@@ -1145,6 +1303,41 @@ mod tests {
     }
 
     #[test]
+    fn test_capture_absent_with_live_server_is_paused() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), false);
+        assert_eq!(status, RecordingStatus::Paused);
+    }
+
+    #[test]
+    fn test_capture_absent_while_starting_stays_starting() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true);
+        assert_eq!(status, RecordingStatus::Starting);
+    }
+
+    #[test]
+    fn test_capture_status_does_not_mask_connection_error() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false);
+        assert_eq!(status, RecordingStatus::Stopped);
+    }
+
+    #[test]
+    fn test_running_capture_keeps_recording_status() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false);
+        assert_eq!(status, RecordingStatus::Recording);
+    }
+
+    #[test]
+    fn test_running_capture_wins_over_stale_starting_flag() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), true);
+        assert_eq!(status, RecordingStatus::Recording);
+    }
+
+    #[test]
     fn test_pool_saturation_scenario() {
         // Simulate DB pool saturation: server responds but with unhealthy status
         // for a few seconds, then recovers. Tray should stay green the whole time.
@@ -1343,5 +1536,152 @@ mod tests {
             is_unhealthy_icon(status_to_icon_key(status)),
             "should show failed icon if server never started"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boot-readiness gate (#3622)
+    //
+    // These tests mutate the process-wide BOOT_PHASE singleton. They share a
+    // mutex so they run serially even under `cargo test`'s default parallel
+    // runner — otherwise one test's `set_boot_phase("ready")` would race
+    // another's `set_boot_phase("error")` and flap.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+    static BOOT_PHASE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn with_boot_phase<F: FnOnce()>(phase: &str, body: F) {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase(phase, None);
+        body();
+        // Reset so other tests see a known-pending baseline.
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_ready_when_ready_phase() {
+        with_boot_phase("ready", || {
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+        });
+    }
+
+    #[test]
+    fn boot_readiness_errored_when_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // set_boot_error uses a different code path than set_boot_phase
+        set_boot_error("simulated boot failure");
+        assert_eq!(boot_readiness(), BootReadiness::Errored);
+        assert_ne!(boot_readiness(), BootReadiness::Ready);
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_pending_during_intermediate_phases() {
+        for phase in [
+            "starting",
+            "migrating_database",
+            "building_audio",
+            "starting_pipes",
+        ] {
+            with_boot_phase(phase, || {
+                assert_eq!(
+                    boot_readiness(),
+                    BootReadiness::Pending,
+                    "phase {phase} should be pending"
+                );
+                assert_ne!(
+                    boot_readiness(),
+                    BootReadiness::Ready,
+                    "phase {phase} should not be ready"
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_immediately_when_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("ready", None);
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "should not poll when already ready (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_fails_fast_on_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_error("simulated startup failure");
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(60)).await;
+        assert_eq!(
+            result,
+            BootReadiness::Errored,
+            "must short-circuit on error, not wait out full timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "error phase must fail fast (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_pending_on_timeout() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+        // 200 ms is long enough for the polling loop to make at least one
+        // pass (poll interval is 500 ms, deadline check fires first), short
+        // enough not to slow the suite.
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            BootReadiness::Pending,
+            "timeout while still pending should return Pending"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "should not overshoot timeout by much (took {:?})",
+            elapsed
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_observes_transition_to_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+
+        // Flip to ready after 100 ms. The waiter polls every 500 ms, so
+        // worst case it observes the transition within ~500 ms of the flip.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            set_boot_phase("ready", None);
+        });
+
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        set_boot_phase("idle", None);
     }
 }

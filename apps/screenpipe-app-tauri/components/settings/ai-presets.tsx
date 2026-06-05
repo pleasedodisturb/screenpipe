@@ -741,11 +741,13 @@ const AISection = ({
             modelCount = ollamaModels.length;
             setModels(ollamaModels);
           } else {
-            const apiModels = (data.data || []).map((m: any) => ({
+            const apiModels = (data.data || [])
+              .map((m: any) => ({
               id: m.id,
               name: m.id,
               provider: settingsPreset?.provider || "custom",
-            }));
+              }))
+              .filter((m: any, idx: number, arr: any[]) => arr.findIndex((x: any) => x.id === m.id) === idx);
             modelCount = apiModels.length;
             setModels(apiModels);
           }
@@ -895,6 +897,7 @@ const AISection = ({
   const isApiKeyRequired =
     settingsPreset?.provider !== "openai-chatgpt" &&
     settingsPreset?.provider !== "anthropic" &&
+    settingsPreset?.url !== "https://api.screenpipe.com/v1" &&
     settingsPreset?.url !== "https://api.screenpi.pe/v1" &&
     settingsPreset?.url !== "http://localhost:11434/v1" &&
     settingsPreset?.url !== "embedded";
@@ -995,14 +998,14 @@ const AISection = ({
             } else {
               // Fallback to hardcoded models
               setModels([
-                { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+                { id: "claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic" },
                 { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
                 { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
               ]);
             }
           } catch {
             setModels([
-              { id: "claude-opus-4-6", name: "Claude Opus 4.6", provider: "anthropic" },
+              { id: "claude-opus-4-8", name: "Claude Opus 4.8", provider: "anthropic" },
               { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.5", provider: "anthropic" },
               { id: "claude-haiku-4-5-20251001", name: "Claude Haiku 4.5", provider: "anthropic" },
             ]);
@@ -1027,7 +1030,8 @@ const AISection = ({
                     id: m.id,
                     name: m.id,
                     provider: "openai-chatgpt",
-                  }));
+                  }))
+                  .filter((m: { id: string }, idx: number, arr: { id: string }[]) => arr.findIndex((x) => x.id === m.id) === idx);
                 console.log("[chatgpt] fetched", chatgptModels.length, "models from API");
                 if (chatgptModels.length > 0) {
                   setModels(chatgptModels);
@@ -1059,12 +1063,13 @@ const AISection = ({
           // Fetch models from gateway so new models appear automatically
           try {
             const token = settings.user?.token || "";
-            const piResp = await fetch("https://api.screenpi.pe/v1/models", {
+            const piResp = await fetch("https://api.screenpipe.com/v1/models", {
               headers: token ? { Authorization: `Bearer ${token}` } : {},
             });
             if (piResp.ok) {
               const piData = await piResp.json();
-              const piModels: AIModel[] = (piData.data || []).map((m: any) => ({
+              const piModels: AIModel[] = (piData.data || [])
+                .map((m: any) => ({
                 id: m.id,
                 name: m.name || m.id,
                 provider: "screenpipe",
@@ -1075,7 +1080,12 @@ const AISection = ({
                 best_for: m.best_for,
                 speed: m.speed,
                 intelligence: m.intelligence,
-              }));
+                cost_tier: m.cost_tier,
+                recommended_for: m.recommended_for,
+                warning: m.warning,
+                query_weight: m.query_weight,
+                }))
+                .filter((m: AIModel, idx: number, arr: AIModel[]) => arr.findIndex((x) => x.id === m.id) === idx);
               if (piModels.length > 0) {
                 setModels(piModels);
                 break;
@@ -1088,7 +1098,7 @@ const AISection = ({
             { id: "auto", name: "Auto (recommended)", provider: "screenpipe" },
             { id: "claude-haiku-4-5", name: "Haiku 4.5 (fast)", provider: "screenpipe" },
             { id: "claude-sonnet-4-5", name: "Sonnet 4.5 (balanced)", provider: "screenpipe" },
-            { id: "claude-opus-4-6", name: "Opus 4.6 (powerful, pro)", provider: "screenpipe" },
+            { id: "claude-opus-4-8", name: "Opus 4.8 (powerful, pro)", provider: "screenpipe" },
             { id: "gemini-3-flash", name: "Gemini 3 Flash (fast)", provider: "screenpipe" },
             { id: "gemini-3.1-flash-lite", name: "Gemini 3.1 Flash-Lite (cheapest)", provider: "screenpipe" },
             { id: "gemini-3.1-pro", name: "Gemini 3.1 Pro (balanced)", provider: "screenpipe" },
@@ -1490,7 +1500,7 @@ const AISection = ({
                             key={model.id}
                             value={model.id}
                             onSelect={async () => {
-                              if (model.id === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
+                              if (model.id === "claude-opus-4-8" && !settings.user?.cloud_subscribed) {
                                 if (!settings.user?.token) {
                                   await commands.openLoginWindow();
                                 } else {
@@ -1843,6 +1853,7 @@ function SortablePresetCard({
   isTeamAdmin,
   readOnly = false,
   defaultLocked = false,
+  chatgptTokenExpired = false,
 }: {
   preset: AIPreset;
   isDefault: boolean;
@@ -1856,6 +1867,7 @@ function SortablePresetCard({
   isTeamAdmin?: boolean;
   readOnly?: boolean;
   defaultLocked?: boolean;
+  chatgptTokenExpired?: boolean;
 }) {
   const {
     attributes,
@@ -1917,6 +1929,21 @@ function SortablePresetCard({
             )}
             {!hasValidation && (
               <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            )}
+            {!hasValidation && (
+              <AlertCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+            )}
+            {chatgptTokenExpired && (
+              <TooltipProvider>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <AlertCircle className="h-3.5 w-3.5 text-yellow-500 shrink-0 cursor-help" />
+                  </TooltipTrigger>
+                  <TooltipContent>
+                    ChatGPT session expired — open Connections to reconnect
+                  </TooltipContent>
+                </Tooltip>
+              </TooltipProvider>
             )}
           </div>
           {hasValidation ? (
@@ -1981,6 +2008,7 @@ export const AIPresets = () => {
   );
   const canManageEmployeePresets = !isEnterprise || aiPresetPolicy.allow_employee_custom_presets;
   const [piAvailable, setPiAvailable] = useState(false);
+  const [chatgptTokenValid, setChatgptTokenValid] = useState<boolean | null>(null);
   const team = useTeam();
   const isTeamAdmin = !!team.team && team.role === "admin";
 
@@ -2036,11 +2064,26 @@ export const AIPresets = () => {
   }, [isEnterprise, aiPresetPolicy.allow_screenpipe_cloud]);
 
   useEffect(() => {
-    if (!createPresetsDialog) {
-      setSelectedPreset(undefined);
-      setIsDuplicating(false);
-    }
-  }, [createPresetsDialog]);
+  const hasChatGptPreset = settings.aiPresets?.some(
+    (p) => p.provider === "openai-chatgpt"
+  );
+  if (!hasChatGptPreset) {
+    setChatgptTokenValid(null);
+    return;
+  }
+  commands.chatgptOauthCheckToken().then((res) => {
+    setChatgptTokenValid(res.status === "ok" ? res.data : null);
+  }).catch(() => {
+    setChatgptTokenValid(null);
+  });
+}, [settings.aiPresets]);
+
+useEffect(() => {
+  if (!createPresetsDialog) {
+    setSelectedPreset(undefined);
+    setIsDuplicating(false);
+  }
+}, [createPresetsDialog]);
 
   if (createPresetsDialog)
     return (
@@ -2282,6 +2325,7 @@ export const AIPresets = () => {
                   preset={preset}
                   isDefault={preset.defaultPreset}
                   hasValidation={!!(preset.provider && preset.model && (preset.url || preset.provider === "screenpipe-cloud" || preset.provider === "openai-chatgpt"))}
+                  chatgptTokenExpired={preset.provider === "openai-chatgpt" && chatgptTokenValid === false}
                   onEdit={() => {
                     setSelectedPreset(preset);
                     setIsDuplicating(false);

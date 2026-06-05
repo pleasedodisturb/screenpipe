@@ -12,6 +12,30 @@ export interface VertexGeminiConfig {
 	region?: string;
 }
 
+function nonEmptyText(value: unknown): string | null {
+	if (typeof value !== 'string') return null;
+	return value.trim().length > 0 ? value : null;
+}
+
+function safeToolArgs(value: unknown): Record<string, any> {
+	if (typeof value === 'string') {
+		try {
+			return JSON.parse(value);
+		} catch {
+			return {};
+		}
+	}
+	return (value && typeof value === 'object') ? value as Record<string, any> : {};
+}
+
+function safeJson(value: unknown): string {
+	try {
+		return JSON.stringify(value ?? {});
+	} catch {
+		return '{}';
+	}
+}
+
 export class GeminiProvider implements AIProvider {
 	supportsTools = true;
 	supportsVision = true;
@@ -43,52 +67,6 @@ export class GeminiProvider implements AIProvider {
 			headers['Authorization'] = `Bearer ${token}`;
 		}
 		return headers;
-	}
-
-	// Check if web search is requested in tools
-	private hasWebSearchTool(tools?: any[]): boolean {
-		if (!tools) return false;
-		return tools.some(tool =>
-			tool.type === 'web_search' ||
-			tool.type === 'google_search' ||
-			tool.googleSearch !== undefined ||
-			(tool.function?.name === 'web_search') ||
-			(tool.function?.name === 'google_search')
-		);
-	}
-
-	/**
-	 * Detect if user is explicitly asking for web search
-	 * Fallback for when frontend doesn't send web_search tool
-	 */
-	private detectWebSearchIntent(messages: Message[]): string | null {
-		const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
-		if (!lastUserMsg) return null;
-
-		const content = typeof lastUserMsg.content === 'string'
-			? lastUserMsg.content.toLowerCase()
-			: '';
-
-		const webSearchPatterns = [
-			/search\s+(.+?)\s+on\s+(?:the\s+)?(?:internet|web)/i,
-			/search\s+(?:the\s+)?(?:internet|web)\s+(?:for|about)\s+(.+)/i,
-			/(?:use\s+)?(?:internet|web)\s+search/i,
-			/search\s+(?:the\s+)?(?:internet|web)/i,
-		];
-
-		for (const pattern of webSearchPatterns) {
-			const match = content.match(pattern);
-			if (match) {
-				const query = match[1]?.trim().replace(/[?.!]+$/, '') ||
-					content.replace(/search|internet|web|the|for|about|use/gi, '').trim();
-				if (query.length > 2) {
-					console.log('[Gemini] Web search intent detected:', query);
-					return query;
-				}
-			}
-		}
-
-		return null;
 	}
 
 	private mapModel(model: string): string {
@@ -133,9 +111,7 @@ export class GeminiProvider implements AIProvider {
 
 	async createCompletion(body: RequestBody): Promise<Response> {
 		const url = this.getEndpointUrl(body.model, false);
-		const hasWebSearch = this.hasWebSearchTool(body.tools);
-
-		let requestBody = this.buildRequestBody(body, hasWebSearch);
+		const requestBody = this.buildRequestBody(body);
 
 		console.log('[Gemini] Request to:', url.replace(this.apiKey || 'N/A', '***'));
 		const headers = await this.getAuthHeaders();
@@ -152,56 +128,11 @@ export class GeminiProvider implements AIProvider {
 			throw new Error(`Gemini API request failed: ${response.status} ${error}`);
 		}
 
-		let result: any = await response.json();
-
-		// Check if model called web_search - if so, execute it and continue
-		const parts = result.candidates?.[0]?.content?.parts || [];
-		const webSearchCall = parts.find((p: any) =>
-			p.functionCall?.name === 'web_search' || p.functionCall?.name === 'google_search'
-		);
-
-		if (webSearchCall) {
-			const query = webSearchCall.functionCall.args?.query || webSearchCall.functionCall.args?.q || '';
-			console.log('[Gemini] Model called web_search, executing for:', query);
-
-			try {
-				const searchResult = await this.executeWebSearch(query);
-
-				const followUpContents = [
-					...requestBody.contents,
-					{
-						role: 'model',
-						parts: [{ functionCall: webSearchCall.functionCall }],
-					},
-					{
-						role: 'user',
-						parts: [{
-							functionResponse: {
-								name: 'web_search',
-								response: { result: searchResult.content },
-							},
-						}],
-					},
-				];
-
-				const followUpUrl = this.getEndpointUrl(body.model, false);
-				const followUpHeaders = await this.getAuthHeaders();
-				const followUpResponse = await fetch(followUpUrl, {
-					method: 'POST',
-					headers: followUpHeaders,
-					body: JSON.stringify({
-						contents: followUpContents,
-						generationConfig: requestBody.generationConfig,
-					}),
-				});
-
-				if (followUpResponse.ok) {
-					result = await followUpResponse.json();
-				}
-			} catch (error) {
-				console.error('[Gemini] Web search execution failed:', error);
-			}
-		}
+		// Tool calls (web_search included) flow through formatResponse as
+		// OpenAI tool_calls. The gateway does NOT execute tools inline — the
+		// client (pi) owns tool execution and re-enters the model loop with the
+		// result. See createStreamingCompletion for the streaming counterpart.
+		const result: any = await response.json();
 
 		return new Response(JSON.stringify(this.formatResponse(result, false)), {
 			headers: { 'Content-Type': 'application/json' },
@@ -209,19 +140,8 @@ export class GeminiProvider implements AIProvider {
 	}
 
 	async createStreamingCompletion(body: RequestBody): Promise<ReadableStream> {
-		const hasWebSearch = this.hasWebSearchTool(body.tools);
-
-		// Fallback: detect web search intent when frontend doesn't send web_search tool
-		if (!hasWebSearch) {
-			const webSearchQuery = this.detectWebSearchIntent(body.messages);
-			if (webSearchQuery) {
-				console.log('[Gemini] Fallback web search for:', webSearchQuery);
-				return this.createDirectWebSearchStream(webSearchQuery);
-			}
-		}
-
 		const url = this.getEndpointUrl(body.model, true);
-		const requestBody = this.buildRequestBody(body, hasWebSearch);
+		const requestBody = this.buildRequestBody(body);
 
 		console.log('[Gemini] Streaming request to:', url.replace(this.apiKey || 'N/A', '***'));
 		console.log('[Gemini] Request body:', JSON.stringify({
@@ -247,10 +167,8 @@ export class GeminiProvider implements AIProvider {
 		const reader = response.body!.getReader();
 		const decoder = new TextDecoder();
 		let buffer = '';
-		const self = this;
 
 		let toolCallIndex = 0;
-		let pendingWebSearch: { name: string; args: any } | null = null;
 		let inputTokens = 0;
 		let outputTokens = 0;
 
@@ -271,49 +189,6 @@ export class GeminiProvider implements AIProvider {
 												completion_tokens: outputTokens,
 												total_tokens: inputTokens + outputTokens,
 											},
-										})}\n\n`
-									)
-								);
-							}
-
-							// Before closing, check if we have a pending web search to execute
-							if (pendingWebSearch) {
-								const query = pendingWebSearch.args?.query || pendingWebSearch.args?.q || '';
-								console.log('[Gemini] Executing pending web_search:', query);
-
-								controller.enqueue(
-									new TextEncoder().encode(
-										`data: ${JSON.stringify({
-											choices: [{ delta: { content: `\n\n*Searching the web for "${query}"...*\n\n` } }],
-										})}\n\n`
-									)
-								);
-
-								try {
-									const searchResult = await self.executeWebSearch(query);
-
-									controller.enqueue(
-										new TextEncoder().encode(
-											`data: ${JSON.stringify({
-												choices: [{ delta: { content: '\n\n' + searchResult.content } }],
-											})}\n\n`
-										)
-									);
-								} catch (error) {
-									console.error('[Gemini] Web search failed:', error);
-									controller.enqueue(
-										new TextEncoder().encode(
-											`data: ${JSON.stringify({
-												choices: [{ delta: { content: '\n\nWeb search failed. Please try again.' } }],
-											})}\n\n`
-										)
-									);
-								}
-
-								controller.enqueue(
-									new TextEncoder().encode(
-										`data: ${JSON.stringify({
-											choices: [{ delta: {}, finish_reason: 'stop' }],
 										})}\n\n`
 									)
 								);
@@ -356,57 +231,50 @@ export class GeminiProvider implements AIProvider {
 											const funcName = part.functionCall.name;
 											console.log('[Gemini] Model called function:', funcName, JSON.stringify(part.functionCall.args || {}));
 
-											if (funcName === 'web_search' || funcName === 'google_search') {
-												pendingWebSearch = {
-													name: funcName,
-													args: part.functionCall.args || {},
-												};
-												console.log('[Gemini] Saving web_search for execution after stream ends');
-											} else {
-												const sig = part.thoughtSignature || '';
-												const toolCallId = sig
-													? `call_${toolCallIndex}_ts_${btoa(sig)}`
-													: `call_${Date.now()}_${toolCallIndex}`;
-												controller.enqueue(
-													new TextEncoder().encode(
-														`data: ${JSON.stringify({
-															choices: [{
-																delta: {
-																	tool_calls: [{
-																		index: toolCallIndex,
-																		id: toolCallId,
-																		type: 'function',
-																		function: {
-																			name: funcName,
-																			arguments: JSON.stringify(part.functionCall.args || {}),
-																		},
-																	}],
-																},
-															}],
-														})}\n\n`
-													)
-												);
-												toolCallIndex++;
-											}
+											// Surface every tool call — web_search included — to the client.
+											// pi executes its own registered tools and feeds the result back
+											// into the loop. The gateway must NOT run tools inline: doing so
+											// bypassed pi's web_search extension and dumped raw search results
+											// into the chat instead of letting the model use them.
+											const sig = part.thoughtSignature || '';
+											const toolCallId = sig
+												? `call_${toolCallIndex}_ts_${btoa(sig)}`
+												: `call_${Date.now()}_${toolCallIndex}`;
+											controller.enqueue(
+												new TextEncoder().encode(
+													`data: ${JSON.stringify({
+														choices: [{
+															delta: {
+																tool_calls: [{
+																	index: toolCallIndex,
+																	id: toolCallId,
+																	type: 'function',
+																	function: {
+																		name: funcName,
+																		arguments: JSON.stringify(part.functionCall.args || {}),
+																	},
+																}],
+															},
+														}],
+													})}\n\n`
+												)
+											);
+											toolCallIndex++;
 										}
 									}
 
 									const finishReason = data.candidates?.[0]?.finishReason;
 									if (finishReason) {
-										if (pendingWebSearch && finishReason === 'TOOL_USE') {
-											console.log('[Gemini] Suppressing tool_calls finish_reason for web_search');
-										} else {
-											const mappedReason = finishReason === 'STOP' ? 'stop' :
-												finishReason === 'MAX_TOKENS' ? 'length' :
-												finishReason === 'TOOL_USE' ? 'tool_calls' : 'stop';
-											controller.enqueue(
-												new TextEncoder().encode(
-													`data: ${JSON.stringify({
-														choices: [{ delta: {}, finish_reason: mappedReason }],
-													})}\n\n`
-												)
-											);
-										}
+										const mappedReason = finishReason === 'STOP' ? 'stop' :
+											finishReason === 'MAX_TOKENS' ? 'length' :
+											finishReason === 'TOOL_USE' ? 'tool_calls' : 'stop';
+										controller.enqueue(
+											new TextEncoder().encode(
+												`data: ${JSON.stringify({
+													choices: [{ delta: {}, finish_reason: mappedReason }],
+												})}\n\n`
+											)
+										);
 									}
 								} catch (e) {
 									// Skip invalid JSON
@@ -440,7 +308,7 @@ export class GeminiProvider implements AIProvider {
 		});
 	}
 
-	private buildRequestBody(body: RequestBody, _hasWebSearch: boolean): any {
+	private buildRequestBody(body: RequestBody): any {
 		const systemMsg = body.messages.find(m => m.role === 'system');
 		const contents = this.formatMessages(body.messages);
 
@@ -555,55 +423,6 @@ export class GeminiProvider implements AIProvider {
 		return { content, sources };
 	}
 
-	private async createDirectWebSearchStream(query: string): Promise<ReadableStream> {
-		const self = this;
-		return new ReadableStream({
-			async start(controller) {
-				try {
-					controller.enqueue(
-						new TextEncoder().encode(
-							`data: ${JSON.stringify({
-								choices: [{ delta: { content: `*Searching the web for "${query}"...*\n\n` } }],
-							})}\n\n`
-						)
-					);
-
-					const searchResult = await self.executeWebSearch(query);
-
-					controller.enqueue(
-						new TextEncoder().encode(
-							`data: ${JSON.stringify({
-								choices: [{ delta: { content: searchResult.content } }],
-							})}\n\n`
-						)
-					);
-
-					controller.enqueue(
-						new TextEncoder().encode(
-							`data: ${JSON.stringify({
-								choices: [{ delta: {}, finish_reason: 'stop' }],
-							})}\n\n`
-						)
-					);
-
-					controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-					controller.close();
-				} catch (error) {
-					console.error('[Gemini] Direct web search failed:', error);
-					controller.enqueue(
-						new TextEncoder().encode(
-							`data: ${JSON.stringify({
-								choices: [{ delta: { content: 'Web search failed. Please try again.' } }],
-							})}\n\n`
-						)
-					);
-					controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-					controller.close();
-				}
-			},
-		});
-	}
-
 	/**
 	 * Convert a JSON-Schema fragment into Gemini's OpenAPI-style tool schema.
 	 *
@@ -626,7 +445,15 @@ export class GeminiProvider implements AIProvider {
 		const converted: any = { type: rawType.toUpperCase() };
 
 		if (params.description) converted.description = params.description;
-		if (params.enum) converted.enum = params.enum;
+		// Gemini requires enum values to be TYPE_STRING regardless of the
+		// declared property type — upstream tools with integer/boolean enums
+		// (e.g. `enum: [4, 5, 6, 7]`) 400 with "Invalid value at … (TYPE_STRING)".
+		// Coerce every entry to string so the request survives. SCREENPIPE-AI-PROXY-8.
+		if (Array.isArray(params.enum)) {
+			converted.enum = params.enum.map((v: unknown) =>
+				typeof v === 'string' ? v : String(v)
+			);
+		}
 
 		if (rawType === 'object' || params.properties) {
 			converted.type = 'OBJECT';
@@ -688,11 +515,13 @@ export class GeminiProvider implements AIProvider {
 			const parts: any[] = [];
 
 			if (typeof msg.content === 'string') {
-				parts.push({ text: msg.content });
+				const text = nonEmptyText(msg.content);
+				if (text) parts.push({ text });
 			} else if (Array.isArray(msg.content)) {
 				for (const part of msg.content) {
 					if (part.type === 'text') {
-						parts.push({ text: part.text || '' });
+						const text = nonEmptyText(part.text);
+						if (text) parts.push({ text });
 					} else if (part.type === 'image_url' && part.image_url?.url) {
 						const url = part.image_url.url;
 						const dataUrlMatch = url.match(/^data:([^;]+);base64,(.+)$/);
@@ -738,27 +567,32 @@ export class GeminiProvider implements AIProvider {
 								},
 							});
 						}
+					} else if ((part as any).type === 'tool_use' && msg.role === 'assistant') {
+						const toolPart = this.formatFunctionCallPart(
+							(part as any).name,
+							(part as any).input ?? {},
+							(part as any).id,
+						);
+						if (toolPart) parts.push(toolPart);
+					} else if ((part as any).type === 'tool_result') {
+						const text = nonEmptyText(
+							typeof (part as any).content === 'string'
+								? (part as any).content
+								: safeJson((part as any).content),
+						);
+						if (text) parts.push({ text });
 					}
 				}
 			}
 
 			if (msg.role === 'assistant' && (msg as any).tool_calls) {
 				for (const toolCall of (msg as any).tool_calls) {
-					const callPart: any = {
-						functionCall: {
-							name: toolCall.function?.name || toolCall.name,
-							args: typeof toolCall.function?.arguments === 'string'
-								? JSON.parse(toolCall.function.arguments)
-								: toolCall.function?.arguments || {},
-						},
-					};
-					const tsMatch = (toolCall.id || '').match(/_ts_(.+)$/);
-					if (tsMatch) {
-						try {
-							callPart.thoughtSignature = atob(tsMatch[1]);
-						} catch {}
-					}
-					parts.push(callPart);
+					const callPart = this.formatFunctionCallPart(
+						toolCall.function?.name || toolCall.name,
+						toolCall.function?.arguments ?? toolCall.input,
+						toolCall.id,
+					);
+					if (callPart) parts.push(callPart);
 				}
 			}
 
@@ -770,6 +604,24 @@ export class GeminiProvider implements AIProvider {
 		flushToolResponses();
 
 		return formatted;
+	}
+
+	private formatFunctionCallPart(name: unknown, argsInput: unknown, id: unknown): any | null {
+		if (typeof name !== 'string' || name.length === 0) return null;
+		const args = safeToolArgs(argsInput);
+		const tsMatch = typeof id === 'string' ? id.match(/_ts_(.+)$/) : null;
+		if (!tsMatch) {
+			return { text: `[function call: ${name}] ${safeJson(args)}` };
+		}
+		const callPart: any = {
+			functionCall: { name, args },
+		};
+		try {
+			callPart.thoughtSignature = atob(tsMatch[1]);
+		} catch {
+			return { text: `[function call: ${name}] ${safeJson(args)}` };
+		}
+		return callPart;
 	}
 
 	private formatGroundingSources(groundingMetadata: any): string {
@@ -859,6 +711,7 @@ export class GeminiProvider implements AIProvider {
 			{ id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash', provider: 'google' },
 			{ id: 'gemini-2.0-pro-exp-02-05', name: 'Gemini 2.0 Pro', provider: 'google' },
 			{ id: 'gemini-3-flash', name: 'Gemini 3 Flash', provider: 'google' },
+			{ id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash', provider: 'google' },
 			{ id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', provider: 'google' },
 		];
 	}

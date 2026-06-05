@@ -17,6 +17,7 @@ use screenpipe_engine::RecordingConfig;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -110,6 +111,17 @@ pub fn local_api_context_from_app(app: &tauri::AppHandle) -> LocalApiContext {
 
 /// Minimum seconds between consecutive stop→spawn cycles.
 const RESTART_COOLDOWN_SECS: u64 = 30;
+const CAPTURE_RESTART_MEETING_REATTACH_WINDOW: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+pub(crate) struct InterruptedMeeting {
+    id: i64,
+    app: String,
+    title: Option<String>,
+    detection_source: String,
+    manual: bool,
+    captured_at: Instant,
+}
 
 /// Two-phase state: server (long-lived) + capture (togglable).
 ///
@@ -135,6 +147,17 @@ pub struct RecordingState {
     pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
+    /// Recently active meeting to revive when capture is immediately restarted.
+    pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
+    /// App-scoped cloud-auth token (Clerk JWT). Outlives the Server (which
+    /// is recreated on every recording restart) so that writes from the
+    /// `set_cloud_token` Tauri command — pushed by the frontend on every
+    /// sign-in / sign-out — survive capture toggles. The Server's own
+    /// `cloud_token` field is replaced with this same Arc at start, and
+    /// `PiExecutor` is constructed with `with_shared_user_token(this)`, so
+    /// one update propagates to all three readers (cloud_proxy.rs, the
+    /// pi-agent's models.json apiKey, and any future Tauri-side consumer).
+    pub cloud_token: Arc<arc_swap::ArcSwap<Option<String>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +275,8 @@ pub async fn stop_capture(
 ) -> Result<(), String> {
     info!("Stopping capture session (server stays alive)");
 
+    remember_active_meeting_for_capture_restart(&state).await;
+
     let mut capture_guard = state.capture.lock().await;
     if let Some(session) = capture_guard.take() {
         session.stop().await;
@@ -259,6 +284,97 @@ pub async fn stop_capture(
     } else {
         debug!("No capture session running");
     }
+    Ok(())
+}
+
+async fn remember_active_meeting_for_capture_restart(state: &RecordingState) {
+    let server_guard = state.server.lock().await;
+    let Some(server) = server_guard.as_ref() else {
+        return;
+    };
+
+    let manual_id = *server.manual_meeting.read().await;
+    let meeting = match manual_id {
+        Some(id) => server.db.get_active_meeting_by_id(id).await.ok().flatten(),
+        None => server
+            .db
+            .get_most_recent_active_meeting()
+            .await
+            .ok()
+            .flatten(),
+    };
+
+    let Some(meeting) = meeting else {
+        *state.interrupted_meeting.lock().await = None;
+        return;
+    };
+
+    let meeting_id = meeting.id;
+    let interrupted = InterruptedMeeting {
+        id: meeting_id,
+        app: meeting.meeting_app,
+        title: meeting.title,
+        detection_source: meeting.detection_source,
+        manual: manual_id == Some(meeting_id),
+        captured_at: Instant::now(),
+    };
+    info!(
+        "remembering active meeting across capture restart (id={}, app={}, manual={})",
+        interrupted.id, interrupted.app, interrupted.manual
+    );
+    *state.interrupted_meeting.lock().await = Some(interrupted);
+}
+
+async fn restore_interrupted_meeting_for_capture_restart(
+    state: &RecordingState,
+) -> Result<(), String> {
+    let interrupted = {
+        let mut guard = state.interrupted_meeting.lock().await;
+        guard.take()
+    };
+    let Some(interrupted) = interrupted else {
+        return Ok(());
+    };
+
+    if interrupted.captured_at.elapsed() > CAPTURE_RESTART_MEETING_REATTACH_WINDOW {
+        debug!(
+            "skipping stale interrupted meeting restore (id={}, app={})",
+            interrupted.id, interrupted.app
+        );
+        return Ok(());
+    }
+
+    let server_guard = state.server.lock().await;
+    let Some(server) = server_guard.as_ref() else {
+        return Ok(());
+    };
+
+    let already_active = server
+        .db
+        .get_active_meeting_by_id(interrupted.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !already_active {
+        server
+            .db
+            .reopen_meeting(interrupted.id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    if interrupted.manual {
+        let mut manual = server.manual_meeting.write().await;
+        *manual = Some(interrupted.id);
+    }
+    if let Some(detector) = server.audio_manager.meeting_detector().await {
+        detector.set_v2_in_meeting(true);
+    }
+
+    info!(
+        "restored active meeting across capture restart (id={}, app={}, source={}, title={:?})",
+        interrupted.id, interrupted.app, interrupted.detection_source, interrupted.title
+    );
     Ok(())
 }
 
@@ -334,12 +450,14 @@ pub async fn start_capture(
         ));
     }
 
+    restore_interrupted_meeting_for_capture_restart(&state).await?;
+
     let server_guard = state.server.lock().await;
     let server = server_guard
         .as_ref()
         .ok_or_else(|| "Server not running — cannot start capture".to_string())?;
     let config = build_config(&app)?;
-    let session = CaptureSession::start(server, &config).await?;
+    let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
     *capture_guard = Some(session);
@@ -365,6 +483,7 @@ pub async fn stop_screenpipe(
 
     // Stop capture first
     {
+        *state.interrupted_meeting.lock().await = None;
         let mut capture_guard = state.capture.lock().await;
         if let Some(session) = capture_guard.take() {
             session.stop().await;
@@ -626,6 +745,11 @@ pub async fn spawn_screenpipe(
             permissions_check.screen_recording
         );
         state.is_starting.store(false, Ordering::SeqCst);
+        state.is_starting_capture.store(false, Ordering::SeqCst);
+        // Flip the tray state machine to a terminal Error so the
+        // recording status indicator stops showing "Starting…" forever
+        // when the user has clicked "click to record" with TCC denied.
+        crate::health::set_recording_status(crate::health::RecordingStatus::Error);
         return Err(
             "Screen recording permission required. Please grant permission and restart the app."
                 .to_string(),
@@ -680,6 +804,7 @@ pub async fn spawn_screenpipe(
 
     let server_arc = state.server.clone();
     let capture_arc = state.capture.clone();
+    let cloud_token_arc = state.cloud_token.clone();
 
     // Pipe output callback. Stage 5: legacy `pipe_event` topic dropped.
     // Every pipe stdout line is emitted on the unified `agent_event`
@@ -700,19 +825,10 @@ pub async fn spawn_screenpipe(
         recording_config.data_dir.clone(),
         owned_browser.clone(),
     );
+    let pipe_agent_events = crate::agent_event_emitter::PipeAgentEventEmitter::new(app_for_pipe);
     let on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine> = Some(
         std::sync::Arc::new(move |pipe_name: &str, exec_id: i64, line: &str| {
-            let inner = if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(line) {
-                parsed
-            } else {
-                serde_json::json!({ "type": "raw_line", "text": line })
-            };
-            let unified = serde_json::json!({
-                "source": "pipe",
-                "sessionId": format!("pipe:{}:{}", pipe_name, exec_id),
-                "event": inner,
-            });
-            let _ = app_for_pipe.emit("agent_event", &unified);
+            pipe_agent_events.emit_line(pipe_name, exec_id, line);
         }),
     );
 
@@ -740,20 +856,24 @@ pub async fn spawn_screenpipe(
 
             server_runtime.block_on(async move {
                 // Phase 1: Start server
-                let server =
-                    match ServerCore::start(&recording_config, on_pipe_output, Some(owned_browser))
-                        .await
-                    {
-                        Ok(s) => s,
-                        Err(e) => {
-                            error!("Failed to start server core: {}", e);
-                            let _ = result_tx.send(Err(e));
-                            return;
-                        }
-                    };
+                let server = match ServerCore::start(
+                    &recording_config,
+                    on_pipe_output,
+                    Some(owned_browser),
+                    cloud_token_arc.clone(),
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!("Failed to start server core: {}", e);
+                        let _ = result_tx.send(Err(e));
+                        return;
+                    }
+                };
 
                 // Phase 2: Start capture
-                let capture = match CaptureSession::start(&server, &recording_config).await {
+                let capture = match CaptureSession::start(&server, &recording_config, true).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to start capture session: {}", e);
@@ -804,6 +924,10 @@ pub async fn spawn_screenpipe(
         }
         Ok(Err(e)) => {
             state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
+            if e.contains("no monitors matched") {
+                crate::health::set_recording_status(crate::health::RecordingStatus::Error);
+            }
             Err(e)
         }
         Err(_) => {
@@ -829,13 +953,15 @@ async fn start_capture_internal(
         return Ok(());
     }
 
+    restore_interrupted_meeting_for_capture_restart(state).await?;
+
     let server_guard = state.server.lock().await;
     let server = server_guard
         .as_ref()
         .ok_or_else(|| "Server not running".to_string())?;
 
     let config = build_config(app)?;
-    let session = CaptureSession::start(server, &config).await?;
+    let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
     *capture_guard = Some(session);

@@ -60,8 +60,12 @@ import {
   saveConversationFile,
 } from "@/lib/chat-storage";
 import type { ChatConversation } from "@/lib/hooks/use-settings";
+import { isInjectedTitleSourcePrompt } from "@/lib/chat-utils";
+import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
+import { isInternalTitleSession } from "@/lib/utils/internal-session";
 import {
   useChatStore,
+  sessionRecordFromMeta,
   type SessionStatus,
   type SessionRecord,
 } from "@/lib/stores/chat-store";
@@ -163,6 +167,8 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   const sid = envelope.sessionId;
   const inner = envelope.event;
   if (!sid || !inner) return; // events without a session id or body can't be routed
+  // Internal Pi sessions (title generation, etc.) — never routed to chat store
+  if (isInternalTitleSession(sid)) return;
   // Pipe sessions are only routed when chat-store already has a record
   // for them — i.e. the user clicked into a pipe-watch view, which
   // upserted the session. Unwatched pipes go to the pipe-run-recorder
@@ -205,7 +211,7 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   if (!existing) {
     store.actions.upsert({
       id: sid,
-      title: "new chat",
+      title: "untitled",
       preview: snippet ?? "",
       status: nextStatus ?? "streaming",
       lastError: err ?? undefined,
@@ -313,25 +319,11 @@ async function hydrate() {
       limit: CHAT_HISTORY_INITIAL_LIMIT,
       includeHidden: false,
     });
-    const records: SessionRecord[] = metas
-      .map((m) => ({
-        id: m.id,
-        title: m.title || "untitled",
-        preview: "",
-        status: "idle" as const,
-        messageCount: m.messageCount,
-        createdAt: m.createdAt,
-        updatedAt: m.updatedAt,
-        pinned: m.pinned,
-        // History reload doesn't count as new activity — start clean.
-        unread: false,
-        lastUserMessageAt: m.lastUserMessageAt,
-        kind: m.kind,
-        pipeContext: m.pipeContext,
-      }));
+    const records: SessionRecord[] = metas.map(sessionRecordFromMeta);
     useChatStore.getState().actions.hydrateFromDisk(records);
   } catch {
     // Storage may not be ready yet on first launch — non-fatal.
+    useChatStore.getState().actions.markDiskHydrated();
   }
 }
 
@@ -459,9 +451,17 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
 
   const t = payload.type;
 
-  // Assistant message starts — create a new in-flight message shell
-  // and remember its id as the streaming target.
+  // Assistant message starts. When a session moves to the background in the
+  // middle of a tool-using reply, Pi may emit another assistant
+  // `message_start` after an internal `turn_end`. Foreground chat keeps that
+  // work inside the SAME visible assistant bubble, so background routing must
+  // reuse the existing streaming target instead of creating a second message.
+  //
+  // Only create a fresh assistant shell when we truly have no in-flight
+  // assistant message for this session.
   if (t === "message_start" && payload.message?.role === "assistant") {
+    const cur = store.sessions[sid];
+    if (cur?.streamingMessageId) return;
     const newId = `pi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const newMsg: MutableMessage = {
       id: newId,
@@ -570,20 +570,12 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
   }
 
   // turn_end fires between LLM turns within a single agent run (typically
-  // across a tool-call boundary). The agent is still streaming — only the
-  // current message's accumulator should be cleared so the next
-  // message_start gets a fresh slate. Calling endTurn here would briefly
-  // flip isStreaming/isLoading false and falsely settle the session
-  // mid-run.
+  // across a tool-call boundary). Foreground chat does NOT split the visible
+  // assistant reply here; it keeps appending follow-up tool work and prose to
+  // the same assistant bubble until the full run reaches agent_end. The
+  // background router must mirror that shape or switching away mid-response
+  // will fragment one reply into several tiny assistant messages.
   if (t === "turn_end") {
-    const cur = store.sessions[sid];
-    if (cur?.streamingMessageId) {
-      store.actions.setStreaming(sid, {
-        streamingMessageId: null,
-        streamingText: "",
-        contentBlocks: [],
-      });
-    }
     return;
   }
 
@@ -610,16 +602,17 @@ const saveQueue = new Map<string, Promise<void>>();
  *  saveQueue tail for each id so already-running saves finish before
  *  the window closes. Used by the close-on-quit hook in
  *  `mountPiEventRouter`. */
-async function flushPendingSaves(): Promise<void> {
+export async function flushPendingSaves(): Promise<void> {
   const sessions = useChatStore.getState().sessions;
   const ids = Object.keys(sessions).filter((id) => {
     const s = sessions[id];
     return !!s.messages && s.messages.length > 0;
   });
   await Promise.all(ids.map((id) => persistBackgroundSession(id)));
-  // Await the entire saveQueue tail so any in-flight save (queued
-  // before flush) also completes. persistBackgroundSession returns the
-  // promise it just appended, so the previous await covers the tail.
+  // Also await any queue tails that were already in-flight before this
+  // flush started, even if their sessions no longer appear in the
+  // current store snapshot.
+  await Promise.all([...saveQueue.values()]);
 }
 
 /**
@@ -662,11 +655,13 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       }
 
       const existing = await loadConversationFile(sid);
-      const firstUserMsg = messages.find((m: any) => m.role === "user") as any;
-      const derivedTitle: string =
-        firstUserMsg?.content?.slice(0, 50) || "New Chat";
-      // Prefer a previously-persisted title (user may have renamed it),
-      // but only if that title isn't itself a stale derivation.
+
+      const firstUserMsg = messages.find(
+        (m: any) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
+      ) as any;
+      const derivedTitle: string = deriveFallbackConversationTitle(firstUserMsg);
+
+      // Background saves use fallback titles; AI titles generated in foreground
       const title = existing?.title || derivedTitle;
 
       const lastUserMessageAt =
@@ -676,6 +671,7 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       const conv: ChatConversation = {
         id: sid,
         title,
+        ...(existing?.titleSource ? { titleSource: existing.titleSource } : {}),
         ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
         // Full transcript — see comment in use-chat-conversations.ts
         // saveConversation. The slice(-100) here was silently truncating
@@ -710,11 +706,16 @@ async function persistBackgroundSession(sid: string): Promise<void> {
             id: m.id,
             role: m.role,
             content,
+            ...(m.intent ? { intent: m.intent } : {}),
+            ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
             timestamp: m.timestamp,
+            ...(m.displayContent ? { displayContent: m.displayContent } : {}),
             ...(blocks?.length ? { contentBlocks: blocks } : {}),
             ...(m.images?.length ? { images: m.images } : {}),
             ...(m.model ? { model: m.model } : {}),
             ...(m.provider ? { provider: m.provider } : {}),
+            ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
+            ...(m.steeredResponse ? { steeredResponse: true } : {}),
           };
         }),
         createdAt: existing?.createdAt ?? Date.now(),

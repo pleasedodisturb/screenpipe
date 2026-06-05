@@ -9,6 +9,59 @@
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { commands } from "@/lib/utils/tauri";
+import { useChatStore } from "@/lib/stores/chat-store";
+
+/**
+ * Detect if content is app-injected metadata (not real user content).
+ * Used to filter when deriving conversation titles and sanitizing display.
+ *
+ * Canonical implementation — imported by pi-event-router.ts and
+ * use-chat-conversations.ts. Update here only.
+ *
+ * Returns true for:
+ * - <conversation_history>...</conversation_history> (sync prompts)
+ * - <role>...</role> (bare metadata with no user content)
+ * - <role>...</role><system>...</system> (bare metadata)
+ *
+ * Returns false for:
+ * - <role>expert</role> analyze this (has user content after tags)
+ * - Normal user messages
+ */
+export function isInjectedTitleSourcePrompt(content?: string | null): boolean {
+  if (typeof content !== "string") return false;
+  const trimmed = content.trimStart();
+
+  // Skip <conversation_history> sync prompts
+  if (trimmed.startsWith("<conversation_history>")) return true;
+
+  // Skip ONLY bare role/system tags with no actual user content
+  // Pattern: <role>...</role> optionally followed by <system>...</system>, nothing else
+  const bareMetadataOnly = /^<role>[^<]*<\/role>\s*(<system>[^<]*<\/system>)?\s*$/;
+  if (bareMetadataOnly.test(trimmed)) return true;
+
+  // Any other content (including <role> with user text after it) is real
+  return false;
+}
+
+/**
+ * Detect `<conversation_history>` sync prompts that Pi echoes back as
+ * user events. Used by display code to hide these from the sidebar/title.
+ *
+ * This is intentionally narrow — only matches conversation_history tags.
+ * For broader title-derivation filtering (bare <role>/<system> tags),
+ * use `isInjectedTitleSourcePrompt` instead.
+ */
+export function isConversationHistorySyncPrompt(value?: string | null): value is string {
+  return typeof value === "string" && value.startsWith("<conversation_history>");
+}
+
+export function extractConversationHistorySyncUserText(value?: string | null): string | null {
+  if (!isConversationHistorySyncPrompt(value)) return null;
+  const closingTag = "</conversation_history>";
+  const closingTagIndex = value.indexOf(closingTag);
+  if (closingTagIndex === -1) return "";
+  return value.slice(closingTagIndex + closingTag.length).replace(/^\s+/, "");
+}
 
 // ============================================================================
 // CHAT PREFILL - Reliable cross-window event delivery
@@ -17,15 +70,153 @@ import { commands } from "@/lib/utils/tauri";
 export interface ChatPrefillData {
   context: string;
   prompt?: string;
+  /** Short user-facing label shown in chat while `prompt` remains the payload sent to Pi. */
+  displayLabel?: string;
   frameId?: number;
+  /** Base64 image data URLs to attach to the next chat turn. */
+  images?: string[];
   autoSend?: boolean;
   source?: string;
   /** Open the Home window chat instead of the Chat overlay. */
   useHomeChat?: boolean;
 }
 
+export type ChatTargetWindow = "home" | "chat";
+
+export interface ChatLoadConversationPayload {
+  conversationId: string;
+  targetWindow?: ChatTargetWindow;
+}
+
+export const RECENT_CHAT_SEARCH_HANDOFF_EVENT = "recent-chat-search-handoff";
+
+export interface RecentChatSearchHandoffPayload {
+  direction: 1 | -1;
+  targetWindow: ChatTargetWindow;
+}
+
+export function shouldHandleChatLoadConversationForWindow(
+  payload: ChatLoadConversationPayload | null | undefined,
+  windowLabel: ChatTargetWindow,
+): boolean {
+  return !payload?.targetWindow || payload.targetWindow === windowLabel;
+}
+
+export function shouldActivateHomeSectionForChatLoadConversation(
+  payload: ChatLoadConversationPayload | null | undefined,
+): boolean {
+  return shouldHandleChatLoadConversationForWindow(payload, "home");
+}
+
+/**
+ * Decide whether THIS window should act on a `chat-prefill` event.
+ *
+ * Both the home window and the chat overlay run a live chat panel. An
+ * `autoSend` prefill with no explicit `targetWindow` would be claimed by
+ * BOTH — each mints its own session id and calls `sendMessage`, producing
+ * two conversations for one intent. That is the root of the duplicate-chat
+ * bug for action/pipe-originated prompts.
+ *
+ * So an untargeted autoSend is pinned to the home window (the only surface
+ * that emits untargeted autoSends — the overlay path always sets a target),
+ * guaranteeing exactly one window sends. Non-autoSend prefills merely
+ * populate the input box, where double-handling is harmless, so they stay
+ * permissive.
+ */
+export function shouldHandleChatPrefillForWindow(
+  payload:
+    | { targetWindow?: string | null; autoSend?: boolean }
+    | null
+    | undefined,
+  windowLabel: string,
+): boolean {
+  if (!payload) return false;
+  const target = payload.targetWindow ?? (payload.autoSend ? "home" : null);
+  return !target || target === windowLabel;
+}
+
 const CHAT_READY_TIMEOUT_MS = 2500;
 const CHAT_READY_MAX_ATTEMPTS = 3;
+const PENDING_CHAT_PREFILL_KEY = "pendingChatPrefill";
+const RECENT_CHAT_SEARCH_ORIGIN_KEY = "recentChatSearchOrigin";
+
+export function markSearchOpenedFromChatSurface(targetWindow: ChatTargetWindow): void {
+  try {
+    localStorage.setItem(
+      RECENT_CHAT_SEARCH_ORIGIN_KEY,
+      JSON.stringify({ targetWindow }),
+    );
+  } catch {
+    // ignore
+  }
+}
+
+export function clearSearchOpenedFromChatSurface(): void {
+  try {
+    localStorage.removeItem(RECENT_CHAT_SEARCH_ORIGIN_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function readSearchOpenedFromChatSurface(): ChatTargetWindow | null {
+  try {
+    const raw = localStorage.getItem(RECENT_CHAT_SEARCH_ORIGIN_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { targetWindow?: ChatTargetWindow };
+    if (parsed.targetWindow !== "home" && parsed.targetWindow !== "chat") return null;
+    return parsed.targetWindow;
+  } catch {
+    clearSearchOpenedFromChatSurface();
+    return null;
+  }
+}
+
+export async function waitForChatReady(targetWindow: ChatTargetWindow): Promise<void> {
+  let chatReady = false;
+  for (let attempt = 1; attempt <= CHAT_READY_MAX_ATTEMPTS; attempt++) {
+    chatReady = await new Promise<boolean>((resolve) => {
+      let resolved = false;
+      const done = (ready: boolean) => {
+        if (resolved) return;
+        resolved = true;
+        clearTimeout(timeout);
+        unlistenPromise.then((fn) => fn());
+        resolve(ready);
+      };
+
+      const timeout = setTimeout(() => done(false), CHAT_READY_TIMEOUT_MS);
+      const unlistenPromise = listen<{ windowLabel?: string }>(
+        "chat-ready",
+        (event) => {
+          const readyWindow = event.payload?.windowLabel;
+          if (readyWindow && readyWindow !== targetWindow) return;
+          done(true);
+        },
+      );
+
+      setTimeout(() => {
+        emit("chat-ping", { targetWindow });
+      }, 50);
+    });
+
+    if (chatReady) return;
+  }
+
+  throw new Error(`chat did not become ready in ${targetWindow} window`);
+}
+
+export async function openChatConversationInCurrentChatSurface(
+  conversationId: string,
+): Promise<void> {
+  const currentWindowLabel = getCurrentWindow().label;
+  const payload: ChatLoadConversationPayload = {
+    conversationId,
+    targetWindow: currentWindowLabel === "chat" ? "chat" : "home",
+  };
+  useChatStore.getState().actions.setCurrent(conversationId);
+  await emit("chat-load-conversation", payload);
+}
 
 /**
  * Show a chat window and reliably deliver a chat-prefill event.
@@ -49,10 +240,9 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
     const url = new URL(window.location.href);
     const isHomeRoute = url.pathname === "/home";
     const isHomeSection = url.searchParams.get("section") === "home";
-
     if (!isHomeRoute || !isHomeSection) {
       sessionStorage.setItem(
-        "pendingChatPrefill",
+        PENDING_CHAT_PREFILL_KEY,
         JSON.stringify({ ...data, targetWindow }),
       );
       window.location.assign("/home?section=home");
@@ -68,44 +258,7 @@ export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> 
     await commands.showWindow("Chat");
   }
 
-  let chatReady = false;
-  for (let attempt = 1; attempt <= CHAT_READY_MAX_ATTEMPTS; attempt++) {
-    // Wait for the chat component to signal readiness in the intended window.
-    chatReady = await new Promise<boolean>((resolve) => {
-      let resolved = false;
-      const done = (ready: boolean) => {
-        if (resolved) return;
-        resolved = true;
-        clearTimeout(timeout);
-        unlistenPromise.then((fn) => fn());
-        resolve(ready);
-      };
-
-      const timeout = setTimeout(() => done(false), CHAT_READY_TIMEOUT_MS);
-      const unlistenPromise = listen<{ windowLabel?: string }>(
-        "chat-ready",
-        (event) => {
-          const readyWindow = event.payload?.windowLabel;
-          if (readyWindow && readyWindow !== targetWindow) return;
-          done(true);
-        },
-      );
-
-      // Ping in case chat is already mounted and won't re-emit on its own.
-      setTimeout(() => {
-        emit("chat-ping", { targetWindow });
-      }, 50);
-    });
-
-    if (chatReady) {
-      break;
-    }
-  }
-
-  if (!chatReady) {
-    throw new Error(`chat did not become ready in ${targetWindow} window`);
-  }
-
+  await waitForChatReady(targetWindow);
   await emit("chat-prefill", { ...data, targetWindow });
 }
 

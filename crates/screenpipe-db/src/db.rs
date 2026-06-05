@@ -11,6 +11,8 @@ use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::PoolConnection;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Column;
+use sqlx::ConnectOptions;
+use sqlx::Connection;
 use sqlx::Error as SqlxError;
 use sqlx::Row;
 use sqlx::Sqlite;
@@ -28,12 +30,14 @@ use zerocopy::AsBytes;
 use futures::future::try_join_all;
 
 use crate::{
-    text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
-    AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
-    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
-    MemoryRecord, MemorySyncRow, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order,
-    SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
-    TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
+    text_similarity::is_similar_transcription, AudioChunkProcessingSnapshot, AudioChunksResponse,
+    AudioDevice, AudioEntry, AudioResult, AudioResultRaw, ChunkOutcome, ContentType, DeviceType,
+    Element, ElementRow, ElementSource, FrameData, FrameRow, FrameRowLight, FrameWindowData,
+    InsertUiEvent, MeetingRecord, MeetingTranscriptSegment, MemoryRecord, MemorySyncRow,
+    NewDiarizationSegment, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order,
+    ReplacementAudioTranscription, SearchMatch, SearchMatchGroup, SearchResult, Speaker,
+    TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord,
+    UiEventRow, VideoMetadata, MAX_TRANSCRIPTION_ATTEMPTS,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -44,6 +48,22 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 /// Higher = stricter matching, lower = more aggressive deduplication.
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
 const FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION: i64 = 20260415000000;
+
+/// User explicitly stopped a meeting (stop button in UI / stop API).
+/// Auto-merge MUST NOT reopen these — a new detected meeting in the same
+/// app should get its own row, even within the 120s merge window.
+pub const MEETING_END_REASON_EXPLICIT_STOP: &str = "explicit_stop";
+/// Server-side auto-end pipeline closed the meeting (e.g. inactivity finalize).
+/// Eligible for auto-merge if a new meeting is detected within the window.
+pub const MEETING_END_REASON_AUTO_END: &str = "auto_end";
+/// App shutdown closed an active meeting row. Eligible for auto-merge on next launch.
+pub const MEETING_END_REASON_SHUTDOWN: &str = "shutdown";
+
+fn normalize_timestamp_for_range_query(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|dt| dt.with_timezone(&Utc).to_rfc3339())
+        .unwrap_or_else(|_| timestamp.to_string())
+}
 
 pub struct DeleteTimeRangeResult {
     pub frames_deleted: u64,
@@ -57,6 +77,18 @@ pub struct DeleteTimeRangeResult {
     pub audio_files: Vec<String>,
     /// Snapshot JPEG files that were uploaded to cloud and can be deleted.
     pub snapshot_files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewMeetingTranscriptSegment {
+    pub provider: String,
+    pub model: Option<String>,
+    pub item_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub speaker_name: Option<String>,
+    pub transcript: String,
+    pub captured_at: DateTime<Utc>,
 }
 
 /// Outcome of `evict_media_in_range`. DB rows stay alive (search/timeline
@@ -254,6 +286,12 @@ impl DatabaseManager {
             ));
         }
 
+        // Ensure the data dir exists before opening the file — a missing parent
+        // dir makes SQLite fail with "unable to open database file"
+        // (SQLITE_CANTOPEN, code 14) at create_database/connect. Shared with the
+        // write_queue's runtime recovery (see ensure_db_parent_dir).
+        crate::write_queue::ensure_db_parent_dir(database_path, true);
+
         // Create the database if it doesn't exist
         if !sqlx::Sqlite::database_exists(&connection_string).await? {
             sqlx::Sqlite::create_database(&connection_string).await?;
@@ -281,6 +319,21 @@ impl DatabaseManager {
             // Crash recovery: ~200ms replay at most.
             .pragma("wal_autocheckpoint", "4000");
 
+        // Fresh DB conversion to journal_mode=WAL requires an exclusive lock.
+        // When the pool opens read_pool + write_pool connections concurrently,
+        // each connection tries the WAL conversion and they race, with losers
+        // failing initialization with SQLITE_BUSY ("database is locked")
+        // (~50% reproduction with fresh data-dir). Pre-converting via a single
+        // connection before pool creation makes pool connections see a WAL'd
+        // DB and skip conversion entirely — no race.
+        {
+            let mut conn = connect_options.connect().await?;
+            sqlx::query("PRAGMA journal_mode=WAL")
+                .execute(&mut conn)
+                .await?;
+            conn.close().await?;
+        }
+
         // Read pool: handles all SELECT queries (search, timeline, API, pipes).
         let read_pool = SqlitePoolOptions::new()
             .max_connections(config.read_pool_max)
@@ -300,8 +353,11 @@ impl DatabaseManager {
             .await?;
 
         let write_semaphore = Arc::new(Semaphore::new(1));
-        let write_queue =
-            crate::write_queue::spawn_write_drain(write_pool.clone(), Arc::clone(&write_semaphore));
+        let write_queue = crate::write_queue::spawn_write_drain(
+            write_pool.clone(),
+            Arc::clone(&write_semaphore),
+            Arc::from(database_path),
+        );
         let db_manager = DatabaseManager {
             pool: read_pool,
             write_pool,
@@ -568,6 +624,18 @@ impl DatabaseManager {
                 match tokio::time::timeout(Duration::from_secs(3), self.write_pool.acquire()).await
                 {
                     Ok(Ok(conn)) => conn,
+                    Ok(Err(e))
+                        if attempt < max_retries
+                            && crate::sqlite_error::should_recycle_sqlite_connection(&e) =>
+                    {
+                        warn!(
+                            "write pool acquire connection error (attempt {}/{}), retrying: {}",
+                            attempt, max_retries, e
+                        );
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
                     Ok(Err(e)) => return Err(e),
                     Err(_) => return Err(sqlx::Error::PoolTimedOut),
                 };
@@ -618,6 +686,19 @@ impl DatabaseManager {
                     last_error = Some(e);
                     tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
                 }
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "BEGIN IMMEDIATE connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -649,13 +730,7 @@ impl DatabaseManager {
 
     /// Check if a sqlx error is a SQLite BUSY variant (code 5, 517, etc.)
     fn is_busy_error(e: &sqlx::Error) -> bool {
-        match e {
-            sqlx::Error::Database(db_err) => {
-                let msg = db_err.message().to_lowercase();
-                msg.contains("database is locked") || msg.contains("busy")
-            }
-            _ => false,
-        }
+        crate::sqlite_error::is_sqlite_busy_error(e)
     }
 
     /// Mark records as synced via the write coalescing queue.
@@ -1003,7 +1078,8 @@ impl DatabaseManager {
             "SELECT ac.id, ac.file_path, ac.timestamp
              FROM audio_chunks ac
              LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
-             WHERE at.id IS NULL AND ac.timestamp >= ?1
+             WHERE at.id IS NULL
+               AND ac.timestamp >= ?1
              ORDER BY ac.timestamp DESC
              LIMIT ?2",
         )
@@ -1014,21 +1090,150 @@ impl DatabaseManager {
         Ok(rows)
     }
 
-    /// Returns true if there are audio transcriptions from output devices
-    /// within the given number of seconds. Used by meeting detection to keep
-    /// browser-based meetings alive when the user switches tabs but audio is
-    /// still flowing (i.e. the meeting is still going).
-    pub async fn has_recent_output_audio(&self, within_secs: i64) -> Result<bool, sqlx::Error> {
-        let count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM audio_transcriptions
-             WHERE is_input_device = 0
-               AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+    /// Returns orphaned audio chunks that are old enough for background reconciliation.
+    ///
+    /// The normal user-facing pipeline can still ask for newest-first chunks, but the
+    /// background reconciler must avoid fresh in-progress audio and drain backlog
+    /// chronologically. Otherwise a live call competes with the cleanup worker and
+    /// chunks can be concatenated in reverse order.
+    pub async fn get_reconciliation_candidate_chunks(
+        &self,
+        since: DateTime<Utc>,
+        older_than: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<UntranscribedChunk>, sqlx::Error> {
+        // We pick `status = 'pending'` directly off the partial index
+        // (`idx_audio_chunks_pending_timestamp`) and gate on the attempts
+        // cap so chunks that have failed `MAX_TRANSCRIPTION_ATTEMPTS` times
+        // can't drag the worker forever.
+        let rows = sqlx::query_as::<_, UntranscribedChunk>(
+            "SELECT id, file_path, timestamp
+             FROM audio_chunks
+             WHERE transcription_status = 'pending'
+               AND transcription_attempts < ?4
+               AND timestamp >= ?1
+               AND timestamp <= ?2
+               AND file_path NOT LIKE 'cloud://%'
+             ORDER BY timestamp ASC
+             LIMIT ?3",
+        )
+        .bind(since)
+        .bind(older_than)
+        .bind(limit)
+        .bind(MAX_TRANSCRIPTION_ATTEMPTS)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Returns one orphaned audio chunk if it is currently eligible for
+    /// background transcription reconciliation.
+    pub async fn get_reconciliation_candidate_chunk_by_id(
+        &self,
+        chunk_id: i64,
+        since: DateTime<Utc>,
+        older_than: DateTime<Utc>,
+    ) -> Result<Option<UntranscribedChunk>, sqlx::Error> {
+        let row = sqlx::query_as::<_, UntranscribedChunk>(
+            "SELECT id, file_path, timestamp
+             FROM audio_chunks
+             WHERE id = ?1
+               AND transcription_status = 'pending'
+               AND transcription_attempts < ?4
+               AND timestamp >= ?2
+               AND timestamp <= ?3
+               AND file_path NOT LIKE 'cloud://%'
              LIMIT 1",
+        )
+        .bind(chunk_id)
+        .bind(since)
+        .bind(older_than)
+        .bind(MAX_TRANSCRIPTION_ATTEMPTS)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Returns a compact summary of audio chunks that are ready for background
+    /// transcription reconciliation.
+    pub async fn get_reconciliation_backlog_summary(
+        &self,
+        since: DateTime<Utc>,
+        older_than: DateTime<Utc>,
+    ) -> Result<(i64, Option<DateTime<Utc>>), sqlx::Error> {
+        let summary = sqlx::query_as::<_, (i64, Option<DateTime<Utc>>)>(
+            "SELECT COUNT(*) as count, MIN(timestamp) as oldest_timestamp
+             FROM audio_chunks
+             WHERE transcription_status = 'pending'
+               AND transcription_attempts < ?3
+               AND timestamp >= ?1
+               AND timestamp <= ?2
+               AND file_path NOT LIKE 'cloud://%'",
+        )
+        .bind(since)
+        .bind(older_than)
+        .bind(MAX_TRANSCRIPTION_ATTEMPTS)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(summary)
+    }
+
+    /// Compact processing-state snapshot of recent audio chunks. Used by the
+    /// health diagnostic to detect a genuine stall (real "pending older than
+    /// X" chunks) vs the previous heuristic (idle pool + stale metric, which
+    /// fired false positives whenever the live path's dedup short-circuited).
+    pub async fn audio_chunk_processing_snapshot(
+        &self,
+        within_secs: i64,
+    ) -> Result<AudioChunkProcessingSnapshot, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64, Option<DateTime<Utc>>)>(
+            "SELECT \
+                SUM(CASE WHEN transcription_status = 'pending' THEN 1 ELSE 0 END) AS pending, \
+                SUM(CASE WHEN transcription_status = 'transcribed' THEN 1 ELSE 0 END) AS transcribed, \
+                SUM(CASE WHEN transcription_status = 'silent' THEN 1 ELSE 0 END) AS silent, \
+                SUM(CASE WHEN transcription_status = 'failed' THEN 1 ELSE 0 END) AS failed, \
+                MIN(CASE WHEN transcription_status = 'pending' THEN timestamp END) AS oldest_pending \
+             FROM audio_chunks \
+             WHERE timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1) \
+               AND file_path NOT LIKE 'cloud://%'",
         )
         .bind(format!("-{} seconds", within_secs))
         .fetch_one(&self.pool)
         .await?;
-        Ok(count > 0)
+        Ok(AudioChunkProcessingSnapshot {
+            pending: row.0,
+            transcribed: row.1,
+            silent: row.2,
+            failed: row.3,
+            oldest_pending: row.4,
+        })
+    }
+
+    /// Returns true if output audio was recently captured. Used by meeting
+    /// detection to keep meetings alive when controls disappear but call audio
+    /// still flows.
+    ///
+    /// Important: batch mode defers `audio_transcriptions` while the meeting is
+    /// active, so this must also inspect durable `audio_chunks` file paths.
+    pub async fn has_recent_output_audio(&self, within_secs: i64) -> Result<bool, sqlx::Error> {
+        // EXISTS short-circuits on the first matching row. Match both old
+        // transcribed output rows and fresh persisted chunks that have not been
+        // transcribed yet (batch/live meeting path).
+        let exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM audio_transcriptions
+                 WHERE is_input_device = 0
+                   AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+                 UNION ALL
+                 SELECT 1 FROM audio_chunks
+                 WHERE lower(file_path) LIKE '%(output)%'
+                   AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+             )",
+        )
+        .bind(format!("-{} seconds", within_secs))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists != 0)
     }
 
     /// Returns recently transcribed chunks that still have no assigned speaker.
@@ -1129,13 +1334,23 @@ impl DatabaseManager {
     ) -> Result<i64, sqlx::Error> {
         use crate::write_queue::{WriteOp, WriteResult};
 
-        // Skip empty transcriptions (no DB access needed)
+        // Empty STT result for an existing chunk → mark Silent so the
+        // reconciliation sweep doesn't keep re-picking it. Old code returned
+        // Ok(0) here, which left the chunk pending forever.
         let trimmed = transcription.trim();
         if trimmed.is_empty() {
+            if audio_chunk_id > 0 {
+                self.record_chunk_outcome(audio_chunk_id, ChunkOutcome::Silent)
+                    .await?;
+            }
             return Ok(0);
         }
 
-        // Pre-read phase: dedup check on read pool (no write lock)
+        // Pre-read phase: dedup check on read pool (no write lock).
+        // When a cross-device duplicate fires we still need to flip the
+        // chunk's status — otherwise this chunk loops in the reconciliation
+        // sweep even though we DID process it (the other device kept the
+        // text).
         if self
             .has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
             .await?
@@ -1144,6 +1359,10 @@ impl DatabaseManager {
                 "Skipping duplicate transcription (cross-device): {:?}",
                 trimmed.chars().take(50).collect::<String>()
             );
+            if audio_chunk_id > 0 {
+                self.record_chunk_outcome(audio_chunk_id, ChunkOutcome::Duplicate)
+                    .await?;
+            }
             return Ok(0);
         }
 
@@ -1316,41 +1535,331 @@ impl DatabaseManager {
         duration_secs: Option<f64>,
         speaker_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
-        // Skip empty transcriptions
         let trimmed = transcription.trim();
         if trimmed.is_empty() {
-            return Ok(());
+            // Funnel through Silent — never let an empty input become a no-op
+            // status-wise. That no-op was the original zombie-chunk loop.
+            return self
+                .record_chunk_outcome(audio_chunk_id, ChunkOutcome::Silent)
+                .await;
+        }
+        let end_time = duration_secs.unwrap_or(0.0);
+        let segments = vec![ReplacementAudioTranscription {
+            transcription: trimmed.to_string(),
+            speaker_id,
+            start_time: 0.0,
+            end_time,
+        }];
+
+        self.replace_audio_transcriptions(
+            audio_chunk_id,
+            &segments,
+            engine,
+            device,
+            is_input_device,
+            timestamp,
+        )
+        .await
+    }
+
+    pub async fn replace_audio_transcriptions(
+        &self,
+        audio_chunk_id: i64,
+        segments: &[ReplacementAudioTranscription],
+        engine: &str,
+        device: &str,
+        is_input_device: bool,
+        timestamp: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        // Empty inputs are a legitimate "STT returned nothing" signal — translate
+        // them into a Silent outcome so the chunk stops being re-picked, instead
+        // of returning a no-op success the way the old helper did. That no-op
+        // was the root of the zombie-chunk loop.
+        if segments.is_empty() || segments.iter().all(|s| s.transcription.trim().is_empty()) {
+            return self
+                .record_chunk_outcome(audio_chunk_id, ChunkOutcome::Silent)
+                .await;
         }
 
-        let text_length = trimmed.len() as i64;
-        let start_time: f64 = 0.0;
-        let end_time: f64 = duration_secs.unwrap_or(0.0);
-        let mut tx = self.begin_immediate_with_retry().await?;
+        self.record_chunk_outcome(
+            audio_chunk_id,
+            ChunkOutcome::Transcribed {
+                segments: segments.to_vec(),
+                engine: engine.to_string(),
+                device: device.to_string(),
+                is_input_device,
+                timestamp,
+            },
+        )
+        .await
+    }
 
-        sqlx::query("DELETE FROM audio_transcriptions WHERE audio_chunk_id = ?1")
-            .bind(audio_chunk_id)
-            .execute(&mut **tx.conn())
-            .await?;
+    /// Atomically record the outcome of processing an audio chunk.
+    ///
+    /// Every transcription writer funnels through this function (live path on
+    /// dedup-skip, reconciliation silent/text/failed paths, retranscribe).
+    /// One TX writes the transcription rows AND flips `audio_chunks.status`
+    /// so the reconciliation sweep can't re-pick a chunk between the row
+    /// insert and the status update.
+    ///
+    /// Edge cases handled inline:
+    /// - Empty / whitespace-only Transcribed segments → falls through to Silent.
+    /// - Duplicate text within Transcribed (diarization splits + same word) →
+    ///   first segment lands, rest collide on the UNIQUE index and are dropped
+    ///   by INSERT OR IGNORE. Per-speaker timing/identity is preserved in
+    ///   `diarization_segments` so nothing is lost analytics-wise.
+    /// - Chunk deleted between query and outcome → the UPDATE is a no-op, the
+    ///   INSERT fails the FK check and the whole TX rolls back. Reconciliation
+    ///   will not retry because the chunk row no longer exists.
+    /// - Failed with attempts >= cap → escalates to FailedPermanent.
+    pub async fn record_chunk_outcome(
+        &self,
+        audio_chunk_id: i64,
+        outcome: ChunkOutcome,
+    ) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
 
+        match outcome {
+            ChunkOutcome::Transcribed {
+                segments,
+                engine,
+                device,
+                is_input_device,
+                timestamp,
+            } => {
+                let filtered: Vec<&ReplacementAudioTranscription> = segments
+                    .iter()
+                    .filter(|s| !s.transcription.trim().is_empty())
+                    .collect();
+                if filtered.is_empty() {
+                    return Box::pin(
+                        self.record_chunk_outcome(audio_chunk_id, ChunkOutcome::Silent),
+                    )
+                    .await;
+                }
+
+                let mut tx = self.begin_immediate_with_retry().await?;
+
+                sqlx::query("DELETE FROM audio_transcriptions WHERE audio_chunk_id = ?1")
+                    .bind(audio_chunk_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+
+                for (offset_index, segment) in filtered.iter().enumerate() {
+                    let trimmed = segment.transcription.trim();
+                    let text_length = trimmed.len() as i64;
+
+                    sqlx::query(
+                        "INSERT OR IGNORE INTO audio_transcriptions \
+                         (audio_chunk_id, transcription, text_length, offset_index, timestamp, \
+                          transcription_engine, device, is_input_device, start_time, end_time, speaker_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    )
+                    .bind(audio_chunk_id)
+                    .bind(trimmed)
+                    .bind(text_length)
+                    .bind(offset_index as i64)
+                    .bind(timestamp)
+                    .bind(&engine)
+                    .bind(&device)
+                    .bind(is_input_device)
+                    .bind(segment.start_time)
+                    .bind(segment.end_time)
+                    .bind(segment.speaker_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                }
+
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'transcribed', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?2",
+                )
+                .bind(now)
+                .bind(audio_chunk_id)
+                .execute(&mut **tx.conn())
+                .await?;
+
+                tx.commit().await?;
+                Ok(())
+            }
+
+            ChunkOutcome::Silent | ChunkOutcome::Duplicate => {
+                // Both terminal states from the pipeline's perspective: the
+                // chunk has been considered and we don't want to retry. We use
+                // `transcribed` for Duplicate (we DID transcribe — on the
+                // other device) and `silent` for Silent. The reconciliation
+                // sweep skips both.
+                let status = match outcome {
+                    ChunkOutcome::Silent => "silent",
+                    ChunkOutcome::Duplicate => "transcribed",
+                    _ => unreachable!(),
+                };
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = ?1, \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?2, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?3",
+                )
+                .bind(status)
+                .bind(now)
+                .bind(audio_chunk_id)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+
+            ChunkOutcome::Failed { reason } => {
+                // Transient failure: bump attempts. If we'd hit the cap, flip
+                // to `failed` so the sweep stops re-trying. We do this in one
+                // UPDATE statement so a concurrent attempt can't double-flip.
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = ?2, \
+                         transcription_status = CASE \
+                             WHEN transcription_attempts + 1 >= ?3 THEN 'failed' \
+                             ELSE transcription_status \
+                         END \
+                     WHERE id = ?4",
+                )
+                .bind(now)
+                .bind(&reason)
+                .bind(MAX_TRANSCRIPTION_ATTEMPTS)
+                .bind(audio_chunk_id)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+
+            ChunkOutcome::FailedPermanent { reason } => {
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'failed', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = ?2 \
+                     WHERE id = ?3",
+                )
+                .bind(now)
+                .bind(&reason)
+                .bind(audio_chunk_id)
+                .execute(&self.pool)
+                .await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Mark a chunk as pending for re-transcription. Used by the retranscribe
+    /// endpoint to opt a meeting back into reconciliation with a different
+    /// engine. Existing rows are kept so the UI doesn't flash empty —
+    /// `record_chunk_outcome(Transcribed)` will DELETE them in the same TX as
+    /// the new INSERTs land.
+    pub async fn reset_chunk_for_retranscription(
+        &self,
+        audio_chunk_id: i64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO audio_transcriptions (audio_chunk_id, transcription, text_length, offset_index, timestamp, transcription_engine, device, is_input_device, start_time, end_time, speaker_id)
-             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "UPDATE audio_chunks \
+             SET transcription_status = 'pending', \
+                 transcription_attempts = 0, \
+                 last_transcription_attempt_at = NULL, \
+                 transcription_failure_reason = NULL \
+             WHERE id = ?1",
         )
         .bind(audio_chunk_id)
-        .bind(trimmed)
-        .bind(text_length)
-        .bind(timestamp)
-        .bind(engine)
-        .bind(device)
-        .bind(is_input_device)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(speaker_id)
-        .execute(&mut **tx.conn())
+        .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_diarization_run_with_segments(
+        &self,
+        audio_chunk_id: i64,
+        mode: &str,
+        provider: &str,
+        model: Option<&str>,
+        metadata: Option<&str>,
+        segments: &[NewDiarizationSegment],
+    ) -> Result<Option<i64>, sqlx::Error> {
+        if segments.is_empty() {
+            return Ok(None);
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let diarization_run_id = sqlx::query(
+            "INSERT INTO diarization_runs (audio_chunk_id, mode, provider, model, metadata)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(audio_chunk_id)
+        .bind(mode)
+        .bind(provider)
+        .bind(model)
+        .bind(metadata)
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
+
+        for segment in segments {
+            if segment.end_time <= segment.start_time {
+                debug!(
+                    "skipping invalid diarization segment for chunk {}: {:.3}..{:.3}",
+                    audio_chunk_id, segment.start_time, segment.end_time
+                );
+                continue;
+            }
+
+            let diarization_segment_id = sqlx::query(
+                "INSERT INTO diarization_segments (
+                    diarization_run_id, audio_chunk_id, provider_speaker_label,
+                    speaker_id, source, start_time, end_time, confidence, overlap, metadata
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            )
+            .bind(diarization_run_id)
+            .bind(audio_chunk_id)
+            .bind(segment.provider_speaker_label.as_str())
+            .bind(segment.speaker_id)
+            .bind(segment.source.as_str())
+            .bind(segment.start_time)
+            .bind(segment.end_time)
+            .bind(segment.confidence)
+            .bind(segment.overlap)
+            .bind(segment.metadata.as_deref())
+            .execute(&mut **tx.conn())
+            .await?
+            .last_insert_rowid();
+
+            if let Some(speaker_id) = segment.speaker_id {
+                sqlx::query(
+                    "INSERT INTO speaker_identity_evidence (
+                        speaker_id, diarization_segment_id, audio_chunk_id,
+                        start_time, end_time, source, confidence, approved, metadata
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                )
+                .bind(speaker_id)
+                .bind(diarization_segment_id)
+                .bind(audio_chunk_id)
+                .bind(segment.start_time)
+                .bind(segment.end_time)
+                .bind(segment.source.as_str())
+                .bind(segment.confidence)
+                .bind(segment.source == "manual")
+                .bind(segment.metadata.as_deref())
+                .execute(&mut **tx.conn())
+                .await?;
+            }
+        }
 
         tx.commit().await?;
-        Ok(())
+        Ok(Some(diarization_run_id))
     }
 
     /// Get audio chunks and their transcriptions within a time range.
@@ -1366,6 +1875,29 @@ impl DatabaseManager {
                       at.device, at.is_input_device
                FROM audio_chunks ac
                LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
+               WHERE ac.timestamp >= ?1 AND ac.timestamp <= ?2
+                 AND ac.file_path NOT LIKE 'cloud://%'
+               ORDER BY ac.timestamp ASC"#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Audio chunks for MP4 export: one row per physical chunk file (NOT joined to
+    /// `audio_transcriptions`, which would return a row per transcript segment and cause the same
+    /// file to be mixed in multiple times). Returns `(id, file_path, timestamp)` where `timestamp`
+    /// is the chunk's true file-start, so each chunk can be delayed onto the timeline exactly once.
+    pub async fn get_audio_chunks_in_range_for_export(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(i64, String, DateTime<Utc>)>, SqlxError> {
+        let rows = sqlx::query_as::<_, (i64, String, DateTime<Utc>)>(
+            r#"SELECT ac.id, ac.file_path, ac.timestamp
+               FROM audio_chunks ac
                WHERE ac.timestamp >= ?1 AND ac.timestamp <= ?2
                  AND ac.file_path NOT LIKE 'cloud://%'
                ORDER BY ac.timestamp ASC"#,
@@ -1891,6 +2423,35 @@ impl DatabaseManager {
 
         tx.commit().await?;
 
+        Ok(id)
+    }
+
+    /// Insert a timeline index frame that points into an existing HD video
+    /// chunk. Unlike [`insert_frame`], `video_chunk_id` and `offset_index` are
+    /// explicit (no racy "latest chunk for device" lookup) and no OCR / app
+    /// metadata is attached — the HD recorder writes these as sparse scrub
+    /// markers into a chunk it owns. `snapshot_path` stays NULL so the timeline
+    /// and export resolve the image from `video_chunks.file_path` at
+    /// `offset_index` (the frame's 0-based decode position in the .mp4).
+    pub async fn insert_hd_index_frame(
+        &self,
+        video_chunk_id: i64,
+        offset_index: i64,
+        timestamp: DateTime<Utc>,
+        device_name: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let id = sqlx::query(
+            "INSERT INTO frames (video_chunk_id, offset_index, timestamp, focused, device_name) VALUES (?1, ?2, ?3, 1, ?4)",
+        )
+        .bind(video_chunk_id)
+        .bind(offset_index)
+        .bind(timestamp)
+        .bind(device_name)
+        .execute(&mut **tx.conn())
+        .await?
+        .last_insert_rowid();
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -3152,7 +3713,8 @@ impl DatabaseManager {
             COALESCE(video_chunks.device_name, frames.device_name) as device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
-            frames.focused
+            frames.focused,
+            frames.text_source
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
         LEFT JOIN ocr_text ON frames.id = ocr_text.frame_id
@@ -3222,12 +3784,67 @@ impl DatabaseManager {
                     .unwrap_or_default(),
                 browser_url: raw.browser_url,
                 focused: raw.focused,
+                text_source: raw.text_source,
             })
             .collect())
     }
 
     #[allow(clippy::too_many_arguments)]
     pub async fn search_audio(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        speaker_name: Option<&str>,
+        device_name: Option<&str>,
+        machine_id: Option<&str>,
+    ) -> Result<Vec<AudioResult>, sqlx::Error> {
+        let fetch_limit = limit.saturating_add(offset);
+        let (mut background_results, mut live_results) = tokio::try_join!(
+            self.search_background_audio(
+                query,
+                fetch_limit,
+                0,
+                start_time,
+                end_time,
+                min_length,
+                max_length,
+                speaker_ids.clone(),
+                speaker_name,
+                device_name,
+                machine_id,
+            ),
+            self.search_live_meeting_transcripts(
+                query,
+                fetch_limit,
+                0,
+                start_time,
+                end_time,
+                min_length,
+                max_length,
+                speaker_ids,
+                speaker_name,
+                device_name,
+                machine_id,
+            )
+        )?;
+
+        background_results.append(&mut live_results);
+        background_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(background_results
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_background_audio(
         &self,
         query: &str,
         limit: u32,
@@ -3255,7 +3872,67 @@ impl DatabaseManager {
                 audio_transcriptions.is_input_device,
                 audio_transcriptions.speaker_id,
                 audio_transcriptions.start_time,
-                audio_transcriptions.end_time
+                audio_transcriptions.end_time,
+                (
+                    SELECT dr.mode
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_mode,
+                (
+                    SELECT ds.provider_speaker_label
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_speaker_label,
+                (
+                    SELECT dr.provider
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_provider,
+                (
+                    SELECT ds.source
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_source,
+                (
+                    SELECT ds.confidence
+                    FROM diarization_segments ds
+                    JOIN diarization_runs dr ON dr.id = ds.diarization_run_id
+                    WHERE ds.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds.end_time - audio_transcriptions.end_time) < 0.05
+                    ORDER BY dr.created_at DESC, ds.id DESC
+                    LIMIT 1
+                ) AS diarization_confidence
              FROM audio_transcriptions
              JOIN audio_chunks ON audio_transcriptions.audio_chunk_id = audio_chunks.id
              LEFT JOIN speakers ON audio_transcriptions.speaker_id = speakers.id
@@ -3285,7 +3962,19 @@ impl DatabaseManager {
             conditions.push("(json_array_length(?) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?)))");
         }
         if speaker_name.is_some() {
-            conditions.push("speakers.name LIKE '%' || ? || '%' COLLATE NOCASE");
+            conditions.push(
+                "(speakers.name LIKE '%' || ? || '%' COLLATE NOCASE
+                  OR EXISTS (
+                    SELECT 1
+                    FROM diarization_segments ds_name
+                    WHERE ds_name.audio_chunk_id = audio_transcriptions.audio_chunk_id
+                      AND audio_transcriptions.start_time IS NOT NULL
+                      AND audio_transcriptions.end_time IS NOT NULL
+                      AND ABS(ds_name.start_time - audio_transcriptions.start_time) < 0.05
+                      AND ABS(ds_name.end_time - audio_transcriptions.end_time) < 0.05
+                      AND ds_name.provider_speaker_label LIKE '%' || ? || '%' COLLATE NOCASE
+                  ))",
+            );
         }
         if device_name.is_some() {
             conditions.push("audio_transcriptions.device LIKE '%' || ? || '%'");
@@ -3336,7 +4025,7 @@ impl DatabaseManager {
                 .bind(&speaker_ids_json);
         }
         if let Some(name) = speaker_name {
-            query_builder = query_builder.bind(name);
+            query_builder = query_builder.bind(name).bind(name);
         }
         if let Some(dev) = device_name {
             query_builder = query_builder.bind(dev);
@@ -3352,9 +4041,26 @@ impl DatabaseManager {
         let futures: Vec<_> = results_raw
             .into_iter()
             .map(|raw| async move {
+                let transcription_engine = raw.transcription_engine;
                 let speaker = match raw.speaker_id {
                     Some(id) => (self.get_speaker_by_id(id).await).ok(),
                     None => None,
+                };
+                let speaker_label = speaker
+                    .as_ref()
+                    .and_then(|speaker| {
+                        let name = speaker.name.trim();
+                        (!name.is_empty()).then(|| name.to_string())
+                    })
+                    .or_else(|| raw.diarization_speaker_label.clone());
+                let speaker_provisional =
+                    speaker.is_none() && raw.diarization_speaker_label.is_some();
+                let speaker_source = if speaker.is_some() {
+                    Some("speaker_id".to_string())
+                } else {
+                    raw.diarization_source
+                        .clone()
+                        .or_else(|| raw.diarization_provider.clone())
                 };
 
                 Ok::<AudioResult, sqlx::Error>(AudioResult {
@@ -3363,7 +4069,7 @@ impl DatabaseManager {
                     timestamp: raw.timestamp,
                     file_path: raw.file_path,
                     offset_index: raw.offset_index,
-                    transcription_engine: raw.transcription_engine,
+                    transcription_engine: transcription_engine.clone(),
                     tags: raw
                         .tags
                         .map(|s| s.split(',').map(|s| s.to_owned()).collect())
@@ -3375,13 +4081,172 @@ impl DatabaseManager {
                         DeviceType::Output
                     },
                     speaker,
+                    speaker_label,
+                    speaker_source,
+                    speaker_confidence: raw.diarization_confidence,
+                    speaker_provisional,
                     start_time: raw.start_time,
                     end_time: raw.end_time,
+                    source: Some(
+                        raw.diarization_mode
+                            .unwrap_or_else(|| "background".to_string()),
+                    ),
+                    meeting_id: None,
+                    provider: None,
+                    model: Some(transcription_engine),
                 })
             })
             .collect();
 
         Ok(try_join_all(futures).await?.into_iter().collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn search_live_meeting_transcripts(
+        &self,
+        query: &str,
+        limit: u32,
+        offset: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        speaker_name: Option<&str>,
+        device_name: Option<&str>,
+        machine_id: Option<&str>,
+    ) -> Result<Vec<AudioResult>, sqlx::Error> {
+        if machine_id.is_some() || speaker_ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            return Ok(Vec::new());
+        }
+
+        #[derive(sqlx::FromRow)]
+        struct LiveAudioResultRaw {
+            id: i64,
+            meeting_id: i64,
+            transcription: String,
+            timestamp: String,
+            provider: String,
+            model: Option<String>,
+            device_name: String,
+            device_type: String,
+            speaker_name: Option<String>,
+        }
+
+        let rows = sqlx::query_as::<_, LiveAudioResultRaw>(
+            r#"
+            SELECT
+                id,
+                meeting_id,
+                transcript AS transcription,
+                captured_at AS timestamp,
+                provider,
+                model,
+                device_name,
+                device_type,
+                speaker_name
+            FROM meeting_transcript_segments
+            WHERE (?1 = '' OR transcript LIKE '%' || ?1 || '%' COLLATE NOCASE)
+              AND (?2 IS NULL OR julianday(captured_at) >= julianday(?2))
+              AND (?3 IS NULL OR julianday(captured_at) <= julianday(?3))
+              AND (?4 IS NULL OR LENGTH(transcript) >= ?4)
+              AND (?5 IS NULL OR LENGTH(transcript) <= ?5)
+              AND (?6 IS NULL OR speaker_name LIKE '%' || ?6 || '%' COLLATE NOCASE)
+              AND (?7 IS NULL OR device_name LIKE '%' || ?7 || '%' COLLATE NOCASE)
+            ORDER BY julianday(captured_at) DESC, id DESC
+            LIMIT ?8 OFFSET ?9
+            "#,
+        )
+        .bind(query)
+        .bind(start_time)
+        .bind(end_time)
+        .bind(min_length.map(|v| v as i64))
+        .bind(max_length.map(|v| v as i64))
+        .bind(speaker_name)
+        .bind(device_name)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|raw| {
+                let timestamp = DateTime::parse_from_rfc3339(&raw.timestamp)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or_else(|_| Utc::now());
+                let transcription_engine =
+                    raw.model.clone().unwrap_or_else(|| raw.provider.clone());
+                let speaker_label = raw
+                    .speaker_name
+                    .as_ref()
+                    .and_then(|name| (!name.trim().is_empty()).then(|| name.clone()));
+                let speaker_provisional = speaker_label.is_some();
+                AudioResult {
+                    audio_chunk_id: -raw.id,
+                    transcription: raw.transcription,
+                    timestamp,
+                    file_path: format!("live://meeting/{}/transcript/{}", raw.meeting_id, raw.id),
+                    offset_index: 0,
+                    transcription_engine,
+                    tags: vec!["meeting".to_string(), "live".to_string()],
+                    device_name: raw.device_name,
+                    device_type: if raw.device_type.eq_ignore_ascii_case("output") {
+                        DeviceType::Output
+                    } else {
+                        DeviceType::Input
+                    },
+                    speaker: None,
+                    speaker_label,
+                    speaker_source: speaker_provisional.then(|| "live".to_string()),
+                    speaker_confidence: None,
+                    speaker_provisional,
+                    start_time: None,
+                    end_time: None,
+                    source: Some("live".to_string()),
+                    meeting_id: Some(raw.meeting_id),
+                    provider: Some(raw.provider),
+                    model: raw.model,
+                }
+            })
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn count_live_meeting_transcript_results(
+        &self,
+        query: &str,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        has_speaker_id_filter: bool,
+        speaker_name: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        if has_speaker_id_filter {
+            return Ok(0);
+        }
+
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT COUNT(*)
+            FROM meeting_transcript_segments
+            WHERE (?1 = '' OR transcript LIKE '%' || ?1 || '%' COLLATE NOCASE)
+              AND (?2 IS NULL OR julianday(captured_at) >= julianday(?2))
+              AND (?3 IS NULL OR julianday(captured_at) <= julianday(?3))
+              AND (?4 IS NULL OR LENGTH(transcript) >= ?4)
+              AND (?5 IS NULL OR LENGTH(transcript) <= ?5)
+              AND (?6 IS NULL OR speaker_name LIKE '%' || ?6 || '%' COLLATE NOCASE)
+            "#,
+        )
+        .bind(query)
+        .bind(start_time)
+        .bind(end_time)
+        .bind(min_length.map(|v| v as i64))
+        .bind(max_length.map(|v| v as i64))
+        .bind(speaker_name)
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Get frame location for serving.
@@ -3454,6 +4319,40 @@ impl DatabaseManager {
         .fetch_all(&self.pool)
         .await?;
         Ok(ids)
+    }
+
+    /// Get all frames within a time range for meeting/video export.
+    ///
+    /// Returns `(frame_id, file_path, offset_index, timestamp, is_snapshot)` ordered by
+    /// timestamp. `file_path` is the snapshot JPEG for snapshot frames, otherwise the backing
+    /// video chunk. Resolving everything in one query avoids an N+1 per-frame `get_frame` call
+    /// and gives the caller real per-frame timestamps to compute display durations.
+    pub async fn get_frames_in_range_for_export(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<Vec<(i64, String, i64, DateTime<Utc>, bool)>, SqlxError> {
+        let rows = sqlx::query_as::<_, (i64, String, i64, DateTime<Utc>, bool)>(
+            r#"
+            SELECT
+                frames.id,
+                COALESCE(frames.snapshot_path, video_chunks.file_path) as file_path,
+                frames.offset_index,
+                frames.timestamp,
+                CASE WHEN frames.snapshot_path IS NOT NULL AND frames.snapshot_path != ''
+                     THEN 1 ELSE 0 END as is_snapshot
+            FROM frames
+            LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+            WHERE frames.timestamp >= ?1 AND frames.timestamp <= ?2
+              AND COALESCE(frames.snapshot_path, video_chunks.file_path) IS NOT NULL
+            ORDER BY frames.timestamp ASC
+            "#,
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// Get frames near a given frame_id for validation/fallback.
@@ -3687,6 +4586,7 @@ impl DatabaseManager {
             }
         }
 
+        let has_speaker_id_filter = speaker_ids.as_ref().is_some_and(|ids| !ids.is_empty());
         let json_array = if let Some(ids) = speaker_ids {
             if !ids.is_empty() {
                 serde_json::to_string(&ids).unwrap_or_default()
@@ -3888,7 +4788,19 @@ impl DatabaseManager {
                 if let Some(name) = speaker_name {
                     query_builder = query_builder.bind(name);
                 }
-                query_builder.fetch_one(&self.pool).await?
+                let background_count: i64 = query_builder.fetch_one(&self.pool).await?;
+                let live_count = self
+                    .count_live_meeting_transcript_results(
+                        query,
+                        start_time,
+                        end_time,
+                        min_length,
+                        max_length,
+                        has_speaker_id_filter,
+                        speaker_name,
+                    )
+                    .await?;
+                background_count + live_count
             }
             _ => return Ok(0),
         };
@@ -4238,13 +5150,47 @@ impl DatabaseManager {
         LIMIT 10000
         "#;
 
+        // Live meeting transcripts live in a SEPARATE table (meeting_transcript_segments)
+        // and are NOT in audio_transcriptions: when a meeting is transcribed live,
+        // mark_chunks_covered_by_live() flags the underlying chunks 'transcribed' so the
+        // background reconciler skips them — leaving no audio_transcriptions row for that
+        // window. Without this query a fully-transcribed live meeting shows as a BLANK
+        // stretch on the timeline even though the in-app Meeting view (which already
+        // UNIONs both tables) shows it. Columns are aliased to match audio_query so the
+        // same row-processing path below handles both. There is no audio file / chunk for
+        // a live segment, so audio_path='' and audio_chunk_id=-1 (transcript-only entry).
+        let live_query = r#"
+        SELECT
+            mts.captured_at AS timestamp,
+            mts.transcript AS transcription,
+            mts.device_name AS audio_device,
+            CASE WHEN mts.device_type = 'input' THEN 1 ELSE 0 END AS is_input_device,
+            '' AS audio_path,
+            -1 AS audio_chunk_id,
+            NULL AS start_time,
+            NULL AS end_time,
+            mts.speaker_name AS speaker_name,
+            NULL AS speaker_id,
+            0.0 AS duration_secs
+        FROM meeting_transcript_segments mts
+        WHERE julianday(mts.captured_at) >= julianday(?1)
+          AND julianday(mts.captured_at) <= julianday(?2)
+          AND TRIM(mts.transcript) != ''
+        ORDER BY julianday(mts.captured_at) DESC
+        LIMIT 10000
+        "#;
+
         // Execute queries in parallel
-        let (frame_rows, audio_rows) = tokio::try_join!(
+        let (frame_rows, audio_rows, live_rows) = tokio::try_join!(
             sqlx::query(frames_query)
                 .bind(start)
                 .bind(end)
                 .fetch_all(&self.pool),
             sqlx::query(audio_query)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&self.pool),
+            sqlx::query(live_query)
                 .bind(start)
                 .bind(end)
                 .fetch_all(&self.pool)
@@ -4300,7 +5246,36 @@ impl DatabaseManager {
         //   to one fallback frame, making it invisible on most of the timeline
         const AUDIO_FRAME_PAD_SECS: i64 = 15;
 
-        for row in audio_rows {
+        // Suppress live rows that duplicate a background transcription of the same
+        // moment (±15s). Normally the two paths are complementary — live-covered
+        // chunks get no audio_transcriptions row — so this only trims rare overlap
+        // (e.g. audio batch-transcribed before the meeting was detected).
+        const LIVE_DEDUP_WINDOW_MS: i64 = 15_000;
+        let mut background_ts_ms: Vec<i64> = audio_rows
+            .iter()
+            .filter_map(|r| r.try_get::<DateTime<Utc>, _>("timestamp").ok())
+            .map(|t| t.timestamp_millis())
+            .collect();
+        background_ts_ms.sort_unstable();
+        let live_rows: Vec<_> = live_rows
+            .into_iter()
+            .filter(|r| match r.try_get::<DateTime<Utc>, _>("timestamp") {
+                Ok(ts) => {
+                    let ts_ms = ts.timestamp_millis();
+                    let lo =
+                        background_ts_ms.partition_point(|&t| t < ts_ms - LIVE_DEDUP_WINDOW_MS);
+                    // keep the live row only if NO background row falls within ±window
+                    background_ts_ms
+                        .get(lo)
+                        .is_none_or(|&t| t > ts_ms + LIVE_DEDUP_WINDOW_MS)
+                }
+                Err(_) => false,
+            })
+            .collect();
+
+        // Background (audio_transcriptions) and live (meeting_transcript_segments) rows
+        // share the same aliased columns, so a single loop attaches both to frames.
+        for row in audio_rows.into_iter().chain(live_rows) {
             let audio_timestamp: DateTime<Utc> = row.get("timestamp");
             let start_offset: Option<f64> = row.try_get("start_time").ok();
             let end_offset: Option<f64> = row.try_get("end_time").ok();
@@ -4933,34 +5908,52 @@ impl DatabaseManager {
     pub async fn delete_speaker(&self, id: i64) -> Result<(), sqlx::Error> {
         let mut tx = self.begin_immediate_with_retry().await?;
 
-        // Array of (query, operation description) tuples
+        // Collect candidate chunk IDs before deleting transcriptions
+        let candidate_chunk_ids: Vec<(i64,)> = sqlx::query_as(
+            "SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE speaker_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // Delete in FK-safe order: transcriptions first (they reference chunks), then chunks
         let operations = [
             (
                 "DELETE FROM audio_transcriptions WHERE speaker_id = ?",
                 "audio transcriptions",
             ),
             (
-                "DELETE FROM audio_chunks WHERE id IN (SELECT audio_chunk_id FROM audio_transcriptions WHERE speaker_id = ? AND start_time IS NULL)",
-                "audio chunks",
-            ),
-            (
                 "DELETE FROM speaker_embeddings WHERE speaker_id = ?",
                 "speaker embeddings",
             ),
-            (
-                "DELETE FROM speakers WHERE id = ?",
-                "speaker",
-            ),
+            ("DELETE FROM speakers WHERE id = ?", "speaker"),
         ];
 
-        // Execute each deletion operation
         for (query, operation) in operations {
             if let Err(e) = sqlx::query(query).bind(id).execute(&mut **tx.conn()).await {
                 error!("Failed to delete {} for speaker {}: {}", operation, id, e);
-                // tx will rollback automatically on drop
                 return Err(e);
             }
             debug!("Successfully deleted {} for speaker {}", operation, id);
+        }
+
+        // Delete only orphaned chunks (not referenced by any remaining transcription)
+        for (chunk_id,) in &candidate_chunk_ids {
+            if let Err(e) = sqlx::query(
+                "DELETE FROM audio_chunks WHERE id = ? \
+                 AND NOT EXISTS (SELECT 1 FROM audio_transcriptions WHERE audio_chunk_id = ?)",
+            )
+            .bind(chunk_id)
+            .bind(chunk_id)
+            .execute(&mut **tx.conn())
+            .await
+            {
+                error!(
+                    "Failed to delete audio chunk {} for speaker {}: {}",
+                    chunk_id, id, e
+                );
+                return Err(e);
+            }
         }
 
         tx.commit().await.map_err(|e| {
@@ -6339,7 +7332,7 @@ impl DatabaseManager {
             // the entire result set, hiding results from other apps.
             format!(
                 r#"
-SELECT id, timestamp, url, app_name, window_name, ocr_text, text_json, accessibility_tree_json FROM (
+SELECT id, timestamp, url, app_name, window_name, ocr_text, text_json, accessibility_tree_json, text_source FROM (
     SELECT
         f.id,
         f.timestamp,
@@ -6349,6 +7342,7 @@ SELECT id, timestamp, url, app_name, window_name, ocr_text, text_json, accessibi
         COALESCE(f.full_text, o.text, f.accessibility_text, '') as ocr_text,
         o.text_json,
         f.accessibility_tree_json,
+        f.text_source,
         ROW_NUMBER() OVER (
             PARTITION BY COALESCE(f.app_name, o.app_name, '')
             ORDER BY f.timestamp {order_dir}, {relevance} DESC
@@ -6377,7 +7371,8 @@ SELECT
     COALESCE(f.window_name, o.window_name) as window_name,
     COALESCE(f.full_text, o.text, f.accessibility_text, '') as ocr_text,
     o.text_json,
-    f.accessibility_tree_json
+    f.accessibility_tree_json,
+    f.text_source
 FROM frames f
 LEFT JOIN ocr_text o ON f.id = o.frame_id
 WHERE {}
@@ -6445,6 +7440,7 @@ LIMIT ? OFFSET ?
                     confidence: calculate_confidence(&positions),
                     text: row.ocr_text.clone(),
                     url: row.url.clone(),
+                    text_source: row.text_source.clone(),
                 }
             })
             .collect())
@@ -6768,6 +7764,9 @@ LIMIT ? OFFSET ?
                 confidence: 0.0,
                 text: String::new(),
                 url: row.url,
+                // FrameRowLight skips text/text_source for speed; grouped
+                // results don't surface text to clients, so None is fine.
+                text_source: None,
             })
             .collect())
     }
@@ -7236,35 +8235,10 @@ LIMIT ? OFFSET ?
     /// Insert a UI event via the write coalescing queue.
     pub async fn insert_ui_event(&self, event: &InsertUiEvent) -> Result<i64, sqlx::Error> {
         use crate::write_queue::{WriteOp, WriteResult};
-        let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
         let result = self
             .write_queue
             .submit(WriteOp::InsertUiEvent {
-                timestamp: event.timestamp.to_rfc3339(),
-                session_id: event.session_id.clone(),
-                relative_ms: event.relative_ms,
-                event_type: event.event_type.to_string(),
-                x: event.x,
-                y: event.y,
-                delta_x: event.delta_x.map(|v| v as i32),
-                delta_y: event.delta_y.map(|v| v as i32),
-                button: event.button.map(|v| v as i32),
-                click_count: event.click_count.map(|v| v as i32),
-                key_code: event.key_code.map(|v| v as i32),
-                modifiers: event.modifiers.map(|v| v as i32),
-                text_content: event.text_content.clone(),
-                text_length,
-                app_name: event.app_name.clone(),
-                app_pid: event.app_pid,
-                window_title: event.window_title.clone(),
-                browser_url: event.browser_url.clone(),
-                element_role: event.element_role.clone(),
-                element_name: event.element_name.clone(),
-                element_value: event.element_value.clone(),
-                element_description: event.element_description.clone(),
-                element_automation_id: event.element_automation_id.clone(),
-                element_bounds: event.element_bounds.clone(),
-                frame_id: event.frame_id,
+                event: Self::ui_event_write(event),
             })
             .await?;
         match result {
@@ -7273,20 +8247,77 @@ LIMIT ? OFFSET ?
         }
     }
 
-    /// Insert multiple UI events via the write coalescing queue.
+    /// Insert multiple UI events via the write coalescing queue. Returns
+    /// one row id per inserted event, in the same order as `events`. The
+    /// frame linker pairs these with correlation ids assigned by the
+    /// recorder before flush.
     pub async fn insert_ui_events_batch(
         &self,
         events: &[InsertUiEvent],
-    ) -> Result<usize, sqlx::Error> {
+    ) -> Result<Vec<i64>, sqlx::Error> {
         if events.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
-        let mut count = 0;
-        for event in events {
-            self.insert_ui_event(event).await?;
-            count += 1;
+        use crate::write_queue::{WriteOp, WriteResult};
+        let events = events.iter().map(Self::ui_event_write).collect();
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertUiEventsBatch { events })
+            .await?;
+        match result {
+            WriteResult::Ids(ids) => Ok(ids),
+            _ => unreachable!(),
         }
-        Ok(count)
+    }
+
+    /// Set `ui_events.frame_id` for a previously inserted row. Idempotent:
+    /// the `WHERE frame_id IS NULL` guard prevents overwriting an
+    /// already-linked frame if a duplicate update arrives.
+    pub async fn update_ui_event_frame_id(
+        &self,
+        row_id: i64,
+        frame_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::UpdateUiEventFrameId { row_id, frame_id })
+            .await?;
+        match result {
+            WriteResult::Unit => Ok(()),
+            _ => unreachable!(),
+        }
+    }
+
+    fn ui_event_write(event: &InsertUiEvent) -> crate::write_queue::UiEventWrite {
+        let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
+        crate::write_queue::UiEventWrite {
+            timestamp: event.timestamp.to_rfc3339(),
+            session_id: event.session_id.clone(),
+            relative_ms: event.relative_ms,
+            event_type: event.event_type.to_string(),
+            x: event.x,
+            y: event.y,
+            delta_x: event.delta_x.map(|v| v as i32),
+            delta_y: event.delta_y.map(|v| v as i32),
+            button: event.button.map(|v| v as i32),
+            click_count: event.click_count.map(|v| v as i32),
+            key_code: event.key_code.map(|v| v as i32),
+            modifiers: event.modifiers.map(|v| v as i32),
+            text_content: event.text_content.clone(),
+            text_length,
+            app_name: event.app_name.clone(),
+            app_pid: event.app_pid,
+            window_title: event.window_title.clone(),
+            browser_url: event.browser_url.clone(),
+            element_role: event.element_role.clone(),
+            element_name: event.element_name.clone(),
+            element_value: event.element_value.clone(),
+            element_description: event.element_description.clone(),
+            element_automation_id: event.element_automation_id.clone(),
+            element_bounds: event.element_bounds.clone(),
+            frame_id: event.frame_id,
+        }
     }
 
     // ============================================================================
@@ -7447,6 +8478,12 @@ LIMIT ? OFFSET ?
     }
 
     // ── Meeting persistence ──────────────────────────────────────────
+    //
+    // `meetings.end_reason` distinguishes how a meeting was finalized so the
+    // auto-merge logic in `find_recent_meeting_for_app` can avoid re-attaching
+    // a brand-new meeting to a row the user just explicitly closed. See the
+    // `MEETING_END_REASON_*` constants below — these are the canonical values
+    // and the only strings that should be written to the column.
 
     pub async fn insert_meeting(
         &self,
@@ -7474,10 +8511,20 @@ LIMIT ? OFFSET ?
         Ok(id)
     }
 
-    pub async fn end_meeting(&self, id: i64, meeting_end: &str) -> Result<(), SqlxError> {
+    /// End a meeting and persist the reason it ended. `end_reason` should be
+    /// one of the `MEETING_END_REASON_*` constants (or `None` for legacy /
+    /// natural grace-timeout ends). The reason drives the auto-merge filter
+    /// in [`Self::find_recent_meeting_for_app`] — explicit stops are excluded.
+    pub async fn end_meeting(
+        &self,
+        id: i64,
+        meeting_end: &str,
+        end_reason: Option<&str>,
+    ) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        sqlx::query("UPDATE meetings SET meeting_end = ?1 WHERE id = ?2")
-            .bind(meeting_end)
+        sqlx::query("UPDATE meetings SET meeting_end = ?1, end_reason = ?2 WHERE id = ?3")
+            .bind(normalize_timestamp_for_range_query(meeting_end))
+            .bind(end_reason)
             .bind(id)
             .execute(&mut **tx.conn())
             .await?;
@@ -7496,7 +8543,10 @@ LIMIT ? OFFSET ?
                 .await?;
 
         let (start, end) = match row {
-            Some((s, Some(e))) => (s, e),
+            Some((s, Some(e))) => (
+                normalize_timestamp_for_range_query(&s),
+                normalize_timestamp_for_range_query(&e),
+            ),
             _ => return Ok(None),
         };
 
@@ -7564,7 +8614,10 @@ LIMIT ? OFFSET ?
                 .await?;
 
         let (start, end) = match row {
-            Some((s, Some(e))) => (s, e),
+            Some((s, Some(e))) => (
+                normalize_timestamp_for_range_query(&s),
+                normalize_timestamp_for_range_query(&e),
+            ),
             _ => return Ok(None),
         };
 
@@ -7596,14 +8649,19 @@ LIMIT ? OFFSET ?
     /// End a meeting and optionally append auto-collected context (typed
     /// text + edited files) to its note. Both blocks come from the same
     /// `[meeting_start, meeting_end]` time window.
+    ///
+    /// `end_reason` is one of the `MEETING_END_REASON_*` constants (or
+    /// `None`). Callers in routes/meetings.rs pass `Some(EXPLICIT_STOP)` so
+    /// the auto-merge logic skips this row on the next detection cycle.
     pub async fn end_meeting_with_typed_text(
         &self,
         id: i64,
         meeting_end: &str,
         append_typed_text: bool,
+        end_reason: Option<&str>,
     ) -> Result<(), SqlxError> {
         // First end the meeting so the time range is set
-        self.end_meeting(id, meeting_end).await?;
+        self.end_meeting(id, meeting_end, end_reason).await?;
 
         if !append_typed_text {
             return Ok(());
@@ -7653,9 +8711,15 @@ LIMIT ? OFFSET ?
         Ok(())
     }
 
+    /// Reopen a previously-ended meeting (clears both `meeting_end` and
+    /// `end_reason`). Used by the auto-merge path and the manual "resume
+    /// meeting" API. Clearing `end_reason` is intentional: if the user
+    /// explicitly stopped and then asked to resume, the explicit-stop tag
+    /// no longer applies — the row is active again and shouldn't be
+    /// excluded from future merges if it later ends naturally.
     pub async fn reopen_meeting(&self, id: i64) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
-        sqlx::query("UPDATE meetings SET meeting_end = NULL WHERE id = ?1")
+        sqlx::query("UPDATE meetings SET meeting_end = NULL, end_reason = NULL WHERE id = ?1")
             .bind(id)
             .execute(&mut **tx.conn())
             .await?;
@@ -7668,60 +8732,160 @@ LIMIT ? OFFSET ?
         let now = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
-        let rows = sqlx::query("UPDATE meetings SET meeting_end = ?1 WHERE meeting_end IS NULL AND detection_source != 'manual'")
-            .bind(&now)
-            .execute(&mut **tx.conn())
-            .await?
-            .rows_affected();
+        let rows = sqlx::query(
+            "UPDATE meetings
+             SET meeting_end = ?1, end_reason = ?2
+             WHERE meeting_end IS NULL
+               AND (
+                 detection_source != 'manual'
+                 OR julianday(meeting_start) <= julianday(?1) - 0.5
+               )",
+        )
+        .bind(&now)
+        .bind(MEETING_END_REASON_AUTO_END)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
         tx.commit().await?;
         Ok(rows)
     }
 
     pub async fn has_active_meeting(&self) -> Result<bool, SqlxError> {
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM meetings WHERE meeting_end IS NULL")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.0 > 0)
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut conn = self.pool.acquire().await?;
+            match sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM meetings WHERE meeting_end IS NULL",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            {
+                Ok(row) => return Ok(row.0 > 0),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: has_active_meeting read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
     }
 
     pub async fn get_active_meeting_by_id(
         &self,
         id: i64,
     ) -> Result<Option<MeetingRecord>, SqlxError> {
-        let meeting = sqlx::query_as::<_, MeetingRecord>(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
-             detection_source, created_at FROM meetings WHERE id = ?1 AND meeting_end IS NULL",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(meeting)
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut conn = self.pool.acquire().await?;
+            match sqlx::query_as::<_, MeetingRecord>(
+                "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
+                 detection_source, created_at FROM meetings WHERE id = ?1 AND meeting_end IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(&mut *conn)
+            .await
+            {
+                Ok(meeting) => return Ok(meeting),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: get_active_meeting_by_id read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
     }
 
     pub async fn get_most_recent_active_meeting_id(&self) -> Result<Option<i64>, SqlxError> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT id FROM meetings WHERE meeting_end IS NULL ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| r.0))
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut conn = self.pool.acquire().await?;
+            match sqlx::query_as::<_, (i64,)>(
+                "SELECT id FROM meetings WHERE meeting_end IS NULL ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+            {
+                Ok(row) => return Ok(row.map(|r| r.0)),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: get_most_recent_active_meeting_id read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
     }
 
     pub async fn get_most_recent_active_meeting(&self) -> Result<Option<MeetingRecord>, SqlxError> {
-        let meeting = sqlx::query_as::<_, MeetingRecord>(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
-             detection_source, created_at FROM meetings WHERE meeting_end IS NULL \
-             ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(meeting)
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut conn = self.pool.acquire().await?;
+            match sqlx::query_as::<_, MeetingRecord>(
+                "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
+                 detection_source, created_at FROM meetings WHERE meeting_end IS NULL \
+                 ORDER BY id DESC LIMIT 1",
+            )
+            .fetch_optional(&mut *conn)
+            .await
+            {
+                Ok(meeting) => return Ok(meeting),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: get_most_recent_active_meeting read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
     }
 
     pub async fn list_meetings(
         &self,
         start_time: Option<&str>,
         end_time: Option<&str>,
+        query: Option<&str>,
         limit: u32,
         offset: u32,
     ) -> Result<Vec<MeetingRecord>, SqlxError> {
@@ -7730,46 +8894,581 @@ LIMIT ? OFFSET ?
              detection_source, created_at FROM meetings WHERE 1=1",
         );
         if start_time.is_some() {
-            sql.push_str(" AND meeting_start >= ?1");
+            sql.push_str(" AND meeting_start >= ?");
         }
         if end_time.is_some() {
-            sql.push_str(if start_time.is_some() {
-                " AND meeting_start <= ?2"
-            } else {
-                " AND meeting_start <= ?1"
-            });
+            sql.push_str(" AND meeting_start <= ?");
         }
-        sql.push_str(" ORDER BY meeting_start DESC");
-        sql.push_str(if start_time.is_some() && end_time.is_some() {
-            " LIMIT ?3 OFFSET ?4"
-        } else if start_time.is_some() || end_time.is_some() {
-            " LIMIT ?2 OFFSET ?3"
-        } else {
-            " LIMIT ?1 OFFSET ?2"
-        });
+        if query.is_some() {
+            sql.push_str(
+                " AND (LOWER(IFNULL(title, '')) LIKE ? \
+                 OR LOWER(IFNULL(attendees, '')) LIKE ? \
+                 OR LOWER(IFNULL(note, '')) LIKE ?)",
+            );
+        }
+        sql.push_str(" ORDER BY meeting_start DESC LIMIT ? OFFSET ?");
 
-        let mut query = sqlx::query_as::<_, MeetingRecord>(&sql);
-        if let Some(st) = start_time {
-            query = query.bind(st);
-        }
-        if let Some(et) = end_time {
-            query = query.bind(et);
-        }
-        query = query.bind(limit).bind(offset);
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut q = sqlx::query_as::<_, MeetingRecord>(&sql);
+            if let Some(st) = start_time {
+                q = q.bind(st);
+            }
+            if let Some(et) = end_time {
+                q = q.bind(et);
+            }
+            if let Some(qs) = query {
+                let pattern = format!("%{}%", qs.to_lowercase());
+                q = q.bind(pattern.clone()).bind(pattern.clone()).bind(pattern);
+            }
+            q = q.bind(limit).bind(offset);
 
-        let meetings = query.fetch_all(&self.pool).await?;
-        Ok(meetings)
+            let mut conn = self.pool.acquire().await?;
+            match q.fetch_all(&mut *conn).await {
+                Ok(meetings) => return Ok(meetings),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: list_meetings read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
     }
 
     pub async fn get_meeting_by_id(&self, id: i64) -> Result<MeetingRecord, SqlxError> {
-        let meeting = sqlx::query_as::<_, MeetingRecord>(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
-             detection_source, created_at FROM meetings WHERE id = ?1",
+        let max_retries = 3;
+        let mut last_error = None;
+        for attempt in 1..=max_retries {
+            let mut conn = self.pool.acquire().await?;
+            match sqlx::query_as::<_, MeetingRecord>(
+                "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
+                 detection_source, created_at FROM meetings WHERE id = ?1",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            {
+                Ok(meeting) => return Ok(meeting),
+                Err(e) if crate::sqlite_error::should_recycle_sqlite_connection(&e) => {
+                    warn!(
+                        "db: get_meeting_by_id read connection error (attempt {}/{}), detaching connection: {}",
+                        attempt, max_retries, e
+                    );
+                    let _raw = conn.detach();
+                    if attempt < max_retries {
+                        last_error = Some(e);
+                        tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_meeting_transcript_segment(
+        &self,
+        meeting_id: i64,
+        provider: &str,
+        model: Option<&str>,
+        item_id: &str,
+        device_name: &str,
+        device_type: &str,
+        speaker_name: Option<&str>,
+        transcript: &str,
+        captured_at: DateTime<Utc>,
+    ) -> Result<i64, SqlxError> {
+        let trimmed = transcript.trim();
+        if trimmed.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO meeting_transcript_segments \
+             (meeting_id, provider, model, item_id, device_name, device_type, speaker_name, transcript, captured_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
-        .bind(id)
-        .fetch_one(&self.pool)
+        .bind(meeting_id)
+        .bind(provider)
+        .bind(model)
+        .bind(item_id)
+        .bind(device_name)
+        .bind(device_type)
+        .bind(speaker_name)
+        .bind(trimmed)
+        .bind(captured_at.to_rfc3339())
+        .execute(&mut **tx.conn())
         .await?;
-        Ok(meeting)
+
+        let id = if result.rows_affected() == 0 {
+            0
+        } else {
+            result.last_insert_rowid()
+        };
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    pub async fn delete_meeting_transcript_segments(
+        &self,
+        meeting_id: i64,
+    ) -> Result<u64, SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let rows = sqlx::query("DELETE FROM meeting_transcript_segments WHERE meeting_id = ?1")
+            .bind(meeting_id)
+            .execute(&mut **tx.conn())
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    pub async fn replace_meeting_transcript_segments(
+        &self,
+        meeting_id: i64,
+        segments: &[NewMeetingTranscriptSegment],
+    ) -> Result<(u64, usize), SqlxError> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let deleted = sqlx::query("DELETE FROM meeting_transcript_segments WHERE meeting_id = ?1")
+            .bind(meeting_id)
+            .execute(&mut **tx.conn())
+            .await?
+            .rows_affected();
+
+        let mut inserted = 0usize;
+        for segment in segments {
+            let trimmed = segment.transcript.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let result = sqlx::query(
+                "INSERT INTO meeting_transcript_segments \
+                 (meeting_id, provider, model, item_id, device_name, device_type, speaker_name, transcript, captured_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )
+            .bind(meeting_id)
+            .bind(&segment.provider)
+            .bind(segment.model.as_deref())
+            .bind(&segment.item_id)
+            .bind(&segment.device_name)
+            .bind(&segment.device_type)
+            .bind(segment.speaker_name.as_deref())
+            .bind(trimmed)
+            .bind(segment.captured_at.to_rfc3339())
+            .execute(&mut **tx.conn())
+            .await?;
+
+            if result.rows_affected() > 0 {
+                inserted += 1;
+            }
+        }
+
+        tx.commit().await?;
+        Ok((deleted, inserted))
+    }
+
+    /// Mark `audio_chunks` within a meeting's window as `transcribed` when a
+    /// live `meeting_transcript_segments` row sits within
+    /// `coverage_window_secs` of the chunk's timestamp. This stops the
+    /// background reconciler from re-running STT on audio the live provider
+    /// already covered — without that, every live-transcribed meeting also
+    /// gets fully re-transcribed by Whisper after it ends, doubling battery,
+    /// CPU, storage, and the rows the UI reads back.
+    ///
+    /// Chunks far from any live segment (live dropped mid-meeting, etc.)
+    /// stay `pending` so reconciliation can still backfill those gaps.
+    ///
+    /// Trade-off: marked chunks won't get a background-engine row in
+    /// `audio_transcriptions`, so they don't contribute to global speaker
+    /// embedding/backfill. Users who need full-quality archival can run the
+    /// retranscribe API, which resets `transcription_status='pending'`.
+    pub async fn mark_chunks_covered_by_live(
+        &self,
+        meeting_id: i64,
+        coverage_window_secs: f64,
+    ) -> Result<u64, SqlxError> {
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let coverage_days = coverage_window_secs / 86_400.0;
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let rows = sqlx::query(
+            r#"
+            UPDATE audio_chunks
+            SET transcription_status = 'transcribed',
+                last_transcription_attempt_at = ?1,
+                transcription_failure_reason = NULL
+            WHERE transcription_status = 'pending'
+              AND julianday(timestamp) >= julianday(
+                    (SELECT meeting_start FROM meetings WHERE id = ?2)
+                  )
+              AND julianday(timestamp) <= julianday(
+                    COALESCE(
+                        (SELECT meeting_end FROM meetings WHERE id = ?2),
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    )
+                  )
+              AND EXISTS (
+                  SELECT 1 FROM meeting_transcript_segments mts
+                  WHERE mts.meeting_id = ?2
+                    AND ABS(julianday(mts.captured_at) - julianday(audio_chunks.timestamp)) <= ?3
+                    AND instr(audio_chunks.file_path, mts.device_name) > 0
+                    AND instr(lower(audio_chunks.file_path), '(' || lower(mts.device_type) || ')') > 0
+              )
+            "#,
+        )
+        .bind(&now)
+        .bind(meeting_id)
+        .bind(coverage_days)
+        .execute(&mut **tx.conn())
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Mirror a finished meeting's live transcript finals into `audio_transcriptions`
+    /// so EVERY surface that reads that table (timeline, `/search`, pipes,
+    /// activity-summary, speaker tooling) and the PII-redaction worker see them.
+    ///
+    /// Live finals live in `meeting_transcript_segments`, and the matching audio
+    /// chunks were flagged 'transcribed' by `mark_chunks_covered_by_live`, so the
+    /// background reconciler never wrote an `audio_transcriptions` row for them. We
+    /// copy the already-computed text in (NO re-transcription / STT), associating
+    /// each segment with the nearest covering chunk so playback + JOINs work.
+    ///
+    /// Notes:
+    /// - Idempotent: `INSERT OR IGNORE` on `UNIQUE(audio_chunk_id, transcription)`.
+    /// - `speaker_id` is left NULL — live diarization stores a free-text
+    ///   `speaker_name`, not a `speakers.id`; the Meeting view still shows the live
+    ///   row's speaker (it reads `meeting_transcript_segments` directly).
+    /// - Segments with no covering chunk within `coverage_window_secs` are skipped
+    ///   (the timeline still surfaces them live via `find_video_chunks`).
+    /// - `timestamp` is bound as a `DateTime<Utc>` so its on-disk format matches
+    ///   every other `audio_transcriptions` row (range queries stay consistent).
+    pub async fn mirror_live_meeting_to_audio_transcriptions(
+        &self,
+        meeting_id: i64,
+        coverage_window_secs: f64,
+    ) -> Result<u64, SqlxError> {
+        struct Seg {
+            transcript: String,
+            device_name: String,
+            is_input: bool,
+            captured_at: DateTime<Utc>,
+        }
+
+        // Read phase (read pool — no write lock held while we gather).
+        let seg_rows = sqlx::query(
+            "SELECT transcript, device_name, device_type, captured_at \
+             FROM meeting_transcript_segments \
+             WHERE meeting_id = ?1 AND TRIM(transcript) != ''",
+        )
+        .bind(meeting_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let segs: Vec<Seg> = seg_rows
+            .iter()
+            .filter_map(|r| {
+                Some(Seg {
+                    transcript: r.try_get("transcript").ok()?,
+                    device_name: r.try_get("device_name").unwrap_or_default(),
+                    is_input: r.try_get::<String, _>("device_type").ok()? == "input",
+                    captured_at: r.try_get("captured_at").ok()?,
+                })
+            })
+            .collect();
+        if segs.is_empty() {
+            return Ok(0);
+        }
+
+        let window = chrono::Duration::milliseconds((coverage_window_secs * 1000.0) as i64);
+        let min_ts = segs.iter().map(|s| s.captured_at).min().unwrap() - window;
+        let max_ts = segs.iter().map(|s| s.captured_at).max().unwrap() + window;
+
+        // Candidate chunks across the meeting window, fetched ONCE (a 40-min meeting
+        // is ~80 chunks), then matched in memory — avoids a per-segment query. We
+        // pull file_path because chunk audio is single-device and the device is
+        // encoded in the filename ("<name> (input|output)_<ts>.mp4"), which is the
+        // only place a chunk records its device. Never fall back to a different
+        // device: mic and system audio are separate tracks, and mirroring a remote
+        // speaker segment onto a mic chunk makes later playback/search look like the
+        // wrong source was recorded.
+        let chunk_rows = sqlx::query(
+            "SELECT id, timestamp, file_path FROM audio_chunks \
+             WHERE timestamp IS NOT NULL \
+               AND julianday(timestamp) >= julianday(?1) \
+               AND julianday(timestamp) <= julianday(?2)",
+        )
+        .bind(min_ts)
+        .bind(max_ts)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let chunks: Vec<(i64, i64, String)> = chunk_rows
+            .iter()
+            .filter_map(|r| {
+                let id: i64 = r.try_get("id").ok()?;
+                let ts: DateTime<Utc> = r.try_get("timestamp").ok()?;
+                // Lowercased for case-insensitive device matching (mirrors #3776's
+                // lower(file_path) in mark_chunks_covered_by_live).
+                let file_path: String = r.try_get::<String, _>("file_path").unwrap_or_default();
+                Some((id, ts.timestamp_millis(), file_path.to_lowercase()))
+            })
+            .collect();
+        if chunks.is_empty() {
+            return Ok(0);
+        }
+
+        let window_ms = (coverage_window_secs * 1000.0) as i64;
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let mut inserted: u64 = 0;
+        for s in &segs {
+            let seg_ms = s.captured_at.timestamp_millis();
+            // Match the SAME physical device's chunk so an input (mic) segment can't
+            // inherit a remote speaker from a System Audio (output) chunk, and vice
+            // versa. The device string is sanitized the same way the recorder names
+            // files (only '/' and '\\' replaced). If no same-device chunk exists,
+            // skip the mirror and leave the chunk pending for backfill rather than
+            // corrupting source attribution.
+            let device_key = format!(
+                "{} ({})",
+                s.device_name,
+                if s.is_input { "input" } else { "output" }
+            )
+            .replace(['/', '\\'], "_")
+            .to_lowercase();
+            let pick = chunks
+                .iter()
+                .filter(|c| (c.1 - seg_ms).abs() <= window_ms && c.2.contains(device_key.as_str()))
+                .min_by_key(|c| (c.1 - seg_ms).abs());
+            let Some(chunk) = pick else {
+                continue;
+            };
+            let chunk_id = chunk.0;
+            let text_length = s.transcript.len() as i64;
+            let res = sqlx::query(
+                "INSERT OR IGNORE INTO audio_transcriptions \
+                 (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, \
+                  device, is_input_device, speaker_id, start_time, end_time, text_length) \
+                 VALUES (?1, ?2, 0, ?3, 'live', ?4, ?5, NULL, 0, 0, ?6)",
+            )
+            .bind(chunk_id)
+            .bind(&s.transcript)
+            .bind(s.captured_at)
+            .bind(&s.device_name)
+            .bind(s.is_input)
+            .bind(text_length)
+            .execute(&mut **tx.conn())
+            .await?;
+            inserted += res.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Give live meeting-transcript segments the SAME global `speaker_id` that the
+    /// engine-agnostic backfill (`backfill_missing_speakers`) resolved on
+    /// `audio_transcriptions` — so the Meeting view shows the cross-meeting, nameable
+    /// identity instead of Deepgram's per-stream "speaker N" label.
+    ///
+    /// For each segment still missing a speaker (and `captured_at >= since`), take the
+    /// `speaker_id` of the nearest already-identified `audio_transcriptions` row within
+    /// `coverage_window_secs`. The mirrored live row shares the segment's exact
+    /// timestamp, so once the chunk backfill stamps it, it matches first. Idempotent —
+    /// only fills NULLs, and the `EXISTS` guard avoids no-op NULL writes. Returns rows
+    /// updated. Cheap: runs on the reconciliation sweep, never the hot path.
+    pub async fn backfill_meeting_segment_speakers(
+        &self,
+        since: DateTime<Utc>,
+        coverage_window_secs: f64,
+    ) -> Result<u64, SqlxError> {
+        // SQLite can't correlate the UPDATE target table inside a SET subquery, so
+        // do it as fetch-candidates → per-row nearest-lookup → update-by-id (the
+        // same shape as the mirror). Capped per pass; resolved segments drop out of
+        // the candidate set, so steady-state work is just newly-mirrored segments.
+        const PER_PASS_LIMIT: i64 = 500;
+        let window_days = coverage_window_secs / 86_400.0;
+
+        let segs = sqlx::query(
+            "SELECT id, captured_at, device_type FROM meeting_transcript_segments \
+             WHERE speaker_id IS NULL AND julianday(captured_at) >= julianday(?1) \
+             ORDER BY captured_at DESC LIMIT ?2",
+        )
+        .bind(since)
+        .bind(PER_PASS_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        if segs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.begin_immediate_with_retry().await?;
+        let mut updated: u64 = 0;
+        for seg in &segs {
+            let seg_id: i64 = seg.get("id");
+            let captured_at: DateTime<Utc> = seg.get("captured_at");
+            let is_input: bool =
+                seg.try_get::<String, _>("device_type").unwrap_or_default() == "input";
+            // The global speaker_id of the nearest already-identified audio row OF
+            // THE SAME DEVICE (input vs output), so a mic segment can't pick up a
+            // remote speaker. The mirrored live row shares this exact timestamp +
+            // device, so it wins.
+            let speaker_id: Option<i64> = sqlx::query_scalar(
+                "SELECT at.speaker_id FROM audio_transcriptions at \
+                 WHERE at.speaker_id IS NOT NULL \
+                   AND COALESCE(at.is_input_device, 1) = ?3 \
+                   AND ABS(julianday(at.timestamp) - julianday(?1)) <= ?2 \
+                 ORDER BY ABS(julianday(at.timestamp) - julianday(?1)) ASC LIMIT 1",
+            )
+            .bind(captured_at)
+            .bind(window_days)
+            .bind(is_input)
+            .fetch_optional(&mut **tx.conn())
+            .await?;
+            if let Some(sid) = speaker_id {
+                let r = sqlx::query(
+                    "UPDATE meeting_transcript_segments SET speaker_id = ?1 \
+                     WHERE id = ?2 AND speaker_id IS NULL",
+                )
+                .bind(sid)
+                .bind(seg_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                updated += r.rows_affected();
+            }
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
+    pub async fn list_meeting_transcript_segments(
+        &self,
+        meeting_id: i64,
+    ) -> Result<Vec<MeetingTranscriptSegment>, SqlxError> {
+        let rows = sqlx::query_as::<_, MeetingTranscriptSegment>(
+            r#"
+            WITH meeting_window AS (
+                SELECT
+                    id AS meeting_id,
+                    meeting_start,
+                    COALESCE(
+                        meeting_end,
+                        strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    ) AS meeting_end
+                FROM meetings
+                WHERE id = ?1
+            ),
+            live_segments AS (
+                SELECT
+                    mts.id,
+                    mts.meeting_id,
+                    'live' AS source,
+                    mts.provider,
+                    mts.model,
+                    mts.item_id,
+                    mts.device_name,
+                    mts.device_type,
+                    NULL AS audio_transcription_id,
+                    NULL AS audio_chunk_id,
+                    NULL AS audio_file_path,
+                    mts.speaker_id AS speaker_id,
+                    -- Prefer the resolved global speaker's name; fall back to the
+                    -- free-text Deepgram label until backfilled / if the speaker is
+                    -- unnamed (NULLIF treats '' as "no name yet").
+                    COALESCE(NULLIF(s.name, ''), mts.speaker_name) AS speaker_name,
+                    mts.transcript,
+                    mts.captured_at,
+                    mts.created_at
+                FROM meeting_transcript_segments mts
+                LEFT JOIN speakers s ON s.id = mts.speaker_id
+                WHERE mts.meeting_id = ?1
+            ),
+            background_segments AS (
+                SELECT
+                    at.id,
+                    mw.meeting_id,
+                    'background' AS source,
+                    'background' AS provider,
+                    at.transcription_engine AS model,
+                    'background:' || at.id AS item_id,
+                    at.device AS device_name,
+                    CASE
+                        WHEN COALESCE(at.is_input_device, 1) THEN 'input'
+                        ELSE 'output'
+                    END AS device_type,
+                    at.id AS audio_transcription_id,
+                    at.audio_chunk_id AS audio_chunk_id,
+                    ac.file_path AS audio_file_path,
+                    at.speaker_id AS speaker_id,
+                    s.name AS speaker_name,
+                    at.transcription AS transcript,
+                    at.timestamp AS captured_at,
+                    at.timestamp AS created_at
+                FROM audio_transcriptions at
+                JOIN audio_chunks ac ON ac.id = at.audio_chunk_id
+                JOIN meeting_window mw ON 1 = 1
+                LEFT JOIN speakers s ON s.id = at.speaker_id
+                WHERE julianday(at.timestamp) >= julianday(mw.meeting_start)
+                  AND julianday(at.timestamp) <= julianday(mw.meeting_end)
+                  AND TRIM(at.transcription) != ''
+                  AND ac.file_path NOT LIKE 'cloud://%'
+                  AND (s.id IS NULL OR s.hallucination = 0)
+                  -- Drop background rows already covered by a live segment in the
+                  -- same meeting (within ±15s). Live + background both writing the
+                  -- same audio is by design (live = real-time, background = post-hoc
+                  -- archival via reconciliation), but consumers should see one copy.
+                  -- The window is half a typical chunk; gaps in live coverage stay
+                  -- visible because their background rows won't have a nearby live row.
+                  --
+                  -- The match MUST be scoped to the same direction (input vs
+                  -- output). Input and output are independent captures: when the
+                  -- user is the primary speaker their input live segments are
+                  -- dense, and a direction-agnostic window would suppress every
+                  -- backfilled *output* (other participants') row that merely
+                  -- happens to fall within 15s of the user talking — silently
+                  -- dropping the audience from the transcript.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM meeting_transcript_segments mts
+                      WHERE mts.meeting_id = mw.meeting_id
+                        AND mts.device_type = CASE
+                              WHEN COALESCE(at.is_input_device, 1) THEN 'input'
+                              ELSE 'output'
+                            END
+                        AND ABS(julianday(mts.captured_at) - julianday(at.timestamp))
+                            <= (15.0 / 86400.0)
+                  )
+            )
+            SELECT * FROM (
+                SELECT * FROM live_segments
+                UNION ALL
+                SELECT * FROM background_segments
+            )
+            ORDER BY julianday(captured_at) ASC,
+                     CASE source WHEN 'live' THEN 0 ELSE 1 END ASC,
+                     id ASC
+            "#,
+        )
+        .bind(meeting_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn delete_meeting(&self, id: i64) -> Result<u64, SqlxError> {
@@ -7830,10 +9529,10 @@ LIMIT ? OFFSET ?
         let mut tx = self.begin_immediate_with_retry().await?;
         let mut query = sqlx::query(&sql);
         if let Some(v) = meeting_start {
-            query = query.bind(v);
+            query = query.bind(normalize_timestamp_for_range_query(v));
         }
         if let Some(v) = meeting_end {
-            query = query.bind(v);
+            query = query.bind(normalize_timestamp_for_range_query(v));
         }
         if let Some(v) = title {
             query = query.bind(v);
@@ -8067,6 +9766,17 @@ LIMIT ? OFFSET ?
         Ok((before, after))
     }
 
+    /// Find the most recent ended meeting in `app` whose `meeting_end` is
+    /// within `within_secs` and that did NOT end via explicit user stop.
+    ///
+    /// The `end_reason != 'explicit_stop'` filter is the load-bearing piece
+    /// of the meeting-merge fix: when a user clicks stop in the meeting note
+    /// UI and then joins a new call seconds later, the auto-detector used to
+    /// re-attach the new call to the just-stopped row, which made the live
+    /// note show the previous call's transcript tail and produced
+    /// "DUPLICATE: X" sync notifications. The detector loop also tracks
+    /// `last_explicit_stop_id` in memory as defense-in-depth, but this SQL
+    /// filter is the durable guarantee that survives restarts.
     pub async fn find_recent_meeting_for_app(
         &self,
         app: &str,
@@ -8082,11 +9792,13 @@ LIMIT ? OFFSET ?
              WHERE meeting_app = ?1 \
                AND meeting_end IS NOT NULL \
                AND meeting_end >= ?2 \
+               AND (end_reason IS NULL OR end_reason != ?3) \
              ORDER BY meeting_end DESC \
              LIMIT 1",
         )
         .bind(app)
         .bind(&cutoff)
+        .bind(MEETING_END_REASON_EXPLICIT_STOP)
         .fetch_optional(&self.pool)
         .await?;
         Ok(meeting)
@@ -8737,7 +10449,12 @@ pub fn parse_all_text_positions(blocks: &[OcrTextBlock]) -> Vec<TextPosition> {
             }
 
             // Parse confidence, defaulting to 0.0 if invalid
-            let confidence = block.conf.parse::<f32>().unwrap_or(0.0);
+            let confidence = block
+                .conf
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .unwrap_or(0.0);
 
             // Skip blocks with very low confidence (likely noise)
             if confidence < 0.0 {
@@ -8745,10 +10462,26 @@ pub fn parse_all_text_positions(blocks: &[OcrTextBlock]) -> Vec<TextPosition> {
             }
 
             // Parse bounding box (already screen space, top-left origin, normalized 0–1)
-            let left = block.left.parse::<f32>().unwrap_or(0.0);
-            let top = block.top.parse::<f32>().unwrap_or(0.0);
-            let width = block.width.parse::<f32>().unwrap_or(0.0);
-            let height = block.height.parse::<f32>().unwrap_or(0.0);
+            let left = block
+                .left
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())?;
+            let top = block
+                .top
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())?;
+            let width = block
+                .width
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())?;
+            let height = block
+                .height
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())?;
 
             // Skip blocks with invalid dimensions
             if width <= 0.0 || height <= 0.0 {
@@ -8861,6 +10594,21 @@ mod tests {
         assert_eq!(positions.len(), 1);
         assert_eq!(positions[0].text, "Test");
         assert!((positions[0].confidence - 0.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_parse_all_text_positions_filters_nan_bounds() {
+        let blocks = vec![
+            create_test_block("Valid", "95.5", "0.1", "0.5", "0.08", "0.02"),
+            create_test_block("NaNLeft", "90.0", "NaN", "0.5", "0.1", "0.02"),
+            create_test_block("NaNWidth", "90.0", "0.2", "0.5", "NaN", "0.02"),
+            create_test_block("NaNHeight", "90.0", "0.3", "0.5", "0.1", "NaN"),
+        ];
+
+        let positions = parse_all_text_positions(&blocks);
+
+        assert_eq!(positions.len(), 1);
+        assert_eq!(positions[0].text, "Valid");
     }
 
     #[test]
@@ -9225,6 +10973,7 @@ mod tests {
             confidence,
             text: String::new(),
             url: url.to_string(),
+            text_source: None,
         }
     }
 

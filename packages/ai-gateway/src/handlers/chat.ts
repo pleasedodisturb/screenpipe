@@ -7,8 +7,11 @@ import { addCorsHeaders } from '../utils/cors';
 import { logModelOutcome } from '../services/model-health';
 import { captureException } from '@sentry/cloudflare';
 
-// Auto model waterfall — ordered by quality/cost ratio (all free or near-free).
+// Auto model waterfall — quality first, then fall back to open-weight Vertex
+// MaaS picks (free for users, near-zero GCP burn) and a cheap Gemini safety
+// net at the tail.
 const AUTO_WATERFALL = [
+  'gemini-3.5-flash', // new flagship flash — beats pro tier on agent benchmarks
   'kimi-k2.5',
   'deepseek-v3.2',
   'glm-4.7',
@@ -17,6 +20,7 @@ const AUTO_WATERFALL = [
 
 // Vision-capable models for requests containing images
 const AUTO_WATERFALL_VISION = [
+  'gemini-3.5-flash', // multimodal, leads on agent/vision benchmarks
   'llama-4-maverick', // free (Vertex MaaS), 400B MoE, strong vision + reasoning
   'gemini-3-flash',   // near-free, good vision
   'llama-4-scout',    // free (Vertex MaaS), 109B MoE, decent vision fallback
@@ -129,6 +133,10 @@ async function tryModel(
     model = resolveModelAlias(model);
     const provider = createProvider(model, env);
     const reqBody = { ...body, model };
+    if (!provider.supportsTools) {
+      delete (reqBody as Partial<RequestBody>).tools;
+      delete (reqBody as Partial<RequestBody>).tool_choice;
+    }
 
     if (body.stream) {
       const stream = await provider.createStreamingCompletion(reqBody);
@@ -238,10 +246,10 @@ function friendlyError(model: string, status: number, fellThrough: boolean): str
     : `${model} request failed (${status}). Please try again or pick a different model.`;
 }
 
-const SCREENPIPE_SYSTEM_HINT = `You have screenpipe skills. At the start of every conversation, read the files in .pi/skills/ directory (e.g. .pi/skills/screenpipe-api/SKILL.md and .pi/skills/screenpipe-cli/SKILL.md) before responding.`;
+export const SCREENPIPE_SYSTEM_HINT = `You have screenpipe skills. At the start of every conversation, read the files in .pi/skills/ directory (e.g. .pi/skills/screenpipe-api/SKILL.md and .pi/skills/screenpipe-cli/SKILL.md) before responding. Do not use web_search for the user's own screenpipe data or for the local screenpipe API at localhost:3030 — that is private and not on the web; answer those from your screenpipe skills and the local API/tools. Only use web_search for public, external information the user explicitly asks for (current events, news, public docs).`;
 
 /** Prepend a screenpipe system hint if no system message already mentions screenpipe */
-function ensureScreenpipeHint(body: RequestBody): RequestBody {
+export function ensureScreenpipeHint(body: RequestBody): RequestBody {
   const hasScreenpipeContext = body.messages.some(
     (m) => m.role === 'system' && typeof m.content === 'string' && m.content.toLowerCase().includes('screenpipe')
   );

@@ -82,6 +82,13 @@ pub trait AgentExecutor: Send + Sync {
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
         continue_session: bool,
         _pipe_system_prompt: Option<&str>,
+        // Chat/session that owns this run (e.g. `pipe:<name>`). Exported to the
+        // agent subprocess as `SCREENPIPE_SESSION_ID` so its local API calls are
+        // tagged, letting the owned-browser sidebar keep a background pipe's
+        // page out of an unrelated chat. The non-streaming fallback below
+        // doesn't set it; only the pi executor (which spawns the subprocess)
+        // acts on it.
+        _session_owner: Option<&str>,
     ) -> Result<AgentOutput> {
         let output = self
             .run(
@@ -115,7 +122,13 @@ pub trait AgentExecutor: Send + Sync {
 
     /// Optional cloud auth token for screenpipe provider proxy.
     /// Defaults to `None`; override in agents that support cloud auth.
-    fn user_token(&self) -> Option<&str> {
+    ///
+    /// Returns an owned `Option<String>` (not `Option<&str>`) so
+    /// implementations can read from interior-mutable storage (e.g. an
+    /// `Arc<RwLock>`) without holding a lock across the caller's borrow.
+    /// This lets the desktop app refresh the token at runtime without
+    /// restarting the engine.
+    fn user_token(&self) -> Option<String> {
         None
     }
 }

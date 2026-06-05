@@ -65,9 +65,10 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone, false)
-            .await
-            .unwrap();
+        let audio_stream =
+            AudioStream::from_device(device_spec, is_running_clone, false, false, false)
+                .await
+                .unwrap();
 
         // Act
         let start_time = Instant::now();
@@ -126,9 +127,10 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone(), false)
-            .await
-            .unwrap();
+        let audio_stream =
+            AudioStream::from_device(device_spec, is_running_clone.clone(), false, false, false)
+                .await
+                .unwrap();
 
         // interrupt in 10 seconds
         tokio::spawn(async move {
@@ -404,9 +406,10 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
 
         // Create an audio stream
-        let stream = AudioStream::from_device(Arc::new(device), is_running.clone(), false)
-            .await
-            .expect("should create audio stream");
+        let stream =
+            AudioStream::from_device(Arc::new(device), is_running.clone(), false, false, false)
+                .await
+                .expect("should create audio stream");
 
         // Let it run for a bit to ensure the audio thread is active
         tokio::time::sleep(Duration::from_millis(100)).await;

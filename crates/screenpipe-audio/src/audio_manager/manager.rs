@@ -4,8 +4,10 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use futures::FutureExt;
 use std::{
     collections::HashSet,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -14,7 +16,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{broadcast, Mutex, RwLock},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
@@ -27,10 +29,11 @@ use crate::{
     core::{
         device::{parse_audio_device, AudioDevice},
         engine::AudioTranscriptionEngine,
-        record_and_transcribe,
+        record_and_transcribe_with_live_tap,
     },
     device::device_manager::DeviceManager,
     meeting_detector::MeetingDetector,
+    meeting_streaming::{start_meeting_streaming_loop, MeetingAudioTap},
     metrics::AudioPipelineMetrics,
     segmentation::segmentation_manager::SegmentationManager,
     transcription::{
@@ -98,6 +101,7 @@ struct MeetingEventData {
 }
 
 type RecordingHandlesMap = DashMap<AudioDevice, Arc<Mutex<JoinHandle<Result<()>>>>>;
+const MEETING_AUDIO_FRAME_BUFFER: usize = 512;
 
 #[derive(Clone)]
 pub struct AudioManager {
@@ -113,9 +117,11 @@ pub struct AudioManager {
     transcription_receiver: Arc<crossbeam::channel::Receiver<TranscriptionResult>>,
     transcription_sender: Arc<crossbeam::channel::Sender<TranscriptionResult>>,
     transcription_receiver_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    meeting_streaming_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     recording_receiver_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
     pub metrics: Arc<AudioPipelineMetrics>,
-    meeting_detector: Option<Arc<MeetingDetector>>,
+    meeting_detector: Arc<RwLock<Option<Arc<MeetingDetector>>>>,
+    meeting_audio_tap: MeetingAudioTap,
     /// Whether transcription is currently paused (legacy, always false — deferral removed).
     pub transcription_paused: Arc<AtomicBool>,
     /// Optional callback invoked after each audio transcription DB insert.
@@ -145,8 +151,20 @@ pub struct CentralHandlerRestartResult {
 
 impl AudioManager {
     pub async fn new(options: AudioManagerOptions, db: Arc<DatabaseManager>) -> Result<Self> {
-        let device_manager =
-            DeviceManager::new(options.experimental_coreaudio_system_audio).await?;
+        let device_manager = DeviceManager::new(
+            options.experimental_coreaudio_system_audio,
+            options.windows_input_aec_enabled,
+            options.macos_input_vpio_enabled,
+        )
+        .await?;
+        if options.windows_input_aec_enabled {
+            info!("screenpipe-audio: Windows WASAPI microphone AEC enabled in settings");
+        }
+        if options.macos_input_vpio_enabled {
+            info!(
+                "screenpipe-audio: macOS VoiceProcessingIO (AEC) enabled in settings (default input only)"
+            );
+        }
         let segmentation_manager = Arc::new(SegmentationManager::new(options.is_disabled).await?);
         let status = RwLock::new(AudioManagerStatus::Stopped);
         let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = if options.is_disabled {
@@ -173,6 +191,9 @@ impl AudioManager {
         let recording_handles = DashMap::new();
 
         let meeting_detector = options.meeting_detector.clone();
+        let (meeting_audio_tx, _) = broadcast::channel(MEETING_AUDIO_FRAME_BUFFER);
+        let meeting_audio_tap =
+            MeetingAudioTap::new(meeting_audio_tx, Arc::new(AtomicBool::new(false)));
 
         let manager = Self {
             options: Arc::new(RwLock::new(options)),
@@ -188,8 +209,10 @@ impl AudioManager {
             recording_handles: Arc::new(recording_handles),
             recording_receiver_handle: Arc::new(RwLock::new(None)),
             transcription_receiver_handle: Arc::new(RwLock::new(None)),
+            meeting_streaming_handle: Arc::new(RwLock::new(None)),
             metrics: Arc::new(AudioPipelineMetrics::new()),
-            meeting_detector,
+            meeting_detector: Arc::new(RwLock::new(meeting_detector)),
+            meeting_audio_tap,
             transcription_paused: Arc::new(AtomicBool::new(false)),
             on_transcription_insert: None,
             engine: Arc::new(RwLock::new(None)),
@@ -199,6 +222,55 @@ impl AudioManager {
         };
 
         Ok(manager)
+    }
+
+    /// Apply fresh capture/audio options without rebuilding the long-lived server.
+    ///
+    /// This is intended to run while capture is stopped, before `start()`.
+    /// It lets settings such as transcription engine, cloud credentials,
+    /// live-meeting provider, devices, language, vocabulary, and batch mode
+    /// update on a capture-level restart.
+    pub async fn apply_options(&self, options: AudioManagerOptions) -> Result<()> {
+        if self.status().await == AudioManagerStatus::Running {
+            self.stop_internal().await?;
+        }
+
+        let deepgram_status = match &options.deepgram_config {
+            Some(c) if c.is_ready() => format!(
+                "provider={} host={}",
+                c.provider_slug_for_log(),
+                crate::transcription::deepgram::transcription_endpoint_host_for_log(&c.endpoint)
+            ),
+            Some(_) => "credentials_incomplete".to_string(),
+            None => {
+                if *options.transcription_engine == AudioTranscriptionEngine::Deepgram {
+                    "missing_deepgram_config".to_string()
+                } else {
+                    "n/a".to_string()
+                }
+            }
+        };
+        info!(
+            "audio_manager apply_options: background_engine={} transcription_mode={:?} deepgram[{}]",
+            options.transcription_engine,
+            options.transcription_mode,
+            deepgram_status
+        );
+
+        self.device_manager.configure_backend_flags(
+            options.experimental_coreaudio_system_audio,
+            options.windows_input_aec_enabled,
+            options.macos_input_vpio_enabled,
+        );
+        *self.meeting_detector.write().await = options.meeting_detector.clone();
+
+        let user_disabled = self.user_disabled_devices.read().await.clone();
+        let mut options = options;
+        super::builder::ensure_system_default_device_types(&mut options, &user_disabled).await;
+
+        *self.options.write().await = options;
+        *self.engine.write().await = None;
+        Ok(())
     }
 
     /// Set a callback that fires after each audio transcription is inserted into DB.
@@ -230,6 +302,21 @@ impl AudioManager {
         *recording_receiver_handle = Some(self.start_audio_receiver_handler().await?);
         let self_arc = Arc::new(self.clone());
 
+        {
+            let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
+            if meeting_streaming_handle.is_none() {
+                let config = self.options.read().await.meeting_streaming.clone();
+                let audio_rx = self.meeting_audio_tap.subscribe();
+                *meeting_streaming_handle = Some(start_meeting_streaming_loop(
+                    config,
+                    self.meeting_audio_tap.clone(),
+                    audio_rx,
+                    self.db.clone(),
+                    self.engine.clone(),
+                ));
+            }
+        }
+
         // Spawn reconciliation sweep for orphaned audio chunks (batch mode only)
         if self.options.read().await.transcription_mode == TranscriptionMode::Batch {
             let db = self.db.clone();
@@ -239,34 +326,66 @@ impl AudioManager {
             let seg_mgr = self.segmentation_manager.clone();
             let output_path_bg = self.options.read().await.output_path.clone();
             let metrics_bg = self.metrics.clone();
+            let meeting_detector_bg = self.meeting_detector().await;
             let handle = tokio::spawn(async move {
                 // Wait for model to load + initial recordings
                 tokio::time::sleep(Duration::from_secs(120)).await;
                 loop {
-                    let engine_guard = engine_ref.read().await;
-                    if let Some(ref transcription_engine) = *engine_guard {
-                        let opts = options_ref.read().await;
-                        let audio_engine = opts.transcription_engine.clone();
-                        let batch_max_dur = opts.batch_max_duration_secs;
-                        drop(opts);
-
-                        let data_dir = output_path_bg.as_deref();
-                        let count = super::reconciliation::reconcile_untranscribed(
-                            &db,
-                            transcription_engine,
-                            on_insert_bg.as_ref(),
-                            audio_engine,
-                            Some(seg_mgr.clone()),
-                            data_dir,
-                            batch_max_dur,
-                            Some(metrics_bg.clone()),
-                        )
-                        .await;
-                        if count > 0 {
-                            info!("reconciliation: transcribed {} orphaned chunks", count);
+                    // Contain a panic inside a sweep so it cannot kill this
+                    // long-lived worker (issue #3498: a single panic used to
+                    // stop the loop permanently, silently piling up pending
+                    // chunks until the app was restarted). The sweep stays on
+                    // this task, so shutdown still cancels an in-flight sweep at
+                    // its next await. The locks it holds are tokio::sync locks,
+                    // which do not poison, so a caught panic releases them
+                    // cleanly.
+                    let swept = AssertUnwindSafe(async {
+                        if let Some(detector) = &meeting_detector_bg {
+                            detector.check_grace_period().await;
+                            if detector.is_in_audio_session() {
+                                debug!(
+                                    "reconciliation: skipping background sweep during active audio session"
+                                );
+                                return;
+                            }
                         }
+
+                        let engine_guard = engine_ref.read().await;
+                        if let Some(ref transcription_engine) = *engine_guard {
+                            let opts = options_ref.read().await;
+                            let audio_engine = opts.transcription_engine.clone();
+                            let batch_max_dur = opts.batch_max_duration_secs;
+                            drop(opts);
+
+                            let count = super::reconciliation::reconcile_untranscribed(
+                                &db,
+                                transcription_engine,
+                                on_insert_bg.as_ref(),
+                                audio_engine,
+                                Some(seg_mgr.clone()),
+                                output_path_bg.as_deref(),
+                                batch_max_dur,
+                                Some(metrics_bg.clone()),
+                            )
+                            .await;
+                            if count > 0 {
+                                info!("reconciliation: transcribed {} orphaned chunks", count);
+                            }
+                        }
+                    })
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = swept {
+                        let reason = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown cause");
+                        error!(
+                            "reconciliation: sweep panicked, worker continues: {}",
+                            reason
+                        );
                     }
-                    drop(engine_guard);
                     tokio::time::sleep(Duration::from_secs(120)).await;
                 }
             });
@@ -337,6 +456,11 @@ impl AudioManager {
 
         let mut transcription_receiver_handle = self.transcription_receiver_handle.write().await;
         if let Some(handle) = transcription_receiver_handle.take() {
+            handle.abort();
+        }
+
+        let mut meeting_streaming_handle = self.meeting_streaming_handle.write().await;
+        if let Some(handle) = meeting_streaming_handle.take() {
             handle.abort();
         }
 
@@ -521,20 +645,28 @@ impl AudioManager {
 
     async fn record_device(&self, device: &AudioDevice) -> Result<JoinHandle<Result<()>>> {
         let options = self.options.read().await;
-        let stream = self.device_manager.stream(device).unwrap();
+        let stream = self
+            .device_manager
+            .stream(device)
+            .ok_or_else(|| anyhow!("audio stream missing after starting device: {device}"))?;
         let audio_chunk_duration = options.audio_chunk_duration;
         let recording_sender = self.recording_sender.clone();
-        let is_running = self.device_manager.is_running_mut(device).unwrap();
+        let is_running = self
+            .device_manager
+            .is_running_mut(device)
+            .ok_or_else(|| anyhow!("audio device state missing after starting device: {device}"))?;
         let device_clone = device.clone();
         let metrics = self.metrics.clone();
+        let meeting_audio_tap = self.meeting_audio_tap.clone();
 
         let recording_handle = tokio::spawn(async move {
-            let record_result = tokio::spawn(record_and_transcribe(
+            let record_result = tokio::spawn(record_and_transcribe_with_live_tap(
                 stream.clone(),
                 audio_chunk_duration,
                 recording_sender.clone(),
                 is_running.clone(),
                 metrics,
+                Some(meeting_audio_tap),
             ))
             .await;
 
@@ -584,7 +716,7 @@ impl AudioManager {
         let options = self.options.read().await;
         let output_path = options.output_path.clone();
         let languages = options.languages.clone();
-        let deepgram_api_key = options.deepgram_api_key.clone();
+        let deepgram_config = options.deepgram_config.clone();
         let openai_compatible_config = options.openai_compatible_config.clone();
         let audio_transcription_engine = options.transcription_engine.clone();
         let vocabulary = options.vocabulary.clone();
@@ -594,7 +726,8 @@ impl AudioManager {
         let vad_engine = self.vad_engine.clone();
         let whisper_receiver = self.recording_receiver.clone();
         let metrics = self.metrics.clone();
-        let meeting_detector = self.meeting_detector.clone();
+        let meeting_detector = self.meeting_detector().await;
+        let meeting_audio_tap = self.meeting_audio_tap.clone();
         let db = self.db.clone();
         let shared_engine = self.engine.clone();
         let on_insert_session = self.on_transcription_insert.clone();
@@ -602,7 +735,7 @@ impl AudioManager {
         // Build unified transcription engine — only loads the needed model
         let engine = TranscriptionEngine::new(
             audio_transcription_engine.clone(),
-            deepgram_api_key.clone(),
+            deepgram_config.clone(),
             openai_compatible_config.clone(),
             languages.clone(),
             vocabulary.clone(),
@@ -742,6 +875,20 @@ impl AudioManager {
                     None
                 };
 
+                // Meeting live transcription has its own provider/session path.
+                // While a live session is active, do not also run the same
+                // audio through the background STT path. The durable audio
+                // chunk was already written above; background transcription
+                // resumes when the live session ends.
+                if meeting_audio_tap.background_suppressed() {
+                    had_deferred_segments = true;
+                    metrics.record_segment_deferred();
+                    debug!(
+                        "meeting live transcription active; skipping background transcription for this chunk"
+                    );
+                    continue;
+                }
+
                 // Batch mode: defer transcription during audio sessions (meetings, YouTube, etc).
                 // Audio is already persisted to disk + DB above.
                 // When the session ends, reconciliation will transcribe all untranscribed chunks.
@@ -757,26 +904,21 @@ impl AudioManager {
                         let session_just_ended =
                             !now_in_session && (was_in_session || had_deferred_segments);
 
-                        // Force reconciliation if we've been deferring longer
-                        // than the engine's batch limit. Prevents infinite
-                        // deferral during long calls or perpetual output-audio.
+                        // Track overly long deferral, but do not reconcile while
+                        // the session is active. Live meeting streaming owns
+                        // call-time latency; reconciliation is background work
+                        // and must not compete with the meeting.
                         let deferral_cap_hit = now_in_session
                             && deferral_started
                                 .is_some_and(|t| t.elapsed().as_secs() >= max_deferral_secs);
 
-                        if session_just_ended || deferral_cap_hit {
+                        if session_just_ended {
                             // Reconcile: session ended or deferral cap reached
                             had_deferred_segments = false;
                             deferral_started = None;
-                            if deferral_cap_hit {
-                                info!(
-                                    "batch mode: deferral cap ({max_deferral_secs}s) reached during active session, force-transcribing"
-                                );
-                            } else {
-                                info!(
-                                    "batch mode: audio session ended, transcribing accumulated audio"
-                                );
-                            }
+                            info!(
+                                "batch mode: audio session ended, transcribing accumulated audio"
+                            );
                             let data_dir = output_path.as_deref();
                             let count = super::reconciliation::reconcile_untranscribed(
                                 &db,
@@ -796,6 +938,11 @@ impl AudioManager {
                         } else if now_in_session {
                             if deferral_started.is_none() {
                                 deferral_started = Some(std::time::Instant::now());
+                            }
+                            if deferral_cap_hit {
+                                debug!(
+                                    "batch mode: deferral cap ({max_deferral_secs}s) reached, continuing to defer until the active session ends"
+                                );
                             }
                             had_deferred_segments = true;
                             metrics.record_segment_deferred();
@@ -872,6 +1019,10 @@ impl AudioManager {
         let db = self.db.clone();
         let options = self.options.read().await;
         let transcription_engine = options.transcription_engine.clone();
+        let diarization_mode = match options.transcription_mode {
+            TranscriptionMode::Realtime => "live",
+            TranscriptionMode::Batch => "background",
+        };
         let use_pii_removal = options.use_pii_removal;
         drop(options); // Release lock before spawning
         let metrics = self.metrics.clone();
@@ -880,6 +1031,7 @@ impl AudioManager {
             db,
             transcription_receiver,
             transcription_engine,
+            diarization_mode,
             use_pii_removal,
             metrics,
             on_insert,
@@ -923,6 +1075,18 @@ impl AudioManager {
 
     pub async fn enabled_devices(&self) -> HashSet<String> {
         self.options.read().await.enabled_devices.clone()
+    }
+
+    /// Drop a name from `enabled_devices` without trying to parse it or stop
+    /// a running stream. Used to scrub legacy sentinel entries (e.g. bare
+    /// "default" from older versions) that have no corresponding parseable
+    /// device and would otherwise stay in the set forever.
+    pub async fn forget_device(&self, device_name: &str) {
+        self.options
+            .write()
+            .await
+            .enabled_devices
+            .remove(device_name);
     }
 
     /// Stop all SCK-based (Output) audio devices for DRM pause.
@@ -988,9 +1152,9 @@ impl AudioManager {
         Ok(())
     }
 
-    /// Returns a reference to the meeting detector, if batch mode is active.
-    pub fn meeting_detector(&self) -> Option<&Arc<MeetingDetector>> {
-        self.meeting_detector.as_ref()
+    /// Returns the current capture-owned meeting detector, if enabled.
+    pub async fn meeting_detector(&self) -> Option<Arc<MeetingDetector>> {
+        self.meeting_detector.read().await.clone()
     }
 
     /// Returns the shared WhisperContext for backward compatibility, if loaded.
@@ -1017,6 +1181,12 @@ impl AudioManager {
         self.options.read().await.deepgram_api_key.clone()
     }
 
+    pub async fn deepgram_config(
+        &self,
+    ) -> Option<crate::transcription::deepgram::DeepgramTranscriptionConfig> {
+        self.options.read().await.deepgram_config.clone()
+    }
+
     /// Returns the current OpenAI Compatible config.
     pub async fn openai_compatible_config(&self) -> Option<crate::OpenAICompatibleConfig> {
         self.options.read().await.openai_compatible_config.clone()
@@ -1037,7 +1207,7 @@ impl AudioManager {
     pub async fn refresh_model_capabilities(&self) -> bool {
         let options = self.options.read().await;
         let audio_transcription_engine = options.transcription_engine.clone();
-        let deepgram_api_key = options.deepgram_api_key.clone();
+        let deepgram_config = options.deepgram_config.clone();
         let openai_compatible_config = options.openai_compatible_config.clone();
         let languages = options.languages.clone();
         let vocabulary = options.vocabulary.clone();
@@ -1065,7 +1235,7 @@ impl AudioManager {
             {
                 match TranscriptionEngine::new(
                     audio_transcription_engine.clone(),
-                    deepgram_api_key.clone(),
+                    deepgram_config.clone(),
                     openai_compatible_config.clone(),
                     languages.clone(),
                     vocabulary.clone(),
@@ -1105,7 +1275,7 @@ impl AudioManager {
                 {
                     match TranscriptionEngine::new(
                         audio_transcription_engine.clone(),
-                        deepgram_api_key.clone(),
+                        deepgram_config.clone(),
                         openai_compatible_config.clone(),
                         languages.clone(),
                         vocabulary.clone(),

@@ -6,9 +6,14 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen, emit } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 import posthog from "posthog-js";
 import ReactMarkdown from "react-markdown";
+import {
+  notificationUrlTransform,
+  openScreenpipeViewerLink,
+  screenpipeViewerPathFromHref,
+} from "@/components/markdown";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import localforage from "localforage";
 import { localFetch } from "@/lib/api";
@@ -19,10 +24,12 @@ interface NotificationAction {
   primary?: boolean;
   // Pipe notification action fields
   id?: string;
-  type?: "pipe" | "api" | "deeplink" | "dismiss";
+  type?: "pipe" | "api" | "deeplink" | "meeting_join" | "dismiss";
   pipe?: string;
   context?: Record<string, unknown>;
   url?: string;
+  deeplink_url?: string;
+  deeplinkUrl?: string;
   method?: string;
   body?: Record<string, unknown>;
   toast?: string;
@@ -39,27 +46,18 @@ interface NotificationPayload {
   pipe_name?: string;
 }
 
-/** Extract `path` from a `screenpipe://view?path=…` deeplink, or null. */
-function viewerPathFromHref(href: string): string | null {
-  if (!href.startsWith("screenpipe://view")) return null;
-  try {
-    const u = new URL(href);
-    return u.searchParams.get("path");
-  } catch {
-    return null;
-  }
+function windowForDeeplink(url: string) {
+  return url.startsWith("screenpipe://meeting/") ||
+    url.startsWith("screenpipe://meeting?")
+    ? { Home: { page: "meetings" } }
+    : "Main";
 }
 
 async function openNotificationLink(href: string) {
   const raw = href.trim();
   if (!raw) return;
 
-  // Viewer deeplink — opens the file in the in-app viewer window.
-  const viewerPath = viewerPathFromHref(raw);
-  if (viewerPath) {
-    await invoke("open_viewer_window", { path: viewerPath });
-    return;
-  }
+  if (await openScreenpipeViewerLink(raw)) return;
 
   let localPath: string | null = null;
   if (raw.startsWith("~/")) {
@@ -73,7 +71,7 @@ async function openNotificationLink(href: string) {
 
   const { open } = await import("@tauri-apps/plugin-shell");
   if (localPath) {
-    await invoke("open_note_path", { path: localPath });
+    await commands.openNotePath(localPath);
     return;
   }
 
@@ -108,7 +106,7 @@ export default function NotificationPanelPage() {
         auto,
       });
       try {
-        await invoke("hide_notification_panel");
+        await commands.hideNotificationPanel();
       } catch {
         // ignore
       }
@@ -179,7 +177,7 @@ export default function NotificationPanelPage() {
                   // emitting. Without this ordering, the emit fires into a
                   // handler that hasn't subscribed yet and the click silently
                   // does nothing.
-                  await invoke("show_window_activated", { window: "Main" });
+                  await commands.showWindowActivated(windowForDeeplink(actionObj.url));
                   await new Promise((r) => setTimeout(r, 150));
                   await emit("deep-link-received", actionObj.url);
                 } else {
@@ -197,6 +195,26 @@ export default function NotificationPanelPage() {
               }
               break;
             }
+            case "meeting_join": {
+              if (actionObj.url) {
+                try {
+                  const { open } = await import("@tauri-apps/plugin-shell");
+                  await open(actionObj.url);
+                } catch (e) {
+                  console.error(
+                    "notification open: shell plugin unavailable",
+                    e
+                  );
+                }
+              }
+              const deeplink = actionObj.deeplink_url || actionObj.deeplinkUrl;
+              if (typeof deeplink === "string" && deeplink.startsWith("screenpipe://")) {
+                await commands.showWindowActivated(windowForDeeplink(deeplink));
+                await new Promise((r) => setTimeout(r, 150));
+                await emit("deep-link-received", deeplink);
+              }
+              break;
+            }
             case "dismiss":
               break;
           }
@@ -211,9 +229,9 @@ export default function NotificationPanelPage() {
         // from the notification panel always surface the window above other
         // apps, regardless of overlay_mode.
         if (actionStr === "open_timeline") {
-          await invoke("show_window_activated", { window: "Main" });
+          await commands.showWindowActivated("Main");
         } else if (actionStr === "open_chat") {
-          await invoke("show_window_activated", { window: "Chat" });
+          await commands.showWindowActivated("Chat");
         } else if (actionStr === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,
@@ -231,12 +249,12 @@ export default function NotificationPanelPage() {
           }
           try {
             try {
-              await invoke("stop_screenpipe");
+              await commands.stopScreenpipe();
             } catch {
               // may already be stopped
             }
             await new Promise((r) => setTimeout(r, 2000));
-            await invoke("spawn_screenpipe");
+            await commands.spawnScreenpipe(null);
             // Poll health endpoint to confirm restart succeeded
             let healthy = false;
             for (let i = 0; i < 15; i++) {
@@ -258,7 +276,7 @@ export default function NotificationPanelPage() {
                 await hide(false);
               } catch {
                 // fallback: force-hide via invoke directly
-                try { await invoke("hide_notification_panel"); } catch {}
+                try { await commands.hideNotificationPanel(); } catch {}
               }
             } else {
               setRestartState("error");
@@ -536,12 +554,13 @@ export default function NotificationPanelPage() {
             }}
           >
             <ReactMarkdown
+              urlTransform={notificationUrlTransform}
               components={{
                 a: ({ href, children }) => {
                   // Viewer deeplinks get a sibling ↗ button so the user can
                   // override and open in the OS default app (e.g. Obsidian
                   // for .md, Preview for .json).
-                  const viewerPath = href ? viewerPathFromHref(href) : null;
+                  const viewerPath = href ? screenpipeViewerPathFromHref(href) : null;
                   return (
                     <>
                       <a
@@ -564,7 +583,7 @@ export default function NotificationPanelPage() {
                             e.preventDefault();
                             e.stopPropagation();
                             try {
-                              await invoke("open_note_path", { path: viewerPath });
+                              await commands.openNotePath(viewerPath);
                             } catch (err) {
                               console.error("failed to open in default app:", err);
                             }
@@ -676,24 +695,6 @@ export default function NotificationPanelPage() {
                 </button>
               ))
             )}
-            <span
-              onClick={() => hide(false)}
-              style={{
-                marginLeft: "auto",
-                fontSize: "10px",
-                color: "rgba(0, 0, 0, 0.3)",
-                cursor: "pointer",
-                fontFamily: '"IBM Plex Mono", monospace',
-              }}
-              onMouseEnter={(e) =>
-                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")
-              }
-              onMouseLeave={(e) =>
-                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")
-              }
-            >
-              dismiss →
-            </span>
           </div>
         )}
 
@@ -711,7 +712,7 @@ export default function NotificationPanelPage() {
             onClick={async () => {
               await hide(false);
               await emit("navigate", { url: "/home?section=notifications" });
-              try { await invoke("show_window", { window: { Home: { page: null } } }); } catch {}
+              try { await commands.showWindow({ Home: { page: null } }); } catch {}
             }}
             style={{
               fontSize: "9px",

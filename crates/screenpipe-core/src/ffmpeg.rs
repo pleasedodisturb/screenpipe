@@ -23,23 +23,33 @@ pub fn find_ffmpeg_path() -> Option<PathBuf> {
 
 /// Create a `std::process::Command` for ffmpeg with `CREATE_NO_WINDOW` on Windows.
 pub fn ffmpeg_cmd(path: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = std::process::Command::new(path);
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new(path)
+    }
+
     #[cfg(windows)]
     {
+        let mut cmd = std::process::Command::new(path);
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd
     }
-    cmd
 }
 
 /// Create a `tokio::process::Command` for ffmpeg with `CREATE_NO_WINDOW` on Windows.
 pub fn ffmpeg_cmd_async(path: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new(path);
+    #[cfg(not(windows))]
+    {
+        tokio::process::Command::new(path)
+    }
+
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-    cmd
+    {
+        let mut cmd = tokio::process::Command::new(path);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd
+    }
 }
 
 /// True when a usable ffprobe exists next to the given ffmpeg binary, OR
@@ -68,6 +78,30 @@ fn has_matching_ffprobe(ffmpeg_path: &std::path::Path) -> bool {
 
 fn find_ffmpeg_path_internal() -> Option<PathBuf> {
     debug!("Starting search for ffmpeg executable");
+
+    // macOS: prefer the app-bundled ffmpeg (Tauri sidecar lands in
+    // Contents/MacOS/ffmpeg, sometimes Contents/Resources/ffmpeg) before any
+    // system binary. A stale brew install (`/opt/homebrew/bin/ffmpeg` symlinked
+    // into a Cellar directory that `brew cleanup` already removed) makes dyld
+    // fail with "Library not loaded: …/Cellar/ffmpeg/8.x_y/lib/libavdevice.62.dylib"
+    // — we'd otherwise pick that broken binary over our own working bundle.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_folder) = exe_path.parent() {
+                let bundled = exe_folder.join(EXECUTABLE_NAME);
+                if bundled.exists() {
+                    debug!("Found bundled ffmpeg next to executable: {:?}", bundled);
+                    return Some(bundled);
+                }
+                let in_resources = exe_folder.join("../Resources").join(EXECUTABLE_NAME);
+                if in_resources.exists() {
+                    debug!("Found bundled ffmpeg in Resources: {:?}", in_resources);
+                    return Some(in_resources);
+                }
+            }
+        }
+    }
 
     // Check in the same folder as the executable (only on Linux)
     #[cfg(target_os = "linux")]

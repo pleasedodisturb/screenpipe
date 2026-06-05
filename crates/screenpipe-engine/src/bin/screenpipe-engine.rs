@@ -7,14 +7,17 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 #[allow(unused_imports)]
 use colored::Colorize;
 use futures::pin_mut;
 use port_check::is_local_ipv4_port_free;
+#[cfg(target_os = "macos")]
+use screenpipe_audio::core::device::{
+    get_cpal_device_and_config, AudioDevice, DeviceType, MACOS_OUTPUT_AUDIO_DEVICE_NAME,
+};
 use screenpipe_audio::{
-    core::device::{default_input_device, default_output_device, parse_audio_device},
-    meeting_detector::MeetingDetector,
+    core::device::resolve_audio_devices_for_capture, meeting_detector::MeetingDetector,
 };
 use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::find_ffmpeg_path;
@@ -26,11 +29,14 @@ use screenpipe_engine::{
         audio::handle_audio_command,
         mcp::handle_mcp_command,
         pipe::handle_pipe_command,
+        search::handle_search_command,
         status::handle_status_command,
         sync::{handle_sync_command, start_sync_service},
+        team::handle_team_command,
         vision::handle_vision_command,
-        Cli, CliAudioTranscriptionEngine, Command,
+        Cli, Command, RecordArgSources,
     },
+    high_fps_controller::HighFpsController,
     hot_frame_cache::HotFrameCache,
     start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
     start_ui_recording,
@@ -113,6 +119,43 @@ fn set_fd_limit() {
     // No action needed
 }
 
+#[cfg(target_os = "macos")]
+async fn doctor_check_system_audio_capture() -> bool {
+    let device = AudioDevice::new(
+        MACOS_OUTPUT_AUDIO_DEVICE_NAME.to_string(),
+        DeviceType::Output,
+    );
+
+    match get_cpal_device_and_config(&device).await {
+        Ok(_) => {
+            eprintln!("  system audio capture: ok");
+            true
+        }
+        Err(e) => {
+            let terminal = screenpipe_core::permissions::detect_terminal();
+            eprintln!("  system audio capture: failed");
+            eprintln!("    ScreenCaptureKit could not open System Audio for this CLI session.");
+            eprintln!(
+                "    macOS grants CLI capture through the terminal app, not the screenpipe app."
+            );
+            eprintln!(
+                "    grant or re-toggle \"{}\" in System Settings > Privacy & Security > Screen & System Audio Recording, then fully restart it.",
+                terminal
+            );
+            eprintln!(
+                "    if you only need a workaround: screenpipe record --experimental-coreaudio-system-audio"
+            );
+            eprintln!("    underlying error: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn doctor_check_system_audio_capture() -> bool {
+    true
+}
+
 const DISPLAY: &str = r"
                                             _          
    __________________  ___  ____     ____  (_____  ___ 
@@ -133,6 +176,7 @@ fn get_base_dir(custom_path: &Option<String>) -> anyhow::Result<PathBuf> {
     let data_dir = base_dir.join("data");
 
     fs::create_dir_all(&data_dir)?;
+    paths::ensure_spotlight_excluded(&base_dir);
     Ok(base_dir)
 }
 
@@ -169,7 +213,13 @@ fn setup_logging(
             // SCREENPIPE_LOG=ort=info.
             .add_directive("ort=warn".parse().unwrap());
 
-        #[cfg(target_os = "windows")]
+        // xcap probes stale monitor / window IDs on every refresh and emits
+        // ERROR-level lines for IDs that don't exist (e.g. ImplMonitor::new(8)
+        // failed after a display was unplugged). Hundreds per session, all
+        // benign, and they crowd out real errors in user feedback logs.
+        // Silence on every platform — was previously windows-only, but the
+        // same spam happens on macOS (Core Graphics display IDs persist after
+        // disconnect) and on Linux X11.
         let filter = filter
             .add_directive("xcap::platform::impl_window=off".parse().unwrap())
             .add_directive("xcap::platform::impl_monitor=off".parse().unwrap())
@@ -252,7 +302,9 @@ async fn main() -> anyhow::Result<()> {
     set_fd_limit();
 
     debug!("starting screenpipe server");
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let record_arg_sources = RecordArgSources::from_cli_matches(&matches);
+    let cli = Cli::from_arg_matches(&matches)?;
 
     // Dispatch subcommands — non-recording commands return early
     let record_args = match cli.command {
@@ -264,6 +316,14 @@ async fn main() -> anyhow::Result<()> {
             let local_data_dir = get_base_dir(data_dir)?;
             let _log_guard = Some(setup_logging(&local_data_dir, false, true)?);
             handle_status_command(json, data_dir, port).await?;
+            return Ok(());
+        }
+        Command::Search(ref args) => {
+            handle_search_command(args).await?;
+            return Ok(());
+        }
+        Command::Team { ref subcommand } => {
+            handle_team_command(subcommand).await?;
             return Ok(());
         }
         Command::Pipe { ref subcommand } => {
@@ -314,6 +374,10 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::login::handle_whoami_command().await?;
             return Ok(());
         }
+        Command::Survey => {
+            screenpipe_engine::cli::survey::handle_survey_command().await?;
+            return Ok(());
+        }
         Command::Auth { ref subcommand } => {
             screenpipe_engine::cli::auth::handle_auth_command(subcommand).await?;
             return Ok(());
@@ -329,6 +393,10 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::backup::handle_backup_command(subcommand, data_dir).await?;
             return Ok(());
         }
+        Command::Export(ref args) => {
+            screenpipe_engine::cli::export::handle_export_command(args).await?;
+            return Ok(());
+        }
         Command::Doctor => {
             eprintln!("screenpipe doctor");
             eprintln!("=================");
@@ -337,6 +405,7 @@ async fn main() -> anyhow::Result<()> {
             // permissions
             eprintln!("permissions:");
             let perms_ok = screenpipe_core::permissions::preflight_check(true, true);
+            let system_audio_ok = doctor_check_system_audio_capture().await;
             eprintln!();
 
             // ffmpeg
@@ -357,10 +426,11 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("  port 3030: available");
             } else {
                 eprintln!("  port 3030: in use (screenpipe may already be running)");
+                eprintln!("    stop the existing process or run record with --port <PORT>");
             }
             eprintln!();
 
-            if perms_ok && ffmpeg_ok {
+            if perms_ok && system_audio_ok && ffmpeg_ok && port_ok {
                 eprintln!("all checks passed — ready to record");
             } else {
                 eprintln!("some checks failed — fix the issues above before running screenpipe");
@@ -371,16 +441,32 @@ async fn main() -> anyhow::Result<()> {
         Command::Record(args) => args,
     };
 
+    let local_data_dir = get_base_dir(&record_args.data_dir)?;
+    let local_data_dir_clone = local_data_dir.clone();
+
+    // Build unified RecordingConfig from shared app settings plus explicit CLI args.
+    let config = record_args
+        .clone()
+        .into_recording_config(local_data_dir.clone(), &record_arg_sources)
+        .await?;
+
+    // Store the guard in a variable that lives for the entire main function
+    let _log_guard = Some(setup_logging(
+        &local_data_dir,
+        record_args.debug,
+        !config.analytics_enabled,
+    )?);
+
     // Non-blocking update check — runs in background, prints banner if outdated
     tokio::spawn(async {
-        check_for_updates().await;
+        screenpipe_engine::cli_reminder::check_for_updates().await;
     });
 
     // Periodic terminal nudge to install the desktop app (CLI-only).
     screenpipe_engine::cli_reminder::spawn();
 
     // Initialize Sentry only if telemetry is enabled
-    let _sentry_guard = if !record_args.disable_telemetry {
+    let _sentry_guard = if config.analytics_enabled {
         let sentry_release_name_append = env::var("SENTRY_RELEASE_NAME_APPEND").unwrap_or_default();
         let release_name = format!(
             "{}{}",
@@ -420,6 +506,9 @@ async fn main() -> anyhow::Result<()> {
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running
                             r"database is locked",
+                            // Port conflict — another screenpipe instance is already bound
+                            // (CLI-2J: 659 events / 649 users — user environment, not a bug)
+                            r"you're likely already running screenpipe instance",
                             // Broken Homebrew install — external dylib missing
                             r"Library not loaded.*libx265\.",
                             // Linux system library missing — distro-local, not our bug
@@ -459,41 +548,43 @@ async fn main() -> anyhow::Result<()> {
 
         // Attach non-sensitive CLI settings to all future Sentry events
         sentry::configure_scope(|scope| {
-            // Set user.id to the same analytics ID used by PostHog
-            // This links Sentry errors to PostHog sessions and feedback reports
+            // Set user.id to the same analytics ID used by PostHog. Embedded
+            // customers can set SCREENPIPE_SUPPORT_ID to make standalone CLI
+            // events searchable by customer without using email.
             scope.set_user(Some(sentry::protocol::User {
                 id: Some(analytics::get_distinct_id().to_string()),
                 ..Default::default()
             }));
+            let telemetry_context =
+                screenpipe_engine::telemetry_context::TelemetryContext::from_env();
+            for (key, value) in telemetry_context.pairs() {
+                scope.set_tag(key, value);
+            }
+            if !telemetry_context.is_empty() {
+                scope.set_context(
+                    "screenpipe_support",
+                    sentry::protocol::Context::Other(telemetry_context.to_json_map()),
+                );
+            }
             scope.set_context(
                 "cli_settings",
                 sentry::protocol::Context::Other({
                     let mut map = std::collections::BTreeMap::new();
                     map.insert(
                         "audio_chunk_duration".into(),
-                        json!(record_args.audio_chunk_duration),
+                        json!(config.audio_chunk_duration),
                     );
-                    map.insert("port".into(), json!(record_args.port));
-                    map.insert("disable_audio".into(), json!(record_args.disable_audio));
+                    map.insert("port".into(), json!(config.port));
+                    map.insert("disable_audio".into(), json!(config.disable_audio));
                     map.insert(
                         "audio_transcription_engine".into(),
-                        json!(format!("{:?}", record_args.audio_transcription_engine)),
+                        json!(format!("{:?}", config.audio_transcription_engine)),
                     );
-                    map.insert("monitor_ids".into(), json!(record_args.monitor_id));
-                    map.insert(
-                        "use_all_monitors".into(),
-                        json!(record_args.use_all_monitors),
-                    );
-                    map.insert(
-                        "languages".into(),
-                        json!(record_args
-                            .language
-                            .iter()
-                            .map(|l| format!("{:?}", l))
-                            .collect::<Vec<_>>()),
-                    );
-                    map.insert("use_pii_removal".into(), json!(record_args.use_pii_removal));
-                    map.insert("disable_vision".into(), json!(record_args.disable_vision));
+                    map.insert("monitor_ids".into(), json!(config.monitor_ids));
+                    map.insert("use_all_monitors".into(), json!(config.use_all_monitors));
+                    map.insert("languages".into(), json!(config.languages));
+                    map.insert("use_pii_removal".into(), json!(config.use_pii_removal));
+                    map.insert("disable_vision".into(), json!(config.disable_vision));
                     map.insert("vad_engine".into(), json!("Silero"));
                     map.insert("enable_sync".into(), json!(record_args.enable_sync));
                     map.insert(
@@ -501,26 +592,26 @@ async fn main() -> anyhow::Result<()> {
                         json!(record_args.sync_interval_secs),
                     );
                     map.insert("debug".into(), json!(record_args.debug));
-                    map.insert("api_auth".into(), json!(record_args.api_auth));
-                    map.insert("encrypt_secrets".into(), json!(record_args.encrypt_secrets));
+                    map.insert("api_auth".into(), json!(config.api_auth));
+                    map.insert("encrypt_secrets".into(), json!(config.encrypt_secrets));
                     map.insert("retention_days".into(), json!(record_args.retention_days));
                     map.insert("retention_mode".into(), json!(record_args.retention_mode));
                     // Only send counts for privacy-sensitive lists (not actual values)
                     map.insert(
                         "audio_device_count".into(),
-                        json!(record_args.audio_device.len()),
+                        json!(config.audio_devices.len()),
                     );
                     map.insert(
                         "ignored_windows_count".into(),
-                        json!(record_args.ignored_windows.len()),
+                        json!(config.ignored_windows.len()),
                     );
                     map.insert(
                         "included_windows_count".into(),
-                        json!(record_args.included_windows.len()),
+                        json!(config.included_windows.len()),
                     );
                     map.insert(
                         "ignored_urls_count".into(),
-                        json!(record_args.ignored_urls.len()),
+                        json!(config.ignored_urls.len()),
                     );
                     map
                 }),
@@ -532,31 +623,23 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let local_data_dir = get_base_dir(&record_args.data_dir)?;
-    let local_data_dir_clone = local_data_dir.clone();
-
-    // Store the guard in a variable that lives for the entire main function
-    let _log_guard = Some(setup_logging(
-        &local_data_dir,
-        record_args.debug,
-        record_args.disable_telemetry,
-    )?);
-
-    // Build unified RecordingConfig from CLI args
-    let config = record_args
-        .clone()
-        .into_recording_config(local_data_dir.clone())
-        .await;
-
-    // Replace the current conditional check with:
-    let ffmpeg_path = find_ffmpeg_path();
-    if ffmpeg_path.is_none() {
-        // Try one more time, which might trigger the installation
+    // Only require ffmpeg when audio recording is enabled. Vision-only recording
+    // should not attempt network installs (important for offline / locked-down
+    // Windows environments).
+    if !config.disable_audio {
         let ffmpeg_path = find_ffmpeg_path();
         if ffmpeg_path.is_none() {
-            eprintln!("ffmpeg not found and installation failed. please install ffmpeg manually.");
-            std::process::exit(1);
+            // Try one more time, which might trigger the installation
+            let ffmpeg_path = find_ffmpeg_path();
+            if ffmpeg_path.is_none() {
+                eprintln!(
+                    "ffmpeg not found and installation failed. please install ffmpeg manually."
+                );
+                std::process::exit(1);
+            }
         }
+    } else {
+        debug!("audio disabled; skipping ffmpeg preflight");
     }
 
     // Pre-flight permission check (macOS: trigger native prompts + poll until granted)
@@ -675,39 +758,24 @@ async fn main() -> anyhow::Result<()> {
         list_monitors().await
     };
 
-    let mut audio_devices = Vec::new();
+    let audio_devices = if config.disable_audio {
+        Vec::new()
+    } else {
+        resolve_audio_devices_for_capture(&config.audio_devices, config.use_system_default_audio)
+            .await
+    };
 
-    if !config.disable_audio {
-        if config.audio_devices.is_empty() {
-            // Use default devices
-            if let Ok(input_device) = default_input_device() {
-                audio_devices.push(input_device.to_string());
-            }
-            if let Ok(output_device) = default_output_device().await {
-                audio_devices.push(output_device.to_string());
-            }
-        } else {
-            // Use specified devices
-            for d in &config.audio_devices {
-                match parse_audio_device(d) {
-                    Ok(device) => audio_devices.push(device.to_string()),
-                    Err(e) => warn!("skipping unparseable audio device '{}': {}", d, e),
-                }
-            }
-        }
-
-        if audio_devices.is_empty() {
-            warn!("no audio devices available.");
-        }
+    if !config.disable_audio && audio_devices.is_empty() {
+        warn!("no audio devices available.");
     }
 
     let audio_devices_clone = audio_devices.clone();
 
-    let resource_monitor = ResourceMonitor::new(!record_args.disable_telemetry);
+    let resource_monitor = ResourceMonitor::new(config.analytics_enabled);
     resource_monitor.start_monitoring(Duration::from_secs(30), Some(Duration::from_secs(60)));
 
     // Initialize analytics for API tracking
-    analytics::init(!record_args.disable_telemetry);
+    analytics::init(config.analytics_enabled);
 
     // Check macOS version and send telemetry if below supported versions
     // This helps track users who may have screen capture issues due to old macOS
@@ -756,7 +824,8 @@ async fn main() -> anyhow::Result<()> {
 
     let db_server = db.clone();
 
-    let warning_audio_transcription_engine_clone = record_args.audio_transcription_engine.clone();
+    let warning_audio_transcription_engine_clone =
+        format!("{:?}", config.audio_transcription_engine);
     let monitor_ids: Vec<u32> = if config.use_all_monitors || config.monitor_ids.is_empty() {
         all_monitors.iter().map(|m| m.id()).collect::<Vec<_>>()
     } else if config.monitor_ids == vec!["default"] {
@@ -793,8 +862,8 @@ async fn main() -> anyhow::Result<()> {
     let output_path_clone = Arc::new(local_data_dir.join("data").to_string_lossy().into_owned());
     let shutdown_tx_clone = shutdown_tx.clone();
 
-    let ignored_windows_clone = record_args.ignored_windows.clone();
-    let included_windows_clone = record_args.included_windows.clone();
+    let ignored_windows_clone = config.ignored_windows.clone();
+    let included_windows_clone = config.included_windows.clone();
     // Create UI recorder config early before cli is moved
     let ui_recorder_config = config.to_ui_recorder_config();
 
@@ -829,35 +898,38 @@ async fn main() -> anyhow::Result<()> {
     let audio_manager = match audio_manager_builder.build(db.clone()).await {
         Ok(mut manager) => {
             // Wire up audio → hot cache: push new transcriptions so the WS
-            // streaming handler can attach audio to live frames.
-            let cache = hot_frame_cache.clone();
-            let rt = tokio::runtime::Handle::current();
-            // Use the actual capture time (when audio was recorded), not Utc::now().
-            // In smart/batch mode, transcription can be deferred by minutes — using
-            // Utc::now() would place audio far from the frames it belongs to.
-            manager.set_on_transcription_insert(std::sync::Arc::new(move |info| {
-                let cache = cache.clone();
-                let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
-                    .unwrap_or_else(chrono::Utc::now);
-                rt.spawn(async move {
-                    use screenpipe_engine::hot_frame_cache::HotAudio;
-                    cache
-                        .push_audio(HotAudio {
-                            audio_chunk_id: info.audio_chunk_id,
-                            timestamp: ts,
-                            transcription: info.transcription,
-                            device_name: info.device_name,
-                            is_input: info.is_input,
-                            audio_file_path: info.audio_file_path,
-                            duration_secs: info.duration_secs,
-                            start_time: info.start_time,
-                            end_time: info.end_time,
-                            speaker_id: info.speaker_id,
-                            speaker_name: None,
-                        })
-                        .await;
-                });
-            }));
+            // streaming handler can attach audio to live frames. Skipped when the
+            // timeline is disabled (the cache is only read by the timeline).
+            if !config.disable_timeline {
+                let cache = hot_frame_cache.clone();
+                let rt = tokio::runtime::Handle::current();
+                // Use the actual capture time (when audio was recorded), not Utc::now().
+                // In smart/batch mode, transcription can be deferred by minutes — using
+                // Utc::now() would place audio far from the frames it belongs to.
+                manager.set_on_transcription_insert(std::sync::Arc::new(move |info| {
+                    let cache = cache.clone();
+                    let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
+                        .unwrap_or_else(chrono::Utc::now);
+                    rt.spawn(async move {
+                        use screenpipe_engine::hot_frame_cache::HotAudio;
+                        cache
+                            .push_audio(HotAudio {
+                                audio_chunk_id: info.audio_chunk_id,
+                                timestamp: ts,
+                                transcription: info.transcription.into(),
+                                device_name: info.device_name.into(),
+                                is_input: info.is_input,
+                                audio_file_path: info.audio_file_path.into(),
+                                duration_secs: info.duration_secs,
+                                start_time: info.start_time,
+                                end_time: info.end_time,
+                                speaker_id: info.speaker_id,
+                                speaker_name: None,
+                            })
+                            .await;
+                    });
+                }));
+            }
             Arc::new(manager)
         }
         Err(e) => {
@@ -887,20 +959,112 @@ async fn main() -> anyhow::Result<()> {
         info!("snapshot compaction disabled via --disable-snapshot-compaction");
     }
 
+    // Build the shared high-FPS controller once. Same instance feeds the
+    // VisionManager (so each capture loop reacts on the next tick) and the
+    // SCServer (so HTTP toggles, the tray menu, and pipes can all hit it
+    // without an engine restart). Seed from the persisted RecordingSettings
+    // so a user who already toggled the auto-mode preference keeps it.
+    let high_fps_controller = Arc::new(HighFpsController::new(
+        meeting_detector.clone(),
+        config.hd_recording_default,
+        config.hd_recording_interval_ms,
+    ));
+
+    // Wire `meeting_ended` → controller.handle_meeting_ended so a
+    // meeting-bound session auto-stops when the call ends. Without this,
+    // the only safety net is the 4-hour hard cap.
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+            while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                if let Some(id) = meeting_id {
+                    controller.handle_meeting_ended(id);
+                }
+            }
+        });
+    }
+
+    // On every `meeting_started`:
+    //   1. Always upgrade any active PrewarmPending session to Meeting{id}
+    //      so the user gets full call coverage instead of the 1hr clip.
+    //      Safe regardless of default_mode — only PrewarmPending sessions
+    //      are upgraded; explicit timers and existing meeting bindings
+    //      are left alone.
+    //   2. If default_mode = Always AND no session is pending an upgrade,
+    //      auto-start a meeting-bound session.
+    //   Ask mode is handled by the desktop shell (it adds a "+ HD" action
+    //   to the existing notification).
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+            while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                let Some(id) = meeting_id else { continue };
+
+                // Step 1: prewarm-pending upgrade is universal.
+                controller.try_upgrade_pending_to_meeting(id);
+
+                // Step 2: auto-start only for Always mode AND only if the
+                // upgrade above didn't already bind a session.
+                let snap = controller.snapshot();
+                if !matches!(
+                    snap.default_mode,
+                    screenpipe_engine::high_fps_controller::DefaultMode::Always
+                ) {
+                    continue;
+                }
+                let already_bound = matches!(
+                    snap.kind,
+                    Some(screenpipe_engine::high_fps_controller::SessionKind::Meeting { .. })
+                );
+                if !already_bound {
+                    controller.start_meeting_session(id);
+                }
+            }
+        });
+    }
+
     // Create VisionManager for event-driven capture on all monitors
-    let (handle, capture_trigger_tx) = if !config.disable_vision {
+    let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
+        // Hot frame cache is only consumed by the timeline streaming endpoint;
+        // skip frame buffering when the timeline is disabled.
+        let hot_cache_for_capture = if config.disable_timeline {
+            None
+        } else {
+            Some(hot_frame_cache.clone())
+        };
         let vision_manager = Arc::new(
             VisionManager::new(vision_config, db_clone.clone(), vision_handle.clone())
-                .with_hot_frame_cache(hot_frame_cache.clone())
-                .with_power_profile(power_manager.subscribe()),
+                .with_hot_frame_cache(hot_cache_for_capture)
+                .with_power_profile(power_manager.subscribe())
+                .with_high_fps_controller(high_fps_controller.clone()),
         );
 
         // Get the broadcast trigger sender BEFORE moving the VisionManager into
         // the spawned task. This sender is passed to start_ui_recording so UI
         // events (clicks, app switches, clipboard) trigger captures.
         let trigger_tx = vision_manager.trigger_sender();
+        // Same idea for the frame-linker channel: shared between the
+        // recorder (sends EventPersisted after batch flush) and each
+        // capture loop (sends FrameCaptured after a successful capture).
+        let linker_tx = vision_manager.linker_sender();
 
         let vm_clone = vision_manager.clone();
         let audio_manager_for_drm = if !config.disable_audio {
@@ -934,11 +1098,11 @@ async fn main() -> anyhow::Result<()> {
                 error!("Error shutting down VisionManager: {:?}", e);
             }
         });
-        (h, Some(trigger_tx))
+        (h, Some(trigger_tx), Some(linker_tx))
     } else {
         // Vision disabled — spawn a pending task so `handle` never completes
         // (otherwise the no-op future wins the tokio::select! race and shuts down the server)
-        (tokio::spawn(std::future::pending::<()>()), None)
+        (tokio::spawn(std::future::pending::<()>()), None, None)
     };
 
     let local_data_dir_clone_2 = local_data_dir_clone.clone();
@@ -963,6 +1127,16 @@ async fn main() -> anyhow::Result<()> {
         info!("API auth enabled — run `screenpipe auth token` to view your key");
     }
 
+    // Standalone CLI users miss out on the chat/timeline UI — point them at the
+    // desktop app. SCREENPIPE_ANALYTICS_ID is only set when the Tauri app spawns
+    // the engine, so its absence is a reliable "this is a bare CLI run" signal.
+    if std::env::var("SCREENPIPE_ANALYTICS_ID").is_err() {
+        eprintln!();
+        eprintln!("  tip: get the desktop app for chat, timeline, and search UI");
+        eprintln!("       → https://screenpi.pe/onboarding");
+        eprintln!();
+    }
+
     let mut server = SCServer::new(
         db_server,
         SocketAddr::new(IpAddr::V4(config.listen_address), config.port),
@@ -976,6 +1150,7 @@ async fn main() -> anyhow::Result<()> {
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
     server.hot_frame_cache = Some(hot_frame_cache);
+    server.timeline_disabled = config.disable_timeline;
     server.power_manager = Some(power_manager);
     server.manual_meeting = Some(manual_meeting.clone());
     server.api_auth = config.api_auth;
@@ -985,7 +1160,7 @@ async fn main() -> anyhow::Result<()> {
     // SCServer::cloud_token_handle after spawn.
     if let Ok(t) = std::env::var("SCREENPIPE_API_KEY") {
         if !t.is_empty() {
-            let _ = server.cloud_token.try_write().map(|mut g| *g = Some(t));
+            server.cloud_token.store(std::sync::Arc::new(Some(t)));
         }
     }
 
@@ -1001,6 +1176,10 @@ async fn main() -> anyhow::Result<()> {
                 match screenpipe_secrets::keychain::get_or_create_key() {
                     Some(k) => {
                         info!("keychain: encryption key ready (--encrypt-secrets)");
+                        if let Err(e) = screenpipe_secrets::mark_encryption_enabled(&local_data_dir)
+                        {
+                            warn!("keychain: failed to persist encryption opt-in flag: {}", e);
+                        }
                         Some(k)
                     }
                     None => {
@@ -1067,9 +1246,10 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pipes_dir).ok();
 
     let user_token = std::env::var("SCREENPIPE_API_KEY").ok();
-    let pi_executor = std::sync::Arc::new(screenpipe_core::agents::pi::PiExecutor::new(
-        user_token.clone(),
-    ));
+    let pi_executor = std::sync::Arc::new(
+        screenpipe_core::agents::pi::PiExecutor::new(user_token.clone())
+            .with_api_auth_key(config.api_auth_key.clone()),
+    );
 
     // Workflow event classifier — opt-in cloud feature. Polls recent activity
     // and emits `WorkflowEvent`s on the bus so pipes with `trigger.events`
@@ -1172,7 +1352,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("failed to start pipe scheduler: {}", e);
     }
     let shared_pipe_manager = std::sync::Arc::new(tokio::sync::Mutex::new(pipe_manager));
-    let server = server.with_pipe_manager(shared_pipe_manager.clone());
+    let server = server
+        .with_pipe_manager(shared_pipe_manager.clone())
+        .with_high_fps_controller(high_fps_controller.clone());
 
     // Install pi agent in background
     tokio::spawn(async move {
@@ -1199,20 +1381,14 @@ async fn main() -> anyhow::Result<()> {
     println!("├────────────────────────┼────────────────────────────────────┤");
     println!(
         "│ audio chunk duration   │ {:<34} │",
-        format!("{} seconds", record_args.audio_chunk_duration)
+        format!("{} seconds", config.audio_chunk_duration)
     );
-    println!("│ port                   │ {:<34} │", record_args.port);
-    println!(
-        "│ audio disabled         │ {:<34} │",
-        record_args.disable_audio
-    );
-    println!(
-        "│ vision disabled        │ {:<34} │",
-        record_args.disable_vision
-    );
+    println!("│ port                   │ {:<34} │", config.port);
+    println!("│ audio disabled         │ {:<34} │", config.disable_audio);
+    println!("│ vision disabled        │ {:<34} │", config.disable_vision);
     println!(
         "│ pause on DRM content   │ {:<34} │",
-        record_args.pause_on_drm_content
+        config.pause_on_drm_content
     );
     println!(
         "│ audio engine           │ {:<34} │",
@@ -1226,15 +1402,15 @@ async fn main() -> anyhow::Result<()> {
     println!("│ debug mode             │ {:<34} │", record_args.debug);
     println!(
         "│ telemetry              │ {:<34} │",
-        !record_args.disable_telemetry
+        config.analytics_enabled
     );
     println!(
         "│ use pii removal        │ {:<34} │",
-        record_args.use_pii_removal
+        config.use_pii_removal
     );
     println!(
         "│ use all monitors       │ {:<34} │",
-        record_args.use_all_monitors
+        config.use_all_monitors
     );
     println!(
         "│ ignored windows        │ {:<34} │",
@@ -1265,7 +1441,7 @@ async fn main() -> anyhow::Result<()> {
     // For security reasons, you might want to mask the API key if displayed
     println!(
         "│ deepgram key           │ {:<34} │",
-        if record_args.deepgram_api_key.is_some() {
+        if config.deepgram_api_key.is_some() {
             "set (masked)"
         } else {
             "not set"
@@ -1273,7 +1449,7 @@ async fn main() -> anyhow::Result<()> {
     );
     println!(
         "│ api auth               │ {:<34} │",
-        if record_args.api_auth {
+        if config.api_auth {
             "enabled"
         } else {
             "disabled"
@@ -1333,10 +1509,10 @@ async fn main() -> anyhow::Result<()> {
     println!("│ languages              │                                    │");
     const MAX_ITEMS_TO_DISPLAY: usize = 5;
 
-    if record_args.language.is_empty() {
+    if config.languages.is_empty() {
         println!("│ {:<22} │ {:<34} │", "", "all languages");
     } else {
-        let total_languages = record_args.language.len();
+        let total_languages = config.languages.len();
         for (_, language) in languages.iter().enumerate().take(MAX_ITEMS_TO_DISPLAY) {
             let language_str = format!("id: {}", language);
             let formatted_language = format_cell(&language_str, VALUE_WIDTH);
@@ -1355,7 +1531,7 @@ async fn main() -> anyhow::Result<()> {
     println!("├────────────────────────┼────────────────────────────────────┤");
     println!("│ monitors               │                                    │");
 
-    if record_args.disable_vision {
+    if config.disable_vision {
         println!("│ {:<22} │ {:<34} │", "", "vision disabled");
     } else if monitor_ids.is_empty() {
         println!("│ {:<22} │ {:<34} │", "", "no monitors available");
@@ -1379,7 +1555,7 @@ async fn main() -> anyhow::Result<()> {
     println!("├────────────────────────┼────────────────────────────────────┤");
     println!("│ audio devices          │                                    │");
 
-    if record_args.disable_audio {
+    if config.disable_audio {
         println!("│ {:<22} │ {:<34} │", "", "disabled");
     } else if audio_devices_clone.is_empty() {
         println!("│ {:<22} │ {:<34} │", "", "no devices available");
@@ -1406,7 +1582,7 @@ async fn main() -> anyhow::Result<()> {
     println!("└────────────────────────┴────────────────────────────────────┘");
 
     // Add warning for cloud arguments and telemetry
-    if warning_audio_transcription_engine_clone == CliAudioTranscriptionEngine::Deepgram {
+    if warning_audio_transcription_engine_clone == "Deepgram" {
         println!(
             "{}",
             "warning: you are using cloud now. make sure to understand the data privacy risks."
@@ -1421,7 +1597,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Add warning for telemetry
-    if !record_args.disable_telemetry {
+    if config.analytics_enabled {
         println!(
             "{}",
             "warning: telemetry is enabled. only error-level data will be sent.\n\
@@ -1469,7 +1645,8 @@ async fn main() -> anyhow::Result<()> {
                 db.clone(),
                 ui_recorder_config,
                 capture_trigger_tx,
-                record_args.ignored_windows.clone(),
+                linker_tx,
+                config.ignored_windows.clone(),
             )
             .await
             {
@@ -1494,6 +1671,7 @@ async fn main() -> anyhow::Result<()> {
             manual_meeting.clone(),
             shutdown_tx.subscribe(),
             Some(meeting_detector),
+            true,
         ))
     } else {
         info!("meeting watcher skipped because audio capture is disabled");
@@ -1555,22 +1733,23 @@ async fn main() -> anyhow::Result<()> {
     // Spawn the async PII reconciliation worker (issue #3185).
     // Off by default — only runs when `--async-pii-redaction` is set.
     // The capture path is unaffected either way.
-    if !record_args.async_pii_redaction {
+    if !config.async_pii_redaction {
         info!(
             "text-PII worker skipped at startup — async_pii_redaction=false. \
              OPF model (~2.8 GB) will NOT be downloaded or loaded. \
              Toggle via Settings → Privacy → AI PII removal."
         );
     }
-    if record_args.async_pii_redaction {
+    if config.async_pii_redaction {
         use screenpipe_redact::{
             adapters::{
+                onnx::{OnnxConfig, OnnxRedactor},
                 opf::{OpfAdapter, OpfConfig},
-                tinfoil::TinfoilRedactor,
+                tinfoil::{TinfoilConfig, TinfoilRedactor},
             },
             pipeline::{Pipeline, PipelineConfig},
             worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
-            Redactor,
+            Redactor, TextRedactionPolicy,
         };
         use std::sync::Arc;
 
@@ -1578,50 +1757,106 @@ async fn main() -> anyhow::Result<()> {
 
         // Pipeline: regex pre-pass + AI fallback. Regex catches
         // structural PII deterministically and on-device. AI step
-        // resolves to:
-        //   1. local opf-rs (candle, ~74 ms p50 on Mac CPU, 41 ms on
-        //      Metal). First run downloads ~2.8 GB from
-        //      huggingface.co/screenpipe/pii-text-redactor and verifies
-        //      SHA-256 before landing at ~/.screenpipe/models/opf-v6/.
-        //      Spawned off the boot path so a slow first-run pull
-        //      doesn't block the engine.
-        //   2. Tinfoil confidential-compute enclave when TINFOIL_*
-        //      env vars are set and local opf-rs is unavailable.
-        //   3. regex-only otherwise (still destructive — overwrites
+        // resolves to (preference order):
+        //   1. v45_phase3 ONNX (xlm-roberta-base fine-tune, INT8, ~278 MB,
+        //      9 ms p50 on CPU, CoreML on macOS / DirectML on Windows
+        //      via the redact-onnx-* CI feature). First run downloads
+        //      from huggingface.co/screenpipe/pii-redactor under
+        //      v45_phase3_onnx/. Same checkpoint the Tinfoil container
+        //      and the desktop app's own worker use, so outputs match
+        //      across surfaces.
+        //   2. Legacy opf-rs (candle, OPF v6, ~74 ms p50 on Mac CPU,
+        //      ~2.8 GB) if v45 ONNX isn't compiled in or the download
+        //      fails.
+        //   3. Tinfoil confidential-compute enclave when TINFOIL_*
+        //      env vars are set and both local adapters are unavailable.
+        //   4. Regex-only otherwise (still destructive — overwrites
         //      regex-redacted text into the source columns).
         let pool = db.pool.clone();
+        let labels = config.pii_redaction_labels.clone();
         tokio::spawn(async move {
+            // Per-label allow-list from the `piiRedactionLabels` setting
+            // (default ["secret"]). Local adapters filter client-side via
+            // this policy; the env-gated tinfoil fallback forwards the
+            // raw labels so the enclave filters server-side.
+            let policy = TextRedactionPolicy::from_labels(&labels);
             info!(
-                "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
-                 ~/.screenpipe/models/opf-v6/)"
+                "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
+                 cached at ~/.screenpipe/models/v45_phase3_onnx/)"
             );
-            let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
+            let pipeline = match OnnxRedactor::load_or_download(OnnxConfig::default()).await {
                 Ok(adapter) => {
                     info!(
-                        "text-PII AI step: local opf-rs (candle) — lazy load on first \
-                         batch, idle-unload after 60s of no work"
+                        "text-PII AI step: local v45_phase3 ONNX — same checkpoint as the \
+                         desktop app + Tinfoil container, sub-10 ms p50 on CPU"
                     );
-                    // Wrap in Arc first so we can spawn the idle
-                    // unloader (which needs `Arc<Self>`) and still
-                    // hand the same Arc to the Pipeline.
-                    let adapter = Arc::new(adapter);
-                    let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
-                    let ai: Arc<dyn Redactor> = adapter;
-                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                    let ai: Arc<dyn Redactor> = Arc::new(adapter);
+                    Pipeline::regex_then_ai(
+                        ai,
+                        PipelineConfig {
+                            policy: policy.clone(),
+                            ..Default::default()
+                        },
+                    )
                 }
-                Err(e) => {
-                    if std::env::var("TINFOIL_API_KEY").is_ok()
-                        || std::env::var("TINFOIL_BASE_URL").is_ok()
-                    {
-                        info!("text-PII AI step: tinfoil enclave (local opf-rs unavailable: {e})");
-                        let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
-                        Pipeline::regex_then_ai(ai, PipelineConfig::default())
-                    } else {
-                        tracing::warn!(
-                            "text-PII AI step disabled — local opf-rs unavailable ({e}) and no \
-                             TINFOIL_* env vars set. Worker will run regex-only."
-                        );
-                        Pipeline::regex_only()
+                Err(onnx_err) => {
+                    tracing::warn!(
+                        "couldn't load v45 phase 3 ONNX redactor ({onnx_err}); falling back \
+                         to OPF v6 candle"
+                    );
+                    info!(
+                        "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
+                         ~/.screenpipe/models/opf-v6/)"
+                    );
+                    match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                        Ok(adapter) => {
+                            info!(
+                                "text-PII AI step: local opf-rs (candle) fallback — lazy load \
+                                 on first batch, idle-unload after 60s of no work"
+                            );
+                            // Wrap in Arc first so we can spawn the idle
+                            // unloader (which needs `Arc<Self>`) and still
+                            // hand the same Arc to the Pipeline.
+                            let adapter = Arc::new(adapter);
+                            let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                            let ai: Arc<dyn Redactor> = adapter;
+                            Pipeline::regex_then_ai(
+                                ai,
+                                PipelineConfig {
+                                    policy: policy.clone(),
+                                    ..Default::default()
+                                },
+                            )
+                        }
+                        Err(e) => {
+                            if std::env::var("TINFOIL_API_KEY").is_ok()
+                                || std::env::var("TINFOIL_BASE_URL").is_ok()
+                            {
+                                info!(
+                                    "text-PII AI step: tinfoil enclave (local adapters \
+                                     unavailable: opf-rs={e})"
+                                );
+                                let ai: Arc<dyn Redactor> =
+                                    Arc::new(TinfoilRedactor::new(TinfoilConfig {
+                                        labels: labels.clone(),
+                                        ..Default::default()
+                                    }));
+                                Pipeline::regex_then_ai(
+                                    ai,
+                                    PipelineConfig {
+                                        policy: policy.clone(),
+                                        ..Default::default()
+                                    },
+                                )
+                            } else {
+                                tracing::warn!(
+                                    "text-PII AI step disabled — both v45 ONNX and opf-rs \
+                                     unavailable ({e}), and no TINFOIL_* env vars set. Worker \
+                                     will run regex-only."
+                                );
+                                Pipeline::regex_only_with_policy(policy.clone())
+                            }
+                        }
                     }
                 }
             };
@@ -1644,56 +1879,61 @@ async fn main() -> anyhow::Result<()> {
     // Independent of the text worker — users can toggle either one
     // without the other. Requires the rfdetr_v9 model present and at
     // least one of the `onnx-*` or `mlx-mac` cargo features built.
-    if !record_args.async_image_pii_redaction {
+    if !config.async_image_pii_redaction {
         info!(
             "image-PII worker skipped at startup — async_image_pii_redaction=false. \
              rfdetr_v9 model (~108 MB) will NOT be downloaded or loaded. \
              Toggle via Settings → Privacy → AI PII removal."
         );
     }
-    if record_args.async_image_pii_redaction {
+    if config.async_image_pii_redaction {
         use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
         use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
-        use screenpipe_redact::ImageRedactor;
+        use screenpipe_redact::{ImageRedactionPolicy, ImageRedactor};
         use std::sync::Arc;
 
-        // Prefer the MLX runtime on Mac when the safetensors weights
-        // are present (~6× faster than the CoreML EP path). Falls
-        // through to the ONNX adapter otherwise — load_or_download
-        // fetches rfdetr_v9.onnx from
-        // huggingface.co/screenpipe/pii-image-redactor on first run
-        // (~108 MB), verifies SHA-256, caches at
-        // ~/.screenpipe/models/. Subsequent starts are instant.
+        // The desktop app intentionally uses the ONNX image redactor for
+        // local mode. Keep the standalone CLI on that same stable path by
+        // default: the MLX RF-DETR port is still experimental and can crash
+        // the process while reconciling large frame backlogs. Developers can
+        // still opt in while iterating on that runtime.
         #[allow(unused_mut)]
         let mut detector_arc: Option<Arc<dyn ImageRedactor>> = None;
         #[cfg(all(feature = "rfdetr-mlx", target_os = "macos", target_arch = "aarch64"))]
         {
-            use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
-            let mlx_cfg = RfdetrMlxConfig::default();
-            // Mirrors the ONNX adapter: download once, verify SHA-256,
-            // cache at ~/.screenpipe/models/rfdetr_v9.safetensors.
-            if let Err(e) = mlx_cfg.ensure_model_present().await {
-                tracing::info!(
-                    "rfdetr-mlx safetensors download failed ({e}); falling back to ONNX adapter"
-                );
-            } else {
-                match RfdetrMlxRedactor::load(mlx_cfg) {
-                    Ok(d) => {
-                        info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
-                        // Lazy-load + 60 s idle-unload — frees the
-                        // ~150–200 MB MLX resident footprint when the
-                        // worker is paused or the reconciliation queue
-                        // has drained. Same pattern as OpfAdapter.
-                        let d = Arc::new(d);
-                        let _ = Arc::clone(&d).spawn_idle_unloader();
-                        detector_arc = Some(d as Arc<dyn ImageRedactor>);
-                    }
-                    Err(e) => {
-                        tracing::info!(
-                            "rfdetr-mlx load failed ({e}); falling back to ONNX adapter"
-                        );
+            if std::env::var_os("SCREENPIPE_ENABLE_EXPERIMENTAL_RFDETR_MLX").is_some() {
+                use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
+                let mlx_cfg = RfdetrMlxConfig::default();
+                // Mirrors the ONNX adapter: download once, verify SHA-256,
+                // cache at ~/.screenpipe/models/rfdetr_v9.safetensors.
+                if let Err(e) = mlx_cfg.ensure_model_present().await {
+                    tracing::info!(
+                        "rfdetr-mlx safetensors download failed ({e}); falling back to ONNX adapter"
+                    );
+                } else {
+                    match RfdetrMlxRedactor::load(mlx_cfg) {
+                        Ok(d) => {
+                            info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
+                            // Lazy-load + 60 s idle-unload — frees the
+                            // ~150–200 MB MLX resident footprint when the
+                            // worker is paused or the reconciliation queue
+                            // has drained. Same pattern as OpfAdapter.
+                            let d = Arc::new(d);
+                            let _ = Arc::clone(&d).spawn_idle_unloader();
+                            detector_arc = Some(d as Arc<dyn ImageRedactor>);
+                        }
+                        Err(e) => {
+                            tracing::info!(
+                                "rfdetr-mlx load failed ({e}); falling back to ONNX adapter"
+                            );
+                        }
                     }
                 }
+            } else {
+                tracing::info!(
+                    "rfdetr-mlx disabled by default for CLI stability; \
+                     set SCREENPIPE_ENABLE_EXPERIMENTAL_RFDETR_MLX=1 to opt in"
+                );
             }
         }
         if detector_arc.is_none() {
@@ -1719,7 +1959,10 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 "starting async image-PII reconciliation worker (destructive overwrite of source JPGs)"
             );
-            let cfg = ImageWorkerConfig::default();
+            let cfg = ImageWorkerConfig {
+                policy: ImageRedactionPolicy::from_labels(&config.pii_redaction_labels),
+                ..Default::default()
+            };
             let _img_handle = ImageWorker::new(db.pool.clone(), detector, cfg).spawn();
         }
     }
@@ -1778,54 +2021,4 @@ async fn main() -> anyhow::Result<()> {
     info!("shutdown complete");
 
     Ok(())
-}
-
-/// Non-blocking update check. Fetches the latest version from npm registry
-/// and prints a one-line banner if the current version is outdated.
-async fn check_for_updates() {
-    // Skip if user opted out
-    if env::var("SCREENPIPE_NO_UPDATE_CHECK").is_ok() {
-        return;
-    }
-
-    let current = env!("CARGO_PKG_VERSION");
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let resp = match client
-        .get("https://registry.npmjs.org/screenpipe/latest")
-        .header("Accept", "application/json")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return,
-    };
-
-    let json: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let latest = match json.get("version").and_then(|v| v.as_str()) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if latest != current {
-        eprintln!(
-            "\n  {} screenpipe {} available (you have {})",
-            "update:".yellow().bold(),
-            latest.green(),
-            current,
-        );
-        eprintln!("  run: {}", "npx screenpipe@latest record".cyan());
-        eprintln!();
-    }
 }

@@ -42,10 +42,15 @@ pub trait OwnedWebviewHandle: Send + Sync {
 
     /// Fire-and-forget navigation. Default impl falls back to `eval` so
     /// existing transports keep working unchanged; the Tauri impl
-    /// overrides it with `WebviewWindow::navigate(...)` so we don't pay
-    /// the eval round-trip (which polls `document.title` and races the
-    /// page's own title setters — see incident notes in the parent crate).
-    async fn navigate(&self, url: &str) -> Result<(), String> {
+    /// overrides it with the native webview `navigate(...)` call so we
+    /// don't pay the eval round-trip.
+    ///
+    /// `owner` is the chat/session id that issued this navigation (see
+    /// [`Browser::navigate_with_owner`]). The eval fallback can't emit the
+    /// frontend navigate event, so it ignores `owner`; the Tauri impl forwards
+    /// it so the embedded sidebar can keep a background pipe's page out of an
+    /// unrelated chat.
+    async fn navigate(&self, url: &str, _owner: Option<&str>) -> Result<(), String> {
         let escaped = serde_json::to_string(url).map_err(|e| format!("encode url: {e}"))?;
         self.eval(
             &format!("location.href = {escaped}"),
@@ -90,8 +95,9 @@ impl OwnedBrowser {
             "owned-default",
             "Owned Browser",
             "An isolated app-managed webview with its own persistent cookie \
-             jar. Empty by default — does NOT have the user's logged-in \
-             sessions. Use this for: scraping, signups under screenpipe's \
+             jar. Starts logged out; when a site has matching browser cookies, \
+             ScreenPipe asks the user before copying that browser session into \
+             this webview. Use this for: scraping, signups under screenpipe's \
              own accounts, scheduled background tasks, navigating to a public \
              URL the user asked you to open. \
              Navigating auto-opens the embedded sidebar in the user's chat — \
@@ -140,11 +146,17 @@ impl Browser for OwnedBrowser {
             .map_err(EvalError::SendFailed)
     }
     async fn navigate(&self, url: &str) -> Result<(), EvalError> {
+        self.navigate_with_owner(url, None).await
+    }
+    async fn navigate_with_owner(&self, url: &str, owner: Option<&str>) -> Result<(), EvalError> {
         let handle = {
             let guard = self.handle.read().await;
             guard.as_ref().cloned().ok_or(EvalError::NotConnected)?
         };
-        handle.navigate(url).await.map_err(EvalError::SendFailed)
+        handle
+            .navigate(url, owner)
+            .await
+            .map_err(EvalError::SendFailed)
     }
 }
 
@@ -161,6 +173,11 @@ mod tests {
         last_code: Mutex<Option<String>>,
     }
 
+    struct NativeNavigateHandle {
+        last_url: Mutex<Option<String>>,
+        last_owner: Mutex<Option<String>>,
+    }
+
     #[async_trait]
     impl OwnedWebviewHandle for StubHandle {
         async fn eval(
@@ -175,6 +192,28 @@ mod tests {
                 result: Some(serde_json::json!("ok")),
                 error: None,
             })
+        }
+    }
+
+    #[async_trait]
+    impl OwnedWebviewHandle for NativeNavigateHandle {
+        async fn eval(
+            &self,
+            _code: &str,
+            _url: Option<&str>,
+            _timeout: Duration,
+        ) -> Result<EvalResult, String> {
+            Ok(EvalResult {
+                ok: true,
+                result: None,
+                error: None,
+            })
+        }
+
+        async fn navigate(&self, url: &str, owner: Option<&str>) -> Result<(), String> {
+            *self.last_url.lock().await = Some(url.to_string());
+            *self.last_owner.lock().await = owner.map(|s| s.to_string());
+            Ok(())
         }
     }
 
@@ -231,6 +270,53 @@ mod tests {
         assert_eq!(
             handle.last_code.lock().await.clone(),
             Some(r#"location.href = "https://example.com""#.into())
+        );
+    }
+
+    #[tokio::test]
+    async fn attached_owned_navigate_uses_native_handle_override() {
+        let owned = OwnedBrowser::default_instance();
+        let handle = Arc::new(NativeNavigateHandle {
+            last_url: Mutex::new(None),
+            last_owner: Mutex::new(None),
+        });
+        owned.attach(handle.clone()).await;
+
+        owned.navigate("https://example.com/native").await.unwrap();
+
+        assert_eq!(
+            handle.last_url.lock().await.clone(),
+            Some("https://example.com/native".into())
+        );
+        // Plain `navigate` carries no owner (sidebar's own action).
+        assert_eq!(handle.last_owner.lock().await.clone(), None);
+    }
+
+    #[tokio::test]
+    async fn navigate_with_owner_forwards_owner_to_handle() {
+        // Regression: a background pipe / chat agent tags its navigation with
+        // the issuing session id so the embedded sidebar can ignore navigations
+        // that belong to a chat other than the one on screen. The owner must
+        // survive the trip through the connect seam to the desktop handle.
+        let owned = OwnedBrowser::default_instance();
+        let handle = Arc::new(NativeNavigateHandle {
+            last_url: Mutex::new(None),
+            last_owner: Mutex::new(None),
+        });
+        owned.attach(handle.clone()).await;
+
+        owned
+            .navigate_with_owner("https://example.com/owned", Some("pipe:reddit"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            handle.last_url.lock().await.clone(),
+            Some("https://example.com/owned".into())
+        );
+        assert_eq!(
+            handle.last_owner.lock().await.clone(),
+            Some("pipe:reddit".into())
         );
     }
 }

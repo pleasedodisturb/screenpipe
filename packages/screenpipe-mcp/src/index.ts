@@ -12,7 +12,6 @@ import {
   ReadResourceRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
-import { WebSocket } from "ws";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
@@ -194,6 +193,49 @@ function discoverApiKey(): string {
 
 const API_KEY = discoverApiKey();
 
+// Enterprise team token — when present, this MCP additionally registers
+// `team-*` tools that query the org-wide telemetry control plane
+// (https://screenpi.pe/api/enterprise/v1/*) instead of just the local
+// recordings. Same audience: an enterprise admin running screenpipe-mcp
+// inside Claude Desktop / Cursor / Windsurf wants to ask "what did MY
+// machine do" AND "what did MY TEAM do" without juggling two MCPs.
+//
+// Resolution order matches discoverApiKey() in spirit:
+//   1. SCREENPIPE_ENTERPRISE_TOKEN env var (Claude config, terminal)
+//   2. team_api_token field in ~/.screenpipe/enterprise.json (written by
+//      the desktop app's Settings → Privacy → Admin Team API Token)
+//
+// Token format is `sk_ent_…`. Empty / missing → team tools are not
+// registered; non-admin users of screenpipe-mcp see exactly what they
+// see today.
+function discoverTeamToken(): string {
+  const envTok = process.env.SCREENPIPE_ENTERPRISE_TOKEN;
+  if (envTok && envTok.startsWith("sk_ent_")) return envTok;
+  try {
+    const entPath = path.join(os.homedir(), ".screenpipe", "enterprise.json");
+    if (fs.existsSync(entPath)) {
+      const raw = fs.readFileSync(entPath, "utf-8");
+      const parsed = JSON.parse(raw);
+      const tok = typeof parsed?.team_api_token === "string" ? parsed.team_api_token : "";
+      if (tok && tok.startsWith("sk_ent_")) return tok;
+    }
+  } catch {}
+  return "";
+}
+
+const TEAM_TOKEN = discoverTeamToken();
+const TEAM_API = "https://screenpi.pe/api/enterprise/v1";
+
+async function fetchTeam(p: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(`${TEAM_API}${p}`, {
+    ...init,
+    headers: {
+      Authorization: `Bearer ${TEAM_TOKEN}`,
+      ...(init.headers || {}),
+    },
+  });
+}
+
 // Read version from package.json (single source of truth)
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const PKG_VERSION: string = require("../package.json").version;
@@ -219,11 +261,11 @@ const TOOLS: Tool[] = [
   {
     name: "search-content",
     description:
-      "Search screen text, audio transcriptions, input events, and memories. " +
-      "Returns timestamped results with app context. " +
-      "IMPORTANT: prefer activity-summary for broad questions ('what was I doing?'). " +
-      "Use search-content only when you need specific text/content. " +
-      "Start with limit=5, increase only if needed. Results can be large — use max_content_length=500 to truncate.",
+      "Search screen text, audio transcriptions, input events, and memories. Returns timestamped results with app context. " +
+      "USE WHEN: you need the actual text/content of a moment — quotes, OCR snippets, transcript lines — or want to filter by speaker/window. " +
+      "DO NOT USE for: broad questions like 'what was I doing?' (use activity-summary, it pre-summarizes apps + windows + transcripts). " +
+      "Also DO NOT USE for: targeted UI controls (use search-elements). " +
+      "Start with limit=5, increase only if needed. Per-result text is auto-truncated to 1000 chars; pass max_content_length=0 to opt out, or a custom integer to override.",
     annotations: { title: "Search Content", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -235,14 +277,15 @@ const TOOLS: Tool[] = [
         content_type: {
           type: "string",
           enum: ["all", "ocr", "audio", "input", "accessibility", "memory"],
-          description: "Filter by content type. 'accessibility' is preferred for screen text (OS-native). 'ocr' is fallback for apps without accessibility support. Default: 'all'.",
+          description:
+            "Filter by content type. NOTE on screen text: 'ocr' is a legacy label — it returns ALL screen-text rows, which are accessibility-derived for most apps (the result tag [Screen·a11y] vs [Screen·ocr] tells you which). Use 'ocr' for screen text (covers both paths), 'audio' for transcriptions, 'input' for keyboard/mouse events, 'memory' for stored facts. Default: 'all'.",
           default: "all",
         },
         limit: { type: "integer", description: "Max results (default 10, max 20). Start with 5 for exploration.", default: 10 },
         offset: { type: "integer", description: "Pagination offset. Use when results say 'use offset=N for more'.", default: 0 },
         start_time: {
           type: "string",
-          description: "ISO 8601 UTC or relative (e.g. '2h ago', '1d ago'). Always provide to avoid scanning entire history.",
+          description: "Accepted: ISO 8601 ('2024-01-15T10:00:00Z'), 'Nh ago' / 'Nd ago' / 'Nw ago', 'now', 'yesterday', 'today', or bare 'YYYY-MM-DD'. Always provide to avoid scanning entire history.",
         },
         end_time: {
           type: "string",
@@ -270,13 +313,15 @@ const TOOLS: Tool[] = [
     name: "list-meetings",
     description:
       "List detected meetings (Zoom, Teams, Meet, etc.) with duration, app, and attendees. " +
-      "Only available when screenpipe runs in smart transcription mode.",
+      "Only available when screenpipe runs in smart transcription mode. " +
+      "Pass `q` to filter by substring match against title, attendees, and notes (e.g. an email or name).",
     annotations: { title: "List Meetings", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
       properties: {
         start_time: { type: "string", description: "ISO 8601 UTC or relative (e.g. '1d ago')" },
         end_time: { type: "string", description: "ISO 8601 UTC or relative" },
+        q: { type: "string", description: "Case-insensitive substring filter on title, attendees, and note" },
         limit: { type: "integer", description: "Max results (default 20)", default: 20 },
         offset: { type: "integer", description: "Pagination offset", default: 0 },
       },
@@ -286,9 +331,9 @@ const TOOLS: Tool[] = [
     name: "activity-summary",
     description:
       "Rich activity overview: app usage, window/tab titles with URLs and time spent, key text per context, audio transcriptions. " +
-      "USE THIS FIRST for broad questions: 'what was I doing?', 'how long on X?', 'which apps?'. " +
-      "The 'windows' field shows exactly what the user worked on (e.g. 'Debug crash issue — 20 min', 'Stripe pricing page — 5 min'). " +
-      "Usually sufficient without further searches.",
+      "USE WHEN: any broad question about what the user did — 'what was I doing?', 'how long on X?', 'which apps?', 'recap my morning'. " +
+      "This is almost always the right first call for time-range questions — usually sufficient without follow-up searches. " +
+      "DO NOT USE for: finding a specific keyword (use keyword-search) or a specific UI control (use search-elements).",
     annotations: { title: "Activity Summary", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -303,9 +348,9 @@ const TOOLS: Tool[] = [
   {
     name: "search-elements",
     description:
-      "Search UI elements (buttons, links, text fields) from the accessibility tree. " +
-      "Lighter than search-content for targeted UI lookups. " +
-      "Use when you need to find specific UI controls or page structure, not general content.",
+      "Search UI elements (buttons, links, text fields) from the accessibility tree, filterable by role. " +
+      "USE WHEN: you want a specific UI control or page-structure question — 'find every Submit button I saw', 'list the links in that page'. " +
+      "DO NOT USE for: general text/content (use search-content) or fast keyword lookup (use keyword-search).",
     annotations: { title: "Search Elements", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
@@ -343,15 +388,22 @@ const TOOLS: Tool[] = [
   {
     name: "export-video",
     description:
-      "Export an MP4 video of screen recordings for a time range. " +
-      "Returns the file path. Can take a few minutes for long ranges.",
+      "Export an MP4 of screen recordings for a time range, with synced microphone audio. " +
+      "Frames are placed at their real timestamps, so the clip's duration matches the " +
+      "wall-clock span you requested (not a sped-up timelapse). Returns the file path. " +
+      "Can take a few minutes for long ranges.",
     annotations: { title: "Export Video", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       properties: {
-        start_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        end_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        fps: { type: "number", description: "Output FPS (default 1.0). Higher = smoother but larger file.", default: 1.0 },
+        start_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        end_time: { type: "string", description: 'ISO 8601 UTC or relative (e.g. "5m ago", "now")' },
+        output_path: {
+          type: "string",
+          description:
+            "Optional absolute path for the MP4 (e.g. ~/Downloads/clip.mp4). " +
+            "Defaults to the screenpipe data dir's exports/ folder.",
+        },
       },
       required: ["start_time", "end_time"],
     },
@@ -553,19 +605,21 @@ const TOOLS: Tool[] = [
   {
     name: "keyword-search",
     description:
-      "Fast keyword search using FTS index. Faster than search-content for exact keyword matching. " +
-      "Returns frame IDs and matched text.",
+      "Fast FTS5 keyword search across OCR + audio combined. Returns matches with frame_id, app, timestamp, and text positions. " +
+      "USE WHEN: you have a specific keyword/phrase and want the fastest hit-list (e.g. 'find every screen where I typed \"stripe\"'). " +
+      "DO NOT USE for: structured filters by content_type / speaker / window — this endpoint ignores those (use search-content instead). " +
+      "DO NOT USE for: broad questions like 'what was I doing' (use activity-summary).",
     annotations: { title: "Keyword Search", readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     inputSchema: {
       type: "object",
       properties: {
-        q: { type: "string", description: "Keyword search query" },
-        content_type: { type: "string", enum: ["ocr", "audio", "all"], description: "Content type filter", default: "all" },
-        start_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        end_time: { type: "string", description: "ISO 8601 UTC or relative" },
-        app_name: { type: "string", description: "Filter by app name" },
+        q: { type: "string", description: "Keyword query (FTS5 syntax: quoted phrases, AND/OR, prefix*)" },
+        start_time: { type: "string", description: "ISO 8601 UTC, 'Nh ago' / 'Nd ago' / 'Nw ago', 'now', 'yesterday', 'today', or 'YYYY-MM-DD'" },
+        end_time: { type: "string", description: "Same formats as start_time" },
+        app_name: { type: "string", description: "Filter by exact app name (case-sensitive, e.g. 'Google Chrome')" },
         limit: { type: "integer", description: "Max results (default 20)", default: 20 },
         offset: { type: "integer", description: "Pagination offset", default: 0 },
+        fuzzy_match: { type: "boolean", description: "Enable typo-tolerant matching", default: false },
       },
       required: ["q"],
     },
@@ -598,8 +652,99 @@ const TOOLS: Tool[] = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// Enterprise team tools — registered only when a team API token is present.
+// Same endpoint surface as the desktop `screenpipe-team` pi-agent skill:
+// proxy GETs to https://screenpi.pe/api/enterprise/v1/* with Bearer auth.
+//
+// Naming convention: every team tool is `team-*` so it's obvious at a glance
+// which scope (just-me vs the-whole-org) any given call is hitting.
+// ---------------------------------------------------------------------------
+const TEAM_TOOLS: Tool[] = [
+  {
+    name: "team-search",
+    description:
+      "Substring-search across the ENTIRE ORG's telemetry (every enrolled " +
+      "device). Use when the question is about the team or another teammate " +
+      "(\"what did engineering work on yesterday\", \"did alice touch the auth code\"). " +
+      "For your own machine only, use search-content. " +
+      "Auth: enterprise admin token (sk_ent_…). " +
+      "Defaults: since=now-24h, limit=50. Returns matched records with device + timestamp.",
+    annotations: { title: "Team Search", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: { type: "string", description: "Substring to match (case-insensitive). Empty = all records in window." },
+        device_id: { type: "string", description: "Restrict to one device. Get the ID from team-devices." },
+        app_name: { type: "string", description: "Restrict to records whose app_name equals this (case-insensitive)." },
+        since: { type: "string", description: "ISO 8601 lower bound. Default = now - 24h." },
+        until: { type: "string", description: "ISO 8601 upper bound. Default = now." },
+        since_hours_ago: { type: "integer", description: "Convenience: equivalent to since=now-N*h." },
+        limit: { type: "integer", description: "Max records (default 50, max 200).", default: 50 },
+      },
+    },
+  },
+  {
+    name: "team-devices",
+    description:
+      "List all devices enrolled under this org's license — hostname, OS, " +
+      "app version, last-seen timestamp. Use to discover device IDs to pass " +
+      "to team-search or team-records, or to spot stale machines.",
+    annotations: { title: "Team Devices", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "team-records",
+    description:
+      "Chronological dump of the org's data for a time window — both raw " +
+      "telemetry (frame/audio) and the structured outputs of the enterprise-" +
+      "worker pipes (sop/skill/trajectory/memory/workflow). " +
+      "Raw kinds return oldest → newest (vs team-search which is recency-ranked). " +
+      "Synthesized kinds return one record per device's latest run by default " +
+      "(set latest_only=false to walk run history). " +
+      "Use raw for ETL / \"walk me through X from Y to Z\". " +
+      "Use synthesized for \"what SOPs / skills / trajectories / memories did " +
+      "we extract from my team's work\" — each item carries evidence-cited " +
+      "event_ids/frame_ids that team-search can resolve back to raw records. " +
+      "Auth: enterprise admin token.",
+    annotations: { title: "Team Records", readOnlyHint: true, openWorldHint: true, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        device_id: { type: "string", description: "Restrict to one device (optional). Raw kinds only." },
+        kind: {
+          type: "string",
+          enum: ["frame", "audio", "all", "sop", "skill", "trajectory", "memory", "workflow"],
+          description:
+            "What to return. Raw: frame|audio|all (telemetry). " +
+            "Synthesized: sop|skill|trajectory|memory|workflow (pipe outputs). " +
+            "Default: all.",
+          default: "all",
+        },
+        since: { type: "string", description: "ISO 8601 lower bound. Raw kinds only." },
+        until: { type: "string", description: "ISO 8601 upper bound. Raw kinds only." },
+        since_hours_ago: { type: "integer", description: "Convenience: equivalent to since=now-N*h. Raw kinds only." },
+        limit: { type: "integer", description: "Max records (default 50, max 200). Raw kinds only.", default: 50 },
+        latest_only: {
+          type: "boolean",
+          description:
+            "Synthesized kinds only: if true (default), collapse to the newest " +
+            "run per device. Set false to walk run history.",
+          default: true,
+        },
+      },
+    },
+  },
+];
+
+// Pipe-output kinds map to /workflows/generated, raw kinds map to /records.
+const SYNTHESIZED_KINDS = new Set(["sop", "skill", "trajectory", "memory", "workflow"]);
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
+  // Team tools only surface when an enterprise token was discovered at boot.
+  // No token = consumer / non-admin user; their MCP looks identical to today.
+  const tools = TEAM_TOKEN ? [...TOOLS, ...TEAM_TOOLS] : TOOLS;
+  return { tools };
 });
 
 // ---------------------------------------------------------------------------
@@ -686,7 +831,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 - **Use max_content_length=500** to keep responses compact
 - **Don't use q for audio** — transcriptions are noisy, q filters too aggressively. Search audio by time range and speaker instead
 - **app_name is case-sensitive** — use exact names: "Google Chrome" not "chrome"
-- **content_type=accessibility is preferred** for screen text (OS-native). ocr is fallback for apps without accessibility support
+- **Screen text is mostly accessibility-derived, not OCR.** Screenpipe walks the OS accessibility tree first; OCR is only a fallback (terminals, canvas-rendered apps, games). \`content_type=ocr\` returns both paths — the result label \`[Screen·a11y]\` vs \`[Screen·ocr]\` tells you which produced the row. Don't pre-filter to a11y/ocr unless you specifically need one or the other
 
 ## Common Patterns
 
@@ -712,21 +857,154 @@ Never fabricate IDs or timestamps — only use values from actual results.
 });
 
 // ---------------------------------------------------------------------------
-// Helper
+// Helpers
 // ---------------------------------------------------------------------------
+
+// Thrown by fetchAPI / callAPI when the backend is unreachable. Caught in the
+// tool dispatcher to surface an actionable hint ("backend not running")
+// instead of the opaque "fetch failed" the model used to see.
+class BackendDownError extends Error {
+  constructor(public readonly cause: unknown) {
+    super(
+      `screenpipe backend not running on ${SCREENPIPE_API}. ` +
+        `Start it with \`screenpipe\` in a terminal, or open the screenpipe desktop app.`,
+    );
+    this.name = "BackendDownError";
+  }
+}
+
+// Thrown when the backend returns a non-2xx. Carries the server's response
+// body so the dispatcher can include it in the user-visible error message.
+class BackendHttpError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly bodyText: string,
+    endpoint: string,
+  ) {
+    let hint = "";
+    if (status === 401 || status === 403) {
+      hint =
+        " — API key not accepted. Set SCREENPIPE_LOCAL_API_KEY in your MCP " +
+        "launcher env, or install the screenpipe desktop app so the MCP can " +
+        "discover the key automatically.";
+    } else if (status === 404) {
+      hint =
+        " — endpoint not found. The backend may be on a different version than this MCP.";
+    } else if (status === 400) {
+      hint = " — bad request. Check argument names and types against the tool schema.";
+    } else if (status >= 500) {
+      hint = " — backend error. Check screenpipe logs.";
+    }
+    const trimmed = bodyText.trim().slice(0, 300);
+    const bodyPart = trimmed ? ` body: ${trimmed}` : "";
+    super(`HTTP ${status} from ${endpoint}${hint}${bodyPart}`);
+    this.name = "BackendHttpError";
+  }
+}
+
 async function fetchAPI(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<Response> {
   const url = `${SCREENPIPE_API}${endpoint}`;
-  return fetch(url, {
-    ...options,
-    headers: {
-      "Content-Type": "application/json",
-      ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
-      ...options.headers,
-    },
-  });
+  try {
+    return await fetch(url, {
+      ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...(API_KEY ? { Authorization: `Bearer ${API_KEY}` } : {}),
+        ...options.headers,
+      },
+    });
+  } catch (e) {
+    throw new BackendDownError(e);
+  }
+}
+
+// Wrap a fetchAPI call: throw BackendHttpError on non-2xx with body included.
+// Use from handlers instead of `if (!response.ok) throw new Error(...)`.
+async function callAPI(endpoint: string, options: RequestInit = {}): Promise<Response> {
+  const response = await fetchAPI(endpoint, options);
+  if (!response.ok) {
+    let body = "";
+    try {
+      body = await response.text();
+    } catch {
+      // body may not be readable; that's fine
+    }
+    throw new BackendHttpError(response.status, body, endpoint);
+  }
+  return response;
+}
+
+// Server's deserialize_flexible_datetime accepts ISO 8601 + "Nh ago" / "Nd ago"
+// / "Nw ago" / "now". Models also try "yesterday", "today", and bare dates
+// ("2026-05-17") — normalize those here so the request doesn't 400.
+function normalizeTime(input: string | undefined): string | undefined {
+  if (!input) return input;
+  const s = input.trim();
+  if (!s) return input;
+  const lower = s.toLowerCase();
+  if (lower === "yesterday") return "1d ago";
+  if (lower === "today") {
+    return `${new Date().toISOString().split("T")[0]}T00:00:00Z`;
+  }
+  if (lower === "tomorrow") {
+    const t = new Date();
+    t.setUTCDate(t.getUTCDate() + 1);
+    return `${t.toISOString().split("T")[0]}T00:00:00Z`;
+  }
+  // Bare YYYY-MM-DD → start of day UTC
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${s}T00:00:00Z`;
+  return s;
+}
+
+// Apply normalizeTime to start_time/end_time fields in an args object.
+// Returns a new object — does not mutate the input.
+function normalizeTimeFields(
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  const out = { ...args };
+  for (const k of ["start_time", "end_time"] as const) {
+    if (typeof out[k] === "string") {
+      out[k] = normalizeTime(out[k] as string);
+    }
+  }
+  return out;
+}
+
+// Middle-truncate long strings: keep head + tail, mark the gap with how much
+// was cut. Used to cap OCR/transcription text in search-content responses
+// so a single call doesn't blow past Claude Code's per-tool output limit
+// (one logged call returned 131k chars from a limit:10 search).
+function truncateMiddle(text: string | null | undefined, max: number): string {
+  if (!text) return text ?? "";
+  if (max <= 0 || text.length <= max) return text;
+  const halfLeft = Math.floor(max / 2);
+  const halfRight = max - halfLeft;
+  const cut = text.length - max;
+  return (
+    text.slice(0, halfLeft) +
+    `…[${cut} chars truncated — pass max_content_length=0 for full text]…` +
+    text.slice(text.length - halfRight)
+  );
+}
+
+// Default per-result text cap for search-content when the caller didn't
+// specify one. Tuned to keep limit=10 responses well under tool-output limits
+// while still giving the model enough text to reason over.
+const DEFAULT_SEARCH_CONTENT_TRUNCATE = 1000;
+
+// Format the screen-text tag for a result. The server's `text_source` is
+// "accessibility" (OS-native tree, primary path) or "ocr" (fallback for
+// terminals, canvas, weak a11y). Older rows have no text_source, so we
+// fall back to a bare `[Screen]`. The result type is historically called
+// OCR in the engine but most captures are accessibility-derived — surface
+// the actual source so the model picks filters correctly.
+function screenTag(textSource: unknown): string {
+  if (textSource === "accessibility") return "[Screen·a11y]";
+  if (textSource === "ocr") return "[Screen·ocr]";
+  return "[Screen]";
 }
 
 // ---------------------------------------------------------------------------
@@ -743,16 +1021,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "search-content": {
         const includeFrames = args.include_frames === true;
+        const normalized = normalizeTimeFields(args);
+        // Default text cap if the caller didn't pass max_content_length.
+        // Keeps single calls under Claude Code's per-tool output limit.
+        const userCap = normalized.max_content_length;
+        const effectiveCap =
+          typeof userCap === "number"
+            ? userCap
+            : userCap === undefined
+            ? DEFAULT_SEARCH_CONTENT_TRUNCATE
+            : Number(userCap);
         const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(args)) {
+        for (const [key, value] of Object.entries(normalized)) {
           if (value !== null && value !== undefined) {
             params.append(key, String(value));
           }
         }
 
-        const response = await fetchAPI(`/search?${params.toString()}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-
+        const response = await callAPI(`/search?${params.toString()}`);
         const data = await response.json();
         const results = data.data || [];
         const pagination = data.pagination || {};
@@ -782,10 +1068,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
           if (result.type === "OCR") {
             const tagsStr = content.tags?.length ? `\nTags: ${content.tags.join(", ")}` : "";
+            // result.type is "OCR" by historical naming, but content.text_source
+            // tells us if the text actually came from the accessibility tree
+            // (primary path) or OCR (fallback). Use it to label honestly.
+            const tag = screenTag(content.text_source);
             formattedResults.push(
-              `[OCR] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
+              `${tag} ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
                 `${content.timestamp || ""}\n` +
-                `${content.text || ""}` +
+                `${truncateMiddle(content.text || "", effectiveCap)}` +
                 tagsStr
             );
             if (includeFrames && content.frame) {
@@ -799,14 +1089,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             formattedResults.push(
               `[Audio] ${content.device_name || "?"}\n` +
                 `${content.timestamp || ""}\n` +
-                `${content.transcription || ""}` +
+                `${truncateMiddle(content.transcription || "", effectiveCap)}` +
                 tagsStr
             );
           } else if (result.type === "UI" || result.type === "Accessibility") {
             formattedResults.push(
               `[Accessibility] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
                 `${content.timestamp || ""}\n` +
-                `${content.text || ""}`
+                `${truncateMiddle(content.text || "", effectiveCap)}`
             );
           } else if (result.type === "Memory") {
             const tagsStr = content.tags?.length ? ` [${content.tags.join(", ")}]` : "";
@@ -815,7 +1105,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             formattedResults.push(
               `[Memory #${content.id}]${tagsStr}${importance}\n` +
                 `${content.created_at || ""}\n` +
-                `${content.content || ""}`
+                `${truncateMiddle(content.content || "", effectiveCap)}`
             );
           }
         }
@@ -840,15 +1130,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list-meetings": {
+        const normalized = normalizeTimeFields(args);
         const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(args)) {
+        for (const [key, value] of Object.entries(normalized)) {
           if (value !== null && value !== undefined) {
             params.append(key, String(value));
           }
         }
 
-        const response = await fetchAPI(`/meetings?${params.toString()}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/meetings?${params.toString()}`);
 
         const meetings = await response.json();
 
@@ -875,15 +1165,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "activity-summary": {
+        const normalized = normalizeTimeFields(args);
         const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(args)) {
+        for (const [key, value] of Object.entries(normalized)) {
           if (value !== null && value !== undefined) {
             params.append(key, String(value));
           }
         }
 
-        const response = await fetchAPI(`/activity-summary?${params.toString()}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/activity-summary?${params.toString()}`);
 
         const data = await response.json();
 
@@ -958,15 +1248,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "search-elements": {
+        const normalized = normalizeTimeFields(args);
         const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(args)) {
+        for (const [key, value] of Object.entries(normalized)) {
           if (value !== null && value !== undefined) {
             params.append(key, String(value));
           }
         }
 
-        const response = await fetchAPI(`/elements?${params.toString()}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/elements?${params.toString()}`);
 
         const data = await response.json();
         const elements = data.data || [];
@@ -1017,8 +1307,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: "text", text: "Error: frame_id is required" }] };
         }
 
-        const response = await fetchAPI(`/frames/${frameId}/context`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/frames/${frameId}/context`);
 
         const data = await response.json();
         const lines = [`Frame ${data.frame_id} (source: ${data.text_source})`];
@@ -1048,9 +1337,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "export-video": {
-        const startTime = args.start_time as string;
-        const endTime = args.end_time as string;
-        const fps = (args.fps as number) || 1.0;
+        const startTime = normalizeTime(args.start_time as string);
+        const endTime = normalizeTime(args.end_time as string);
 
         if (!startTime || !endTime) {
           return {
@@ -1058,140 +1346,58 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           };
         }
 
-        // Get frame IDs for the time range
-        const searchParams = new URLSearchParams({
-          content_type: "ocr",
-          start_time: startTime,
-          end_time: endTime,
-          limit: "10000",
-        });
-
-        const searchResponse = await fetchAPI(`/search?${searchParams.toString()}`);
-        if (!searchResponse.ok) {
-          throw new Error(`Failed to search for frames: HTTP ${searchResponse.status}`);
-        }
-
-        const searchData = await searchResponse.json();
-        const results = searchData.data || [];
-
-        if (results.length === 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No screen recordings found between ${startTime} and ${endTime}.`,
-              },
-            ],
-          };
-        }
-
-        const frameIds: number[] = [];
-        const seenIds = new Set<number>();
-        for (const result of results) {
-          if (result.type === "OCR" && result.content?.frame_id) {
-            const frameId = result.content.frame_id;
-            if (!seenIds.has(frameId)) {
-              seenIds.add(frameId);
-              frameIds.push(frameId);
-            }
+        // A real-time MP4 with synced microphone audio, rendered server-side by the
+        // engine export core (the `screenpipe export` CLI's HTTP twin). MCP runs on the
+        // same host as the backend, so the returned path is a local file. Frames sit at
+        // their real timestamps, so the clip duration matches the wall-clock span.
+        try {
+          const body: Record<string, unknown> = { start: startTime, end: endTime };
+          if (typeof args.output_path === "string" && args.output_path.trim()) {
+            body.output_path = args.output_path;
           }
-        }
-
-        if (frameIds.length === 0) {
-          return {
-            content: [{ type: "text", text: "No valid frame IDs found (audio-only?)." }],
+          const response = await callAPI("/export", {
+            method: "POST",
+            body: JSON.stringify(body),
+          });
+          const data = (await response.json()) as {
+            output_path: string;
+            frame_count: number;
+            audio_chunk_count: number;
+            duration_secs: number;
+            file_size_bytes: number;
           };
-        }
-
-        frameIds.sort((a, b) => a - b);
-
-        const wsUrl = `ws://localhost:${port}/frames/export?fps=${fps}`;
-
-        const exportResult = await new Promise<{
-          success: boolean;
-          filePath?: string;
-          error?: string;
-          frameCount?: number;
-        }>((resolve) => {
-          const ws = new WebSocket(wsUrl);
-          let resolved = false;
-
-          const timeout = setTimeout(() => {
-            if (!resolved) {
-              resolved = true;
-              ws.close();
-              resolve({ success: false, error: "Export timed out after 5 minutes" });
-            }
-          }, 5 * 60 * 1000);
-
-          ws.on("open", () => {
-            ws.send(JSON.stringify({ frame_ids: frameIds }));
-          });
-
-          ws.on("error", (error) => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: `WebSocket error: ${error.message}` });
-            }
-          });
-
-          ws.on("close", () => {
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve({ success: false, error: "Connection closed unexpectedly" });
-            }
-          });
-
-          ws.on("message", (data) => {
-            try {
-              const message = JSON.parse(data.toString());
-              if (message.status === "completed" && message.video_data) {
-                const tempDir = os.tmpdir();
-                const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-                const filename = `screenpipe_export_${timestamp}.mp4`;
-                const filePath = path.join(tempDir, filename);
-                fs.writeFileSync(filePath, Buffer.from(message.video_data));
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: true, filePath, frameCount: frameIds.length });
-              } else if (message.status === "error") {
-                resolved = true;
-                clearTimeout(timeout);
-                ws.close();
-                resolve({ success: false, error: message.error || "Export failed" });
-              }
-            } catch {
-              // Ignore parse errors for progress messages
-            }
-          });
-        });
-
-        if (exportResult.success && exportResult.filePath) {
+          const sizeMb = data.file_size_bytes
+            ? (data.file_size_bytes / (1024 * 1024)).toFixed(1)
+            : null;
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `Video exported: ${exportResult.filePath}\n` +
-                  `Frames: ${exportResult.frameCount} | ${startTime} → ${endTime} | ${fps} fps`,
+                  `Video exported (with audio): ${data.output_path}\n` +
+                  `${data.frame_count ?? 0} frames | ${data.audio_chunk_count ?? 0} audio chunks` +
+                  (sizeMb ? ` | ${sizeMb} MB` : "") +
+                  (data.duration_secs ? ` | ${data.duration_secs}s` : "") +
+                  ` | ${startTime} → ${endTime}`,
               },
             ],
           };
-        } else {
+        } catch (err) {
           return {
-            content: [{ type: "text", text: `Export failed: ${exportResult.error}` }],
+            content: [
+              {
+                type: "text",
+                text: `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+              },
+            ],
           };
         }
       }
 
       case "update-memory": {
         if (args.delete && args.id) {
-          const response = await fetchAPI(`/memories/${args.id}`, { method: "DELETE" });
-          if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-          return { content: [{ type: "text", text: `Memory ${args.id} deleted.` }] };
+          const response = await callAPI(`/memories/${args.id}`, { method: "DELETE" });
+            return { content: [{ type: "text", text: `Memory ${args.id} deleted.` }] };
         }
         if (args.id) {
           const body: Record<string, unknown> = {};
@@ -1199,12 +1405,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (args.tags !== undefined) body.tags = args.tags;
           if (args.importance !== undefined) body.importance = args.importance;
           if (args.source_context !== undefined) body.source_context = args.source_context;
-          const response = await fetchAPI(`/memories/${args.id}`, {
+          const response = await callAPI(`/memories/${args.id}`, {
             method: "PUT",
             body: JSON.stringify(body),
           });
-          if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
-          const memory = await response.json();
+            const memory = await response.json();
           return {
             content: [{ type: "text", text: `Memory ${memory.id} updated: "${memory.content}"` }],
           };
@@ -1221,11 +1426,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           importance: args.importance ?? 0.5,
         };
         if (args.source_context) memoryBody.source_context = args.source_context;
-        const memoryResponse = await fetchAPI("/memories", {
+        const memoryResponse = await callAPI("/memories", {
           method: "POST",
           body: JSON.stringify(memoryBody),
         });
-        if (!memoryResponse.ok) throw new Error(`HTTP error: ${memoryResponse.status}`);
         const newMemory = await memoryResponse.json();
         return {
           content: [
@@ -1242,12 +1446,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
         if (args.timeout_secs) notifBody.timeout = Number(args.timeout_secs) * 1000;
         if (args.actions) notifBody.actions = args.actions;
-        const notifResponse = await fetch("http://localhost:11435/notify", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(notifBody),
-        });
-        if (!notifResponse.ok) throw new Error(`HTTP error: ${notifResponse.status}`);
+        // send-notification hits the desktop notify daemon on a separate port
+        // (11435), not the screenpipe API. Keep direct fetch with friendlier
+        // error so the model sees an actionable message if the daemon's down.
+        let notifResponse: Response;
+        try {
+          notifResponse = await fetch("http://localhost:11435/notify", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(notifBody),
+          });
+        } catch (e) {
+          throw new Error(
+            "notification daemon not reachable on localhost:11435 — is the screenpipe desktop app running?",
+          );
+        }
+        if (!notifResponse.ok) {
+          let body = "";
+          try { body = await notifResponse.text(); } catch {}
+          throw new Error(`notify daemon HTTP ${notifResponse.status}${body ? `: ${body.slice(0, 200)}` : ""}`);
+        }
         const notifResult = await notifResponse.json();
         return {
           content: [{ type: "text", text: `Notification sent: ${notifResult.message}` }],
@@ -1255,8 +1473,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "health-check": {
-        const response = await fetchAPI("/health");
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI("/health");
         const data = await response.json();
         return {
           content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
@@ -1264,8 +1481,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list-audio-devices": {
-        const response = await fetchAPI("/audio/list");
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI("/audio/list");
         const devices = await response.json();
         if (!Array.isArray(devices) || devices.length === 0) {
           return { content: [{ type: "text", text: "No audio devices found." }] };
@@ -1280,8 +1496,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "list-monitors": {
-        const response = await fetchAPI("/vision/list");
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI("/vision/list");
         const monitors = await response.json();
         if (!Array.isArray(monitors) || monitors.length === 0) {
           return { content: [{ type: "text", text: "No monitors found." }] };
@@ -1302,11 +1517,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!contentType || !id || !tags) {
           return { content: [{ type: "text", text: "Error: content_type, id, and tags are required" }] };
         }
-        const response = await fetchAPI(`/tags/${contentType}/${id}`, {
+        const response = await callAPI(`/tags/${contentType}/${id}`, {
           method: "POST",
           body: JSON.stringify({ tags }),
         });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
         return {
           content: [{ type: "text", text: `Tags added to ${contentType}/${id}: ${tags.join(", ")}` }],
         };
@@ -1317,8 +1531,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!nameQuery) {
           return { content: [{ type: "text", text: "Error: name is required" }] };
         }
-        const response = await fetchAPI(`/speakers/search?name=${encodeURIComponent(nameQuery)}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/speakers/search?name=${encodeURIComponent(nameQuery)}`);
         const speakers = await response.json();
         if (!Array.isArray(speakers) || speakers.length === 0) {
           return { content: [{ type: "text", text: "No speakers found." }] };
@@ -1335,8 +1548,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "list-unnamed-speakers": {
         const limit = (args.limit as number) || 10;
         const offset = (args.offset as number) || 0;
-        const response = await fetchAPI(`/speakers/unnamed?limit=${limit}&offset=${offset}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/speakers/unnamed?limit=${limit}&offset=${offset}`);
         const speakers = await response.json();
         if (!Array.isArray(speakers) || speakers.length === 0) {
           return { content: [{ type: "text", text: "No unnamed speakers found." }] };
@@ -1357,11 +1569,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const body: Record<string, unknown> = { id: speakerId };
         if (args.name !== undefined) body.name = args.name;
         if (args.metadata !== undefined) body.metadata = args.metadata;
-        const response = await fetchAPI("/speakers/update", {
+        const response = await callAPI("/speakers/update", {
           method: "POST",
           body: JSON.stringify(body),
         });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
         return {
           content: [{ type: "text", text: `Speaker ${speakerId} updated.` }],
         };
@@ -1373,11 +1584,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!keepId || !mergeId) {
           return { content: [{ type: "text", text: "Error: speaker_to_keep_id and speaker_to_merge_id are required" }] };
         }
-        const response = await fetchAPI("/speakers/merge", {
+        const response = await callAPI("/speakers/merge", {
           method: "POST",
           body: JSON.stringify({ speaker_to_keep_id: keepId, speaker_to_merge_id: mergeId }),
         });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
         return {
           content: [{ type: "text", text: `Merged speaker ${mergeId} into ${keepId}.` }],
         };
@@ -1388,11 +1598,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (args.app) body.app = args.app;
         if (args.title) body.title = args.title;
         if (args.attendees) body.attendees = args.attendees;
-        const response = await fetchAPI("/meetings/start", {
+        const response = await callAPI("/meetings/start", {
           method: "POST",
           body: JSON.stringify(body),
         });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
         const meeting = await response.json();
         return {
           content: [{ type: "text", text: `Meeting started (id: ${meeting.id || "ok"}).` }],
@@ -1400,8 +1609,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "stop-meeting": {
-        const response = await fetchAPI("/meetings/stop", { method: "POST" });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI("/meetings/stop", { method: "POST" });
         return {
           content: [{ type: "text", text: "Meeting stopped." }],
         };
@@ -1412,8 +1620,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!meetingId) {
           return { content: [{ type: "text", text: "Error: id is required" }] };
         }
-        const response = await fetchAPI(`/meetings/${meetingId}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/meetings/${meetingId}`);
         const meeting = await response.json();
         return {
           content: [{ type: "text", text: JSON.stringify(meeting, null, 2) }],
@@ -1440,12 +1647,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             ],
           };
         }
-        const response = await fetchAPI(`/meetings/${meetingId}`, {
-          method: "PATCH",
+        const response = await callAPI(`/meetings/${meetingId}`, {
+          method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
         const updated = await response.json();
         return {
           content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
@@ -1453,22 +1659,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "keyword-search": {
-        const params = new URLSearchParams();
-        for (const [key, value] of Object.entries(args)) {
-          if (value !== null && value !== undefined) {
-            params.append(key, String(value));
-          }
+        // Translate model-facing arg names to what the engine actually
+        // accepts (KeywordSearchRequest in routes/search.rs):
+        //   q          -> query    (mandatory; the field is literally named `query`)
+        //   app_name   -> app_names (comma-separated; serde splits it)
+        //   content_type: dropped — the keyword endpoint doesn't filter by type.
+        //                  It searches OCR + audio together via the FTS index.
+        // Without these mappings every keyword-search request 400s (and used
+        // to: in logs, 25/25 calls failed before this fix).
+        const queryStr = (args.query as string) ?? (args.q as string);
+        if (!queryStr) {
+          return {
+            content: [{ type: "text", text: "Error: 'q' (search query) is required" }],
+          };
         }
-        const response = await fetchAPI(`/search/keyword?${params.toString()}`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const normalized = normalizeTimeFields(args);
+        const params = new URLSearchParams();
+        params.append("query", queryStr);
+        if (normalized.start_time) params.append("start_time", String(normalized.start_time));
+        if (normalized.end_time) params.append("end_time", String(normalized.end_time));
+        if (normalized.limit !== undefined) params.append("limit", String(normalized.limit));
+        if (normalized.offset !== undefined) params.append("offset", String(normalized.offset));
+        if (normalized.app_name) params.append("app_names", String(normalized.app_name));
+        if (normalized.app_names) params.append("app_names", String(normalized.app_names));
+        if (args.fuzzy_match !== undefined) params.append("fuzzy_match", String(args.fuzzy_match));
+        const response = await callAPI(`/search/keyword?${params.toString()}`);
         const data = await response.json();
-        const results = data.data || [];
+        // /search/keyword returns a bare array (Vec<KeywordSearchMatch> from
+        // routes/search.rs), not the {data, pagination} shape /search uses.
+        // The old `data.data || []` always lost results.
+        const results: Array<Record<string, unknown>> = Array.isArray(data)
+          ? data
+          : (data.data ?? []);
         if (results.length === 0) {
           return { content: [{ type: "text", text: "No keyword search results found." }] };
         }
-        const formatted = results.map((r: Record<string, unknown>) => {
-          const content = r.content as Record<string, unknown> | undefined;
-          return `[${r.type}] ${content?.app_name || "?"} | ${content?.timestamp || ""}\n${content?.text || content?.transcription || ""}`;
+        const formatted = results.map((r) => {
+          // Flat shape from search_with_text_positions: { app_name, frame_id,
+          // timestamp, text, text_source, ... }. Truncate to keep responses
+          // under tool-output limits. text_source is "accessibility" (primary)
+          // or "ocr" (fallback) — show it so the model knows which path hit.
+          const text = (r.text as string) || (r.transcription as string) || "";
+          const tag = screenTag(r.text_source);
+          return (
+            `${tag} [frame:${r.frame_id ?? "?"}] ${r.app_name ?? "?"} | ${r.timestamp ?? ""}\n` +
+            truncateMiddle(text, DEFAULT_SEARCH_CONTENT_TRUNCATE)
+          );
         });
         return {
           content: [{ type: "text", text: `Results: ${results.length}\n\n${formatted.join("\n---\n")}` }],
@@ -1480,8 +1716,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (!frameId) {
           return { content: [{ type: "text", text: "Error: frame_id is required" }] };
         }
-        const response = await fetchAPI(`/frames/${frameId}/elements`);
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const response = await callAPI(`/frames/${frameId}/elements`);
         const elements = await response.json();
         if (!Array.isArray(elements) || elements.length === 0) {
           return { content: [{ type: "text", text: `No elements found for frame ${frameId}.` }] };
@@ -1508,11 +1743,63 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         else {
           return { content: [{ type: "text", text: `Error: unknown action '${action}'` }] };
         }
-        const response = await fetchAPI(endpoint, { method: "POST" });
-        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        await callAPI(endpoint, { method: "POST" });
         return {
           content: [{ type: "text", text: `Recording action '${action}' executed.` }],
         };
+      }
+
+      // ---------------------------------------------------------------------
+      // Enterprise team tools — only callable when TEAM_TOKEN is set at boot.
+      // If we got this far without one, the tool wasn't in the listed set the
+      // host saw, but a misbehaving client could still try to call it. Fail
+      // loudly so the host surfaces the misconfiguration.
+      // ---------------------------------------------------------------------
+      case "team-search":
+      case "team-devices":
+      case "team-records": {
+        if (!TEAM_TOKEN) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `team-* tools require an enterprise admin token. Set ` +
+                  `SCREENPIPE_ENTERPRISE_TOKEN in your MCP env, or mint one ` +
+                  `at https://screenpi.pe/enterprise → API Tokens and paste ` +
+                  `it into Settings → Privacy → Admin Team API Token in the ` +
+                  `screenpipe desktop app.`,
+              },
+            ],
+          };
+        }
+        // Map MCP tool name → /api/enterprise/v1 path. team-records also
+        // routes synthesized pipe outputs (kind=sop|skill|...) to the
+        // workflows endpoint so callers see one tool surface for "give me
+        // the org's data."
+        const kindArg = typeof args.kind === "string" ? args.kind : "";
+        const subpath =
+          name === "team-search" ? "/search"
+          : name === "team-devices" ? "/devices"
+          : name === "team-records" && SYNTHESIZED_KINDS.has(kindArg) ? "/workflows/generated"
+          : "/records";
+        // Forward every primitive arg as a query param. The server validates;
+        // unknown params are ignored, so we don't need to gatekeep here.
+        const params = new URLSearchParams();
+        for (const [k, v] of Object.entries(args)) {
+          if (v !== null && v !== undefined && v !== "") {
+            params.append(k, String(v));
+          }
+        }
+        const query = params.toString();
+        const response = await fetchTeam(`${subpath}${query ? `?${query}` : ""}`);
+        const body = await response.text();
+        if (!response.ok) {
+          throw new Error(
+            `${name} failed: HTTP ${response.status} ${response.statusText} — ${body.slice(0, 300)}`
+          );
+        }
+        return { content: [{ type: "text", text: body }] };
       }
 
       default:
@@ -1520,7 +1807,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    // isError flags the result as a failure so the model retries with a
+    // different approach instead of treating the error text as data.
     return {
+      isError: true,
       content: [{ type: "text", text: `Error executing ${name}: ${errorMessage}` }],
     };
   }

@@ -40,22 +40,24 @@ use crate::{
             vision_metrics_handler,
         },
         meetings::{
-            bulk_delete_meetings_handler, delete_meeting_handler, get_meeting_handler,
-            list_meetings_handler, meeting_status_handler, merge_meetings_handler,
-            split_meeting_handler, start_meeting_handler, stop_meeting_handler,
-            update_meeting_handler,
+            bulk_delete_meetings_handler, delete_meeting_handler, export_handler,
+            get_meeting_handler, get_meeting_transcript_handler, list_meetings_handler,
+            meeting_status_handler, merge_meetings_handler, split_meeting_handler,
+            start_meeting_handler, stop_meeting_handler, update_meeting_handler,
         },
         memories::{
             create_memory_handler, delete_memory_handler, get_memory_handler,
-            list_memories_handler, list_memory_tags_handler, update_memory_handler,
+            list_memories_handler, list_memory_tags_handler, sync_external_memories_handler,
+            update_memory_handler,
         },
+        retranscribe::retranscribe_meeting_handler,
         search::{keyword_search_handler, search},
         speakers::{
             delete_speaker_handler, get_similar_speakers_handler, get_unnamed_speakers_handler,
             mark_as_hallucination_handler, merge_speakers_handler, reassign_speaker_handler,
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
-        streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
+        streaming::stream_frames_handler,
         websocket::{
             ws_events_handler, ws_health_handler, ws_meeting_status_handler, ws_metrics_handler,
         },
@@ -63,6 +65,7 @@ use crate::{
     sync_api::{self, SyncState},
     video_cache::FrameCache,
 };
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use lru::LruCache;
 use moka::future::Cache as MokaCache;
@@ -188,14 +191,20 @@ pub struct AppState {
     pub api_auth: bool,
     /// The API key to validate against (from SCREENPIPE_API_KEY or auth.json)
     pub api_auth_key: Option<String>,
-    /// Cloud JWT (Clerk) used to authenticate proxied requests to api.screenpi.pe.
-    /// Held in a RwLock so the desktop shell can refresh it after login/logout
+    /// Cloud JWT (Clerk) used to authenticate proxied requests to api.screenpipe.com.
+    /// Held in ArcSwap so the desktop shell can refresh it after login/logout
     /// without rebuilding the server. The pi-agent's bash deliberately can't see
     /// this token — agent calls localhost/v1/chat/completions and the server
     /// signs the upstream request here. See routes/cloud_proxy.rs.
-    pub cloud_token: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub cloud_token: Arc<ArcSwap<Option<String>>>,
     /// Unified credential store for OAuth tokens, API keys, etc.
     pub secret_store: Option<Arc<screenpipe_secrets::SecretStore>>,
+    /// Runtime control for the high-FPS screen-capture override. Shared
+    /// with each per-monitor capture loop so HTTP toggles propagate
+    /// without a restart. `None` only when the engine was started in a
+    /// configuration that doesn't run vision capture (e.g. headless
+    /// `--disable-vision`).
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
 }
 
 pub struct SCServer {
@@ -230,9 +239,26 @@ pub struct SCServer {
     /// API key for remote auth validation
     pub api_auth_key: Option<String>,
     /// Cloud JWT for proxied /v1/chat/completions calls. See AppState::cloud_token.
-    pub cloud_token: Arc<tokio::sync::RwLock<Option<String>>>,
+    pub cloud_token: Arc<ArcSwap<Option<String>>>,
     /// Unified credential store for OAuth tokens, API keys, etc.
     pub secret_store: Option<Arc<screenpipe_secrets::SecretStore>>,
+    /// Background OAuth refresh scheduler. Owned here so its JoinHandle
+    /// isn't dropped (which would cancel the task) and so future
+    /// observability endpoints can call `.snapshot()` to inspect metrics.
+    pub oauth_refresher:
+        Option<Arc<screenpipe_connect::oauth_refresh_scheduler::OAuthRefreshScheduler>>,
+    /// Background scheduler that mirrors `memories` out to Claude Code's
+    /// CLAUDE.md and Codex's AGENTS.md every few minutes. Owned for the
+    /// same reasons as `oauth_refresher` — keeps the JoinHandle alive
+    /// and exposes `.snapshot()` for health reporting later.
+    pub external_memory_sync: Option<Arc<crate::external_memory_sync::ExternalMemorySyncScheduler>>,
+    /// Shared high-FPS controller. Set before `start()` so AppState and
+    /// the per-monitor capture loops point at the same instance.
+    pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
+    /// When true, the timeline / rewind feature is disabled. The server skips
+    /// warming the hot frame cache from the DB at startup (the cache is only
+    /// read by the timeline streaming endpoint). Set before `start()`.
+    pub timeline_disabled: bool,
 }
 
 impl SCServer {
@@ -268,25 +294,37 @@ impl SCServer {
             owned_browser: None,
             api_auth: false,
             api_auth_key: None,
-            cloud_token: Arc::new(tokio::sync::RwLock::new(None)),
+            cloud_token: Arc::new(ArcSwap::new(Arc::new(None))),
             secret_store: None,
+            oauth_refresher: None,
+            external_memory_sync: None,
+            high_fps_controller: None,
+            timeline_disabled: false,
         }
     }
 
+    /// Wire the shared high-FPS controller. Pass the same instance to the
+    /// `VisionManager` so the HTTP routes and capture loops point at it.
+    pub fn with_high_fps_controller(
+        mut self,
+        controller: Arc<crate::high_fps_controller::HighFpsController>,
+    ) -> Self {
+        self.high_fps_controller = Some(controller);
+        self
+    }
+
     /// Set the cloud JWT used to authenticate proxied chat-completion calls
-    /// to api.screenpi.pe. Safe to call before or after `start()` — the route
+    /// to api.screenpipe.com. Safe to call before or after `start()` — the route
     /// reads the inner Arc on each request. Callers can also clone the Arc
     /// directly (see `cloud_token_handle`) to update it from elsewhere.
     pub fn with_cloud_token(self, token: Option<String>) -> Self {
-        if let Ok(mut guard) = self.cloud_token.try_write() {
-            *guard = token;
-        }
+        self.cloud_token.store(Arc::new(token));
         self
     }
 
     /// Clone the cloud-token handle so the desktop shell can refresh it
     /// after the server has started (e.g. when settings.user.token changes).
-    pub fn cloud_token_handle(&self) -> Arc<tokio::sync::RwLock<Option<String>>> {
+    pub fn cloud_token_handle(&self) -> Arc<ArcSwap<Option<String>>> {
         self.cloud_token.clone()
     }
 
@@ -460,7 +498,11 @@ impl SCServer {
             .hot_frame_cache
             .clone()
             .unwrap_or_else(|| Arc::new(HotFrameCache::new()));
-        {
+        if self.timeline_disabled {
+            // Timeline disabled: the hot frame cache is only read by the timeline
+            // streaming endpoint, so skip the (potentially 40s+) DB warm-up.
+            tracing::info!("timeline disabled: skipping hot frame cache warm_from_db");
+        } else {
             let cache = hot_frame_cache.clone();
             let db = self.db.clone();
             tokio::spawn(async move {
@@ -540,6 +582,7 @@ impl SCServer {
             api_auth_key: self.api_auth_key.clone(),
             cloud_token: self.cloud_token.clone(),
             secret_store: self.secret_store.clone(),
+            high_fps_controller: self.high_fps_controller.clone(),
         });
 
         // Populate the registry so /connections/browsers shows both kinds
@@ -604,16 +647,22 @@ impl SCServer {
             .get("/meetings", list_meetings_handler)
             .get("/meetings/status", meeting_status_handler)
             .post("/meetings/merge", merge_meetings_handler)
+            // General export: meeting_id XOR start/end → MP4 (frames + synced audio).
+            // HTTP twin of the `screenpipe export` CLI; used by the MCP export-video tool.
+            .post("/export", export_handler)
             .post("/meetings/bulk-delete", bulk_delete_meetings_handler)
             .post("/meetings/start", start_meeting_handler)
             .post("/meetings/stop", stop_meeting_handler)
+            .get("/meetings/:id/transcript", get_meeting_transcript_handler)
             .get("/meetings/:id", get_meeting_handler)
             .delete("/meetings/:id", delete_meeting_handler)
             .put("/meetings/:id", update_meeting_handler)
+            .post("/meetings/:id/retranscribe", retranscribe_meeting_handler)
             .post("/meetings/:id/split", split_meeting_handler)
             .post("/memories", create_memory_handler)
             .get("/memories", list_memories_handler)
             .get("/memories/tags", list_memory_tags_handler)
+            .post("/memories/sync-external", sync_external_memories_handler)
             .get("/memories/:id", get_memory_handler)
             .put("/memories/:id", update_memory_handler)
             .delete("/memories/:id", delete_memory_handler)
@@ -678,7 +727,41 @@ impl SCServer {
             // Vision/audio pipeline metrics (not in OpenAPI spec — external types)
             .route("/vision/metrics", get(vision_metrics_handler))
             .route("/audio/metrics", get(audio_metrics_handler))
+            // HD recording — bound sessions (meeting / timer / prewarm-pending),
+            // no indefinite mode. Every session has a natural end condition.
+            // GET    /capture/hd            → current snapshot
+            // POST   /capture/hd/start      → { boundTo: "meeting"|"timer"|"prewarm_pending", meetingId?, durationSecs? }
+            // POST   /capture/hd/stop       → clear active session
+            // POST   /capture/hd/extend     → { additionalSecs } push expires_at back
+            // POST   /capture/hd/settings   → { defaultMode?, intervalMs? }
+            .route("/capture/hd", get(crate::routes::capture::get_hd))
+            .route(
+                "/capture/hd/start",
+                axum::routing::post(crate::routes::capture::start_hd),
+            )
+            .route(
+                "/capture/hd/stop",
+                axum::routing::post(crate::routes::capture::stop_hd),
+            )
+            .route(
+                "/capture/hd/extend",
+                axum::routing::post(crate::routes::capture::extend_hd),
+            )
+            .route(
+                "/capture/hd/settings",
+                axum::routing::post(crate::routes::capture::update_hd_settings),
+            )
             // Retranscribe/transcribe (not in OpenAPI spec — opaque Response / multipart)
+            .route(
+                "/audio/reconciliation/backlog",
+                get(crate::routes::retranscribe::audio_reconciliation_backlog_handler),
+            )
+            .route(
+                "/audio/reconciliation/backlog/:audio_chunk_id",
+                axum::routing::delete(
+                    crate::routes::retranscribe::drop_audio_reconciliation_chunk_handler,
+                ),
+            )
             .route(
                 "/audio/retranscribe",
                 axum::routing::post(crate::routes::retranscribe::retranscribe_handler),
@@ -688,7 +771,7 @@ impl SCServer {
                 axum::routing::post(crate::routes::transcribe::transcribe_handler)
                     .layer(axum::extract::DefaultBodyLimit::max(250 * 1024 * 1024)), // 250MB
             )
-            // Local proxy → api.screenpi.pe/v1/chat/completions. Lets the
+            // Local proxy → api.screenpipe.com/v1/chat/completions. Lets the
             // pi-agent's bash do cloud media analysis without ever seeing the
             // cloud JWT (which the wrapper unsets). Body limit bumped because
             // requests embed base64'd audio/images.
@@ -841,6 +924,16 @@ impl SCServer {
             ),
         );
 
+        // User-supplied MCP servers (issue #3282).
+        // Mounted at the top level so /mcp-servers/:id doesn't shadow
+        // /connections/:id and vice versa.
+        let mcp_store: crate::mcp_servers_api::SharedMcpServerStore =
+            Arc::new(screenpipe_connect::mcp_servers::McpServerStore::new(
+                self.screenpipe_dir.clone(),
+                self.secret_store.clone(),
+            ));
+        let router = router.nest("/mcp-servers", crate::mcp_servers_api::router(mcp_store));
+
         // Power management routes (if power manager is available)
         let router = if let Some(ref pm) = self.power_manager {
             let power_routes = Router::new()
@@ -897,10 +990,6 @@ impl SCServer {
                     }
                 }),
             )
-            .route(
-                "/frames/export",
-                get(handle_video_export_ws).post(handle_video_export_post),
-            )
             .with_state(app_state.clone())
             .layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
@@ -946,7 +1035,8 @@ impl SCServer {
                             // Allow specific endpoints without auth:
                             // - /health: device monitor, tray status, startup polling
                             //   (called before frontend loads API key via IPC)
-                            // - /connections/oauth/callback: browser redirect from
+                            // - /connections/oauth/callback and
+                            //   /mcp-servers/:id/oauth/callback: browser redirect from
                             //   OAuth providers (no bearer token in redirect)
                             // - /pipes/store/*: onboarding can fire pipe install before
                             //   the frontend's IPC key-fetch completes on cold start /
@@ -958,6 +1048,8 @@ impl SCServer {
                                 || path == "/ws/health"
                                 || path == "/audio/device/status"
                                 || path == "/connections/oauth/callback"
+                                || (path.starts_with("/mcp-servers/")
+                                    && path.ends_with("/oauth/callback"))
                                 || path == "/connections/browser/pair/start"
                                 || path == "/connections/browser/pair/status"
                                 || path.starts_with("/frames/")

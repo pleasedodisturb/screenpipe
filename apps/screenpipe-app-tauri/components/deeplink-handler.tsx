@@ -13,6 +13,10 @@ import { listen, emit } from "@tauri-apps/api/event";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openSettingsWindow } from "@/lib/utils/window";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
+import {
+  openScreenpipeViewerLink,
+  screenpipeViewerPathFromHref,
+} from "@/components/markdown";
 
 export function DeeplinkHandler() {
   const { toast } = useToast();
@@ -22,6 +26,20 @@ export function DeeplinkHandler() {
   const setPendingNavigation = useTimelineStore((s) => s.setPendingNavigation);
 
   useEffect(() => {
+    const emitMeetingNoteRouteWithRetries = async (
+      meetingId: number,
+      transcript: boolean,
+    ) => {
+      const payload = { meetingId, transcript };
+      for (const delayMs of [0, 250, 750, 1500]) {
+        if (delayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+        await emit("navigate", { url: "/home?section=meetings" });
+        await emit("open-meeting-note", payload);
+      }
+    };
+
     // Shared deep-link URL processor used by both the native plugin callback
     // and the custom Tauri event from single-instance handoff.
     const processDeepLinkUrl = async (url: string) => {
@@ -179,11 +197,10 @@ export function DeeplinkHandler() {
       // Notification bodies with markdown links to local files are rewritten
       // to this scheme by the /notify route in src-tauri/src/notifications/rewrite.rs
       if (parsedUrl.host === "view" || parsedUrl.pathname === "view") {
-        const filePath = parsedUrl.searchParams.get("path");
+        const filePath = screenpipeViewerPathFromHref(url);
         if (filePath) {
           try {
-            const { invoke } = await import("@tauri-apps/api/core");
-            await invoke("open_viewer_window", { path: filePath });
+            await openScreenpipeViewerLink(url);
           } catch (error) {
             console.error("Failed to open viewer:", error);
             toast({
@@ -211,6 +228,24 @@ export function DeeplinkHandler() {
           } catch (error) {
             console.error("Failed to navigate to frame:", error);
           }
+        }
+      }
+
+      // Handle meeting note deep links:
+      //   screenpipe://meeting/123?live=1
+      //   screenpipe://meeting?id=123
+      if (parsedUrl.host === "meeting" || parsedUrl.pathname?.startsWith("/meeting/")) {
+        const pathId =
+          parsedUrl.host === "meeting"
+            ? parsedUrl.pathname.replace(/^\/+/, "").split("/")[0]
+            : parsedUrl.pathname.replace(/^\/meeting\/?/, "").split("/")[0];
+        const meetingId = parsedUrl.searchParams.get("id") || pathId;
+        if (meetingId) {
+          const numericId = Number(meetingId);
+          if (!Number.isFinite(numericId)) return;
+          const transcript = parsedUrl.searchParams.get("live") !== "0";
+          await commands.showWindowActivated({ Home: { page: "meetings" } });
+          await emitMeetingNoteRouteWithRetries(numericId, transcript);
         }
       }
     };

@@ -13,15 +13,27 @@ import {
   type RefObject,
   type MutableRefObject,
 } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 import { ChatConversation } from "@/lib/hooks/use-settings";
-import { commands } from "@/lib/utils/tauri";
+import { titleCreatedByAI } from "@/lib/utils/generate-title-with-preset";
+import {
+  deriveFallbackConversationTitle,
+  isFallbackLikeTitle,
+  shouldAcceptTitleSource,
+} from "@/lib/utils/chat-title";
+import { isInjectedTitleSourcePrompt } from "@/lib/chat-utils";
+import { commands, type AIPreset } from "@/lib/utils/tauri";
 import {
   saveConversationFile,
+  loadConversationFile,
   deleteConversationFile,
+  invalidateConversationListCache,
   listConversations,
+  markConversationFileChanged,
   searchConversations,
   migrateFromStoreBin,
   CHAT_HISTORY_INITIAL_LIMIT,
+  conversationDedupKey,
   type ConversationMeta,
 } from "@/lib/chat-storage";
 
@@ -46,12 +58,16 @@ export interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
+  intent?: "steer";
+  turnIntentId?: string;
   displayContent?: string;
   images?: string[];
   timestamp: number;
   contentBlocks?: ContentBlock[];
   model?: string;
   provider?: string;
+  interruptedBySteer?: boolean;
+  steeredResponse?: boolean;
 }
 
 // --- Hook options ---
@@ -74,8 +90,41 @@ interface UseChatConversationsOpts {
   setIsLoading: Dispatch<SetStateAction<boolean>>;
   setIsStreaming: Dispatch<SetStateAction<boolean>>;
   setPastedImages: Dispatch<SetStateAction<string[]>>;
+  // Optional so existing call-sites (other than StandaloneChat) don't have
+  // to provide it; if absent, attached-doc chips simply aren't cleared on
+  // new-chat / load-conversation (same behavior as before this feature).
+  setAttachedDocs?: Dispatch<SetStateAction<any[]>>;
+  // Same contract as setAttachedDocs for the pending-extraction chips.
+  // A switch mid-extraction still resolves into the now-background
+  // attachedDocs (harmless — the next foreground render won't see it),
+  // but we clear the pending chips so the new chat's composer doesn't
+  // momentarily render a spinner from the previous chat's drop.
+  setPendingDocs?: Dispatch<SetStateAction<any[]>>;
+  // ── Per-conversation composer draft snapshot ─────────────────────
+  // Refs mirroring the live composer values so the hook can snapshot
+  // the OUTGOING chat's composer into the store before switching, and
+  // restore the INCOMING chat's saved draft after. Optional so other
+  // hook consumers don't have to wire them — if absent, the switch
+  // just clears the composer with no restore.
+  inputValueRef?: MutableRefObject<string>;
+  pastedImagesRef?: MutableRefObject<string[]>;
+  attachedDocsRef?: MutableRefObject<any[]>;
+  pendingDocsRef?: MutableRefObject<any[]>;
   settings: any;
+  selectedPreset?: AIPreset | null;
+  inlineHistoryEnabled?: boolean;
 }
+
+interface SaveConversationOptions {
+  refreshHistory?: boolean;
+  syncActiveConversation?: boolean;
+}
+
+/** Module-scope guard for AI title generation — survives component remounts
+ *  and is shared across all hook instances so two StandaloneChat mounts
+ *  (chat window + home page) never both fire for the same conversation.
+ *  Entries are removed on failure/null to allow retry. */
+const aiTitleAttempted = new Set<string>();
 
 export function useChatConversations(opts: UseChatConversationsOpts) {
   const {
@@ -96,8 +145,17 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     setIsLoading,
     setIsStreaming,
     setPastedImages,
+    setAttachedDocs,
+    setPendingDocs,
+    inputValueRef,
+    pastedImagesRef,
+    attachedDocsRef,
+    pendingDocsRef,
     settings,
+    selectedPreset,
+    inlineHistoryEnabled = true,
   } = opts;
+  const componentUnmountedRef = useRef(false);
 
   const [showHistory, setShowHistoryRaw] = useState(() => {
     try { return localStorage.getItem("screenpipe:chat-history-open") === "true"; } catch { return false; }
@@ -112,11 +170,19 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   const [historySearch, setHistorySearch] = useState("");
   const [fileConversations, setFileConversations] = useState<ConversationMeta[]>([]);
 
+  // Track component unmount to prevent post-unmount work in async AI title callback
+  useEffect(() => {
+    return () => {
+      componentUnmountedRef.current = true;
+    };
+  }, []);
+
   // Run migration from store.bin on mount, then load conversations from files
   const migrationDoneRef = useRef(false);
   const historyRequestRef = useRef(0);
   const lastHistoryQueryRef = useRef<string | null>(null);
   const [historyReady, setHistoryReady] = useState(false);
+  const historyRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadConversationMetas = useCallback(async (query: string) => {
     const options = {
       limit: CHAT_HISTORY_INITIAL_LIMIT,
@@ -126,8 +192,122 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     return q ? searchConversations(q, options) : listConversations(options);
   }, []);
 
+  const upsertFileConversationMeta = useCallback((conversation: ChatConversation) => {
+    if (historySearch.trim()) return;
+
+    const msgs = Array.isArray(conversation.messages) ? conversation.messages : [];
+    let lastUserMessageAt = conversation.lastUserMessageAt;
+    if (lastUserMessageAt == null) {
+      for (const m of msgs) {
+        if (m?.role === "user" && typeof m.timestamp === "number") {
+          if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
+            lastUserMessageAt = m.timestamp;
+          }
+        }
+      }
+    }
+
+    const meta: ConversationMeta = {
+      id: conversation.id,
+      title: typeof conversation.title === "string" ? conversation.title : "untitled",
+      createdAt: typeof conversation.createdAt === "number" ? conversation.createdAt : 0,
+      updatedAt: typeof conversation.updatedAt === "number" ? conversation.updatedAt : 0,
+      messageCount: msgs.length,
+      pinned: conversation.pinned === true,
+      hidden: conversation.hidden === true,
+      lastUserMessageAt,
+      kind: conversation.kind ?? "chat",
+      pipeContext: conversation.pipeContext,
+      titleSource: conversation.titleSource,
+      dedupKey: conversationDedupKey(conversation) ?? undefined,
+    };
+
+    setFileConversations((prev) => {
+      const existing = prev.find((c) => c.id === meta.id);
+      const nextMeta = existing
+        ? { ...existing, ...meta, pinned: existing.pinned || meta.pinned }
+        : meta;
+      const without = prev.filter((c) => c.id !== meta.id);
+      const next = nextMeta.hidden ? without : [nextMeta, ...without];
+      return next
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, CHAT_HISTORY_INITIAL_LIMIT);
+    });
+    lastHistoryQueryRef.current = "";
+  }, [historySearch]);
+
+  const syncConversationTitleState = useCallback(async (
+    id: string,
+    {
+      title,
+      titleSource,
+    }: {
+      title?: string | null;
+      titleSource?: "fallback" | "ai" | "user";
+    } = {},
+  ) => {
+    let resolvedTitle = title?.trim() || null;
+    let resolvedTitleSource = titleSource;
+    let loadedConversation: ChatConversation | null = null;
+
+    if (!resolvedTitle || !resolvedTitleSource) {
+      try {
+        await markConversationFileChanged(id);
+        loadedConversation = await loadConversationFile(id);
+        if (!loadedConversation) return;
+        resolvedTitle = resolvedTitle || loadedConversation.title?.trim() || null;
+        resolvedTitleSource = resolvedTitleSource || loadedConversation.titleSource;
+      } catch {
+        return;
+      }
+    }
+
+    if (!resolvedTitle) return;
+
+    try {
+      const { useChatStore } = await import("@/lib/stores/chat-store");
+      const session = useChatStore.getState().sessions[id];
+      if (session) {
+        // Never downgrade title priority (fallback < ai < user).
+        if (!shouldAcceptTitleSource(session.titleSource, resolvedTitleSource)) return;
+        useChatStore.getState().actions.patch(id, {
+          title: resolvedTitle,
+          ...(resolvedTitleSource ? { titleSource: resolvedTitleSource } : {}),
+          // Clear any in-flight streaming partial when a higher-priority title
+          // (user rename or finalized AI) arrives from another window.
+          ...(resolvedTitleSource === "user" || resolvedTitleSource === "ai"
+            ? { streamingTitle: undefined }
+            : {}),
+        });
+      }
+    } catch (e) {
+      console.warn("[chat-title] failed to sync local title state", { id, error: e });
+    }
+
+    if (!loadedConversation) {
+      try {
+        await markConversationFileChanged(id);
+        loadedConversation = await loadConversationFile(id);
+      } catch {
+        loadedConversation = null;
+      }
+    }
+
+    if (loadedConversation) {
+      upsertFileConversationMeta(loadedConversation);
+    }
+  }, [upsertFileConversationMeta]);
+
   useEffect(() => {
-    if (migrationDoneRef.current) return;
+    if (!inlineHistoryEnabled || !showHistory) {
+      setHistoryReady(false);
+      return;
+    }
+
+    if (migrationDoneRef.current) {
+      setHistoryReady(true);
+      return;
+    }
     migrationDoneRef.current = true;
     (async () => {
       try {
@@ -142,9 +322,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         setHistoryReady(true);
       }
     })();
-  }, [loadConversationMetas]);
+  }, [inlineHistoryEnabled, loadConversationMetas, showHistory]);
 
   useEffect(() => {
+    if (!inlineHistoryEnabled || !showHistory) return;
     if (!historyReady) return;
     const q = historySearch.trim();
     if (lastHistoryQueryRef.current === q) return;
@@ -165,33 +346,307 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }, q ? 200 : 0);
 
     return () => clearTimeout(timer);
-  }, [historyReady, historySearch, loadConversationMetas]);
+  }, [historyReady, historySearch, inlineHistoryEnabled, loadConversationMetas, showHistory]);
 
-  const refreshFileConversations = async () => {
+  const refreshFileConversations = useCallback(async () => {
+    if (!inlineHistoryEnabled || !showHistory) return;
     const q = historySearch.trim();
     const convs = await loadConversationMetas(q);
     setFileConversations(convs);
     lastHistoryQueryRef.current = q;
-  };
+  }, [historySearch, inlineHistoryEnabled, loadConversationMetas, showHistory]);
+
+  const scheduleHistoryRefresh = useCallback((delayMs = 80) => {
+    if (historyRefreshTimerRef.current) {
+      clearTimeout(historyRefreshTimerRef.current);
+    }
+    historyRefreshTimerRef.current = setTimeout(() => {
+      historyRefreshTimerRef.current = null;
+      void refreshFileConversations().catch(() => {});
+    }, delayMs);
+  }, [refreshFileConversations]);
+
+  useEffect(() => {
+    return () => {
+      if (historyRefreshTimerRef.current) {
+        clearTimeout(historyRefreshTimerRef.current);
+        historyRefreshTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Cross-window history sync. The overlay and home windows keep separate
+  // React states, so sidebar archive/delete actions in one window won't
+  // update the other's file-backed history list unless we listen for the
+  // broadcast events and refresh locally.
+  useEffect(() => {
+    let cancelled = false;
+    const unlistenFns: Array<() => void> = [];
+
+    (async () => {
+      const unlistenDeleted = await listen<{ id: string }>(
+        "chat-deleted",
+        (event) => {
+          if (cancelled) return;
+          const id = event.payload?.id;
+          if (!id) return;
+          invalidateConversationListCache();
+          setFileConversations((prev) => prev.filter((c) => c.id !== id));
+          if (conversationId === id) {
+            setMessages([]);
+            setConversationId(null);
+          }
+          scheduleHistoryRefresh();
+        },
+      );
+      unlistenFns.push(unlistenDeleted);
+
+      const unlistenVisibility = await listen<{ id: string; hidden: boolean }>(
+        "chat-visibility-changed",
+        (event) => {
+          if (cancelled) return;
+          const { id, hidden } = event.payload ?? {};
+          if (!id) return;
+          invalidateConversationListCache();
+          if (hidden) {
+            setFileConversations((prev) => prev.filter((c) => c.id !== id));
+          }
+          scheduleHistoryRefresh();
+        },
+      );
+      unlistenFns.push(unlistenVisibility);
+
+      const unlistenSaved = await listen<{ id: string; title?: string; titleSource?: "fallback" | "ai" | "user" }>(
+        "chat-conversation-saved",
+        async (event) => {
+          if (cancelled) return;
+          const { id, title, titleSource } = event.payload ?? {};
+          if (!id) return;
+
+          // The current conversation's transcript may be newer in local state
+          // than on disk, but title metadata should still converge to the
+          // persisted value across windows.
+          if (id === conversationId || id === piSessionIdRef.current) {
+            await syncConversationTitleState(id, { title, titleSource });
+            return;
+          }
+
+          await syncConversationTitleState(id, { title, titleSource });
+        },
+      );
+      unlistenFns.push(unlistenSaved);
+
+      const unlistenRenamed = await listen<{ id: string; title: string }>(
+        "chat-renamed",
+        async (event) => {
+          if (cancelled) return;
+          const { id, title } = event.payload ?? {};
+          if (!id || !title) return;
+          await syncConversationTitleState(id, { title, titleSource: "user" });
+        },
+      );
+      unlistenFns.push(unlistenRenamed);
+    })().catch(() => {
+      // ignore: chat still works without cross-window sync listeners
+    });
+
+    return () => {
+      cancelled = true;
+      for (const unlisten of unlistenFns) unlisten();
+    };
+  }, [
+    conversationId,
+    piSessionIdRef,
+    scheduleHistoryRefresh,
+    setConversationId,
+    setMessages,
+    syncConversationTitleState,
+    upsertFileConversationMeta,
+  ]);
 
   // ---- saveConversation ----
-  const saveConversation = async (msgs: Message[]) => {
+  const saveConversation = async (
+    msgs: Message[],
+    options: SaveConversationOptions = {}
+  ) => {
     if (msgs.length === 0) return;
 
     const historyEnabled = settings?.chatHistory?.historyEnabled ?? true;
     if (!historyEnabled) return;
 
-    const convId = conversationId || crypto.randomUUID();
-    const firstUserMsg = msgs.find(m => m.role === "user");
-    const title = firstUserMsg?.content.slice(0, 50) || "New Chat";
+    // Bind the save to `conversationId` (React state), NOT
+    // `piSessionIdRef.current` (a ref). The ref is updated eagerly inside
+    // loadConversation — `piSessionIdRef.current = conv.id` runs before
+    // `setMessages` / `setConversationId` commit — which means during a
+    // mid-stream chat switch there's a render window where:
+    //   piSessionIdRef.current = NEW chat id
+    //   conversationId         = OLD chat id (not yet committed)
+    //   messages               = OLD chat's messages (not yet committed)
+    // Trusting the ref here lets the auto-save edge (isLoading: true→false
+    // flipped by loadConversation) write the OLD chat's messages under the
+    // NEW chat's id — corrupting the chat the user just opened. Using
+    // `conversationId` keeps the convId in lockstep with the `messages`
+    // argument because both are React state captured by the same render.
+    //
+    // Fall back to the ref only when `conversationId` is briefly null
+    // during startNewConversation (setConversationId(null) → … →
+    // setConversationId(newSid)); without the fallback the save would mint
+    // a fresh uuid and duplicate the conversation.
+    const convId = conversationId || piSessionIdRef.current || crypto.randomUUID();
 
-    // Try to load existing conversation to preserve createdAt
+    // Try to load existing conversation to preserve createdAt + title + kind.
     const { loadConversationFile } = await import("@/lib/chat-storage");
     const existing = await loadConversationFile(convId);
+
+    // Find first real user message, skipping injected metadata.
+    const firstUserMsg = msgs.find((m) => (
+      m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
+    ));
+    const fallbackTitle = deriveFallbackConversationTitle(firstUserMsg);
+    const existingTitle = existing?.title?.trim() || null;
+
+    const hasValidPreset =
+      selectedPreset &&
+      selectedPreset.provider &&
+      selectedPreset.model?.trim();
+
+    const existingSource = existing?.titleSource;
+    const existingLooksFallback = isFallbackLikeTitle(
+      existingTitle,
+      fallbackTitle,
+      firstUserMsg?.content,
+    );
+    // Title priority: user > ai > fallback.
+    // Also preserve legacy non-fallback titles that predate titleSource.
+    const preservedTitleSource: "user" | "ai" | null =
+      existingSource === "user" || existingSource === "ai"
+        ? existingSource
+        : existingTitle && !existingLooksFallback
+          ? "user"
+          : null;
+    const title =
+      preservedTitleSource && existingTitle ? existingTitle : fallbackTitle;
+    const titleSource: "user" | "ai" | "fallback" =
+      preservedTitleSource ?? "fallback";
+
+    // Start AI title generation in background (once per conversation)
+    // Only generate if current title is fallback priority
+    const rawContent = firstUserMsg?.content?.trim() || null;
+    // Opt-out: when the user disables auto title generation (to save tokens),
+    // skip the extra LLM call entirely — chats keep the fallback title.
+    const autoTitleEnabled = settings?.autoGenerateChatTitles !== false;
+    if (
+      autoTitleEnabled &&
+      titleSource === "fallback" &&
+      rawContent &&
+      hasValidPreset &&
+      !aiTitleAttempted.has(convId)
+    ) {
+      aiTitleAttempted.add(convId);
+
+      // Generate title in background (non-blocking)
+      // Pass the full raw user message — the AI can parse wrapper tags
+      // and extract intent better than the simple regex stripper.
+      void (async () => {
+        try {
+          const aiTitle = await titleCreatedByAI(
+            rawContent,
+            selectedPreset,
+            settings?.user?.token ?? null,
+            async (partial) => {
+              try {
+                const { useChatStore } = await import("@/lib/stores/chat-store");
+                const session = useChatStore.getState().sessions[convId];
+                // Only stream partial title while still at fallback priority.
+                // If the user renamed (titleSource === "user") or AI already
+                // settled, stop updating.
+                if (!session || (session.titleSource && session.titleSource !== "fallback")) return;
+                useChatStore.getState().actions.patch(convId, { streamingTitle: partial });
+              } catch {}
+            },
+          );
+
+          if (aiTitle) {
+            // Reload conversation to check title priority
+            const existingConv = await loadConversationFile(convId);
+            if (!existingConv) {
+              // Conversation deleted — clear streaming state
+              try {
+                const { useChatStore } = await import("@/lib/stores/chat-store");
+                useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+              } catch {}
+              return;
+            }
+
+            // Only update if current title is still fallback priority
+            if (existingConv.titleSource === "fallback" || !existingConv.titleSource) {
+              existingConv.title = aiTitle;
+              existingConv.titleSource = "ai";
+              await saveConversationFile(existingConv);
+
+              // Clear streamingTitle atomically with the final title apply
+              // so the sidebar transitions directly from partial → final
+              // with no fallback flicker.
+              try {
+                const { useChatStore } = await import("@/lib/stores/chat-store");
+                useChatStore.getState().actions.patch(convId, {
+                  title: aiTitle,
+                  titleSource: "ai",
+                  streamingTitle: undefined,
+                });
+              } catch (e) {
+                console.warn("[chat-title] failed to update chat store", { convId, error: e });
+              }
+
+              try {
+                await emit("chat-conversation-saved", {
+                  id: convId,
+                  title: existingConv.title,
+                  titleSource: "ai" as const,
+                });
+              } catch {
+                // Ignore - webview may have reloaded
+              }
+
+              // React state update — only safe while mounted
+              if (!componentUnmountedRef.current) {
+                upsertFileConversationMeta(existingConv);
+              }
+            } else {
+              // Title was upgraded (e.g. user renamed) while we were generating —
+              // just clear the streaming state. Keep guard entry to prevent re-trigger.
+              try {
+                const { useChatStore } = await import("@/lib/stores/chat-store");
+                useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+              } catch {}
+            }
+          } else {
+            // AI returned null — clear streaming state, allow retry.
+            aiTitleAttempted.delete(convId);
+            try {
+              const { useChatStore } = await import("@/lib/stores/chat-store");
+              useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+            } catch {}
+          }
+        } catch (error) {
+          // Clear streamingTitle on error, allow retry.
+          aiTitleAttempted.delete(convId);
+          try {
+            const { useChatStore } = await import("@/lib/stores/chat-store");
+            useChatStore.getState().actions.patch(convId, { streamingTitle: undefined });
+          } catch {}
+          console.warn("[chat-title] background title generation failed", {
+            convId,
+            error,
+          });
+        }
+      })();
+    }
 
     const conversation: ChatConversation = {
       id: convId,
       title,
+      titleSource,
       // Persist the full transcript. The previous slice(-100) was silently
       // dropping the oldest messages on every save, so any chat that grew
       // past 100 messages walked forward and lost its early history. If
@@ -229,15 +684,28 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           id: m.id,
           role: m.role,
           content,
+          ...(m.intent ? { intent: m.intent } : {}),
+          ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
           timestamp: m.timestamp,
+          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
           ...(blocks?.length ? { contentBlocks: blocks } : {}),
           ...(m.images?.length ? { images: m.images } : {}),
+          ...((m as any).attachments?.length ? { attachments: (m as any).attachments } : {}),
           ...(m.model ? { model: m.model } : {}),
           ...(m.provider ? { provider: m.provider } : {}),
+          ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
+          ...(m.steeredResponse ? { steeredResponse: true } : {}),
         };
       }),
       createdAt: existing?.createdAt ?? Date.now(),
       updatedAt: Date.now(),
+      // Preserve pipe-run identity across follow-up saves. Without this, the
+      // first user-typed follow-up to a pipe-run silently demoted it to a
+      // plain chat (kind/pipeContext dropped on disk).
+      ...(existing?.kind ? { kind: existing.kind } : {}),
+      ...(existing?.pipeContext ? { pipeContext: existing.pipeContext } : {}),
+      ...(existing?.pinned ? { pinned: existing.pinned } : {}),
+      ...(existing?.hidden ? { hidden: existing.hidden } : {}),
       // Preserve sort key across reloads. Source of truth: the in-memory
       // chat-store, which is bumped exactly once per user-send.
       ...(await (async () => {
@@ -272,7 +740,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }
 
     await saveConversationFile(conversation);
-    await refreshFileConversations();
+    if (options.refreshHistory) {
+      await refreshFileConversations();
+    } else {
+      upsertFileConversationMeta(conversation);
+    }
+    try {
+      await emit("chat-conversation-saved", {
+        id: conversation.id,
+        title: conversation.title,
+        titleSource: conversation.titleSource,
+      });
+    } catch {
+      // ignore broadcast failures; local save already succeeded
+    }
 
     // Sync the persisted title back into the in-memory chat-store so the
     // sidebar (which reads `sessions[id].title` directly) updates immediately.
@@ -301,25 +782,27 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }
 
     // Update activeConversationId in store (lightweight — no conversation data)
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      await store.set("settings", {
-        ...freshSettings,
-        chatHistory: {
-          ...(freshSettings?.chatHistory || {}),
-          activeConversationId: convId,
-          historyEnabled: true,
-          conversations: [], // keep empty — data lives in files now
-        },
-      });
-      await store.save();
-    } catch (e) {
-      console.warn("[chat] failed to update activeConversationId:", e);
+    if (options.syncActiveConversation !== false) {
+      try {
+        const { getStore } = await import("@/lib/hooks/use-settings");
+        const store = await getStore();
+        const freshSettings = await store.get<any>("settings");
+        await store.set("settings", {
+          ...freshSettings,
+          chatHistory: {
+            ...(freshSettings?.chatHistory || {}),
+            activeConversationId: convId,
+            historyEnabled: true,
+            conversations: [], // keep empty — data lives in files now
+          },
+        });
+        await store.save();
+      } catch (e) {
+        console.warn("[chat] failed to update activeConversationId:", e);
+      }
     }
 
-    if (!conversationId) {
+    if (!conversationId || conversationId !== convId) {
       setConversationId(convId);
     }
   };
@@ -390,7 +873,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     streamingSaveTimerRef.current = setTimeout(() => {
       streamingSaveTimerRef.current = null;
       // Snapshot inside the timeout so we save the latest, not stale closure.
-      saveConversation(messages);
+      saveConversation(messages, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
     }, 1500);
 
     return () => {
@@ -409,7 +895,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const { loadConversationFile } = await import("@/lib/chat-storage");
     const conv = await loadConversationFile(convId);
     if (!conv) return;
-    await saveConversationFile({ ...conv, title: trimmed, updatedAt: Date.now() });
+    await saveConversationFile({ ...conv, title: trimmed, titleSource: "user", updatedAt: Date.now() });
     await refreshFileConversations();
     // Mirror to the in-memory store so the chat sidebar reflects the new
     // title without waiting for app restart. Some call sites already patch
@@ -418,7 +904,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     try {
       const { useChatStore } = await import("@/lib/stores/chat-store");
       if (useChatStore.getState().sessions[convId]) {
-        useChatStore.getState().actions.patch(convId, { title: trimmed });
+        useChatStore.getState().actions.patch(convId, { title: trimmed, titleSource: "user", streamingTitle: undefined });
       }
     } catch (e) {
       console.warn("[chat] failed to sync rename to store:", e);
@@ -429,7 +915,6 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // vice versa) until the next on-disk hydration. Listeners in
     // standalone-chat.tsx patch their local store on receipt.
     try {
-      const { emit } = await import("@tauri-apps/api/event");
       await emit("chat-renamed", { id: convId, title: trimmed });
     } catch (e) {
       console.warn("[chat] failed to broadcast rename:", e);
@@ -461,6 +946,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       }
     } catch (e) {
       console.warn("[chat] failed to clear activeConversationId:", e);
+    }
+
+    // Broadcast so other windows (home sidebar / overlay) update immediately.
+    try {
+      await emit("chat-deleted", { id: convId });
+    } catch (e) {
+      console.warn("[chat] failed to broadcast delete:", e);
     }
   };
 
@@ -510,6 +1002,19 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           isLoading,
         });
       }
+      // (1b) Snapshot OUTGOING composer draft — what the user had
+      // typed + staged but not yet sent. Restored when they come back
+      // to this chat. Mirrors how messages/streamingText are stored.
+      // No-op when the caller didn't pass the value refs (other hook
+      // consumers just get the clear, no restore).
+      if (inputValueRef && pastedImagesRef) {
+        store.actions.setComposerDraft(outgoingSid, {
+          input: inputValueRef.current,
+          pastedImages: [...pastedImagesRef.current],
+          attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
+          pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
+        });
+      }
     }
 
     // (2) Reset panel flags — these are panel-local, not session-local.
@@ -518,6 +1023,21 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     piContentBlocksRef.current = [];
     setIsLoading(false);
     setIsStreaming(false);
+    // Composer state (text, images, docs) is scoped to the chat the user
+    // was composing in. Switching to another conversation must not carry
+    // any of it over — otherwise the user can send a draft into the wrong
+    // thread (or silently inject a PDF/image they thought belonged to the
+    // previous chat). Mirrors startNewConversation, which already clears
+    // the full composer on "+ new chat". The block below then restores
+    // the INCOMING chat's saved draft after switching — ChatGPT/Claude
+    // parity. The clear is intentional even with restore: if the
+    // incoming chat has no draft, we want a clean composer, not the
+    // outgoing chat's contents lingering for a frame.
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+    setPastedImages([]);
+    setAttachedDocs?.([]);
+    setPendingDocs?.([]);
 
     // Switch to this conversation's session. Pair the panel's ref
     // switch with `setCurrent` on the store so the router's
@@ -540,6 +1060,47 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     //     disk would silently drop tokens that arrived since the last
     //     persisted agent_end.
     const existing = store.sessions[conv.id];
+    const needsPersistedSync =
+      !existing ||
+      !existing.hydratedAt ||
+      !existing.messages ||
+      existing.messages.length === 0 ||
+      existing.titleSource == null;
+    let persisted: ChatConversation | null = null;
+
+    if (needsPersistedSync) {
+      const { loadConversationFile } = await import("@/lib/chat-storage");
+      persisted = await loadConversationFile(conv.id);
+      if (persisted) {
+        if (!store.sessions[conv.id]) {
+          store.actions.upsert({
+            id: conv.id,
+            title: persisted.title || "untitled",
+            ...(persisted.titleSource ? { titleSource: persisted.titleSource } : {}),
+            preview: "",
+            status: "idle",
+            messageCount: persisted.messages?.length ?? 0,
+            createdAt: persisted.createdAt ?? Date.now(),
+            updatedAt: persisted.updatedAt ?? Date.now(),
+            pinned: persisted.pinned === true,
+            unread: false,
+            ...(persisted.hidden === true ? { hidden: true } : {}),
+            ...(persisted.kind ? { kind: persisted.kind } : {}),
+            ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
+          });
+        } else {
+          store.actions.patch(conv.id, {
+            title: persisted.title || existing?.title || "untitled",
+            ...(persisted.titleSource ? { titleSource: persisted.titleSource } : {}),
+            pinned: persisted.pinned === true,
+            hidden: persisted.hidden === true,
+            updatedAt: Math.max(existing?.updatedAt ?? 0, persisted.updatedAt ?? 0),
+            ...(persisted.kind ? { kind: persisted.kind } : {}),
+            ...(persisted.pipeContext ? { pipeContext: persisted.pipeContext } : {}),
+          });
+        }
+      }
+    }
     let messagesForPanel: any[];
     if (existing?.messages && existing.messages.length > 0) {
       messagesForPanel = existing.messages as any[];
@@ -571,10 +1132,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       store.actions.markHydrated(conv.id);
     } else {
       // Cold session — load from disk and seed the store.
-      const { loadConversationFile } = await import("@/lib/chat-storage");
-      const loaded = await loadConversationFile(conv.id);
       const full =
-        loaded ||
+        persisted ||
         (Array.isArray((conv as ChatConversation).messages)
           ? (conv as ChatConversation)
           : null);
@@ -586,7 +1145,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         id: m.id,
         role: m.role,
         content: m.content,
+        ...((m as any).intent ? { intent: (m as any).intent } : {}),
+        ...((m as any).turnIntentId ? { turnIntentId: (m as any).turnIntentId } : {}),
         timestamp: m.timestamp,
+        ...(m.displayContent ? { displayContent: m.displayContent } : {}),
         ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
         ...((m as any).images?.length
           ? { images: (m as any).images }
@@ -595,12 +1157,15 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
             : {}),
         ...((m as any).model ? { model: (m as any).model } : {}),
         ...((m as any).provider ? { provider: (m as any).provider } : {}),
+        ...((m as any).interruptedBySteer ? { interruptedBySteer: true } : {}),
+        ...((m as any).steeredResponse ? { steeredResponse: true } : {}),
       }));
       // Make sure a record exists, then seed messages and mark hydrated.
       if (!store.sessions[conv.id]) {
         store.actions.upsert({
           id: conv.id,
           title: full.title || "untitled",
+          ...(full.titleSource ? { titleSource: full.titleSource } : {}),
           preview: "",
           status: "idle",
           messageCount: messagesForPanel.length,
@@ -617,6 +1182,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         });
       } else if (conv.kind || conv.pipeContext) {
         store.actions.patch(conv.id, {
+          title: full.title || store.sessions[conv.id]?.title || "untitled",
+          ...(full.titleSource ? { titleSource: full.titleSource } : {}),
+          pinned: full.pinned === true,
+          hidden: full.hidden === true,
+          updatedAt: Math.max(store.sessions[conv.id]?.updatedAt ?? 0, full.updatedAt ?? 0),
           ...(conv.kind ? { kind: conv.kind } : {}),
           ...(conv.pipeContext ? { pipeContext: conv.pipeContext } : {}),
         });
@@ -629,6 +1199,28 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     setConversationId(conv.id);
     setShowHistory(false);
     piSessionSyncedRef.current = false;
+
+    // (3) Restore INCOMING composer draft, if any. Reads from the
+    // store snapshot taken last time the user left this chat
+    // (or set live by the panel's mirror effect). Safe no-op when
+    // there's no saved draft — the composer was just cleared above,
+    // so we're either restoring a real draft or staying empty.
+    // Only runs when value refs were wired by the caller.
+    const incomingDraft = store.sessions[conv.id]?.composerDraft;
+    if (incomingDraft && inputValueRef) {
+      if (incomingDraft.input) {
+        setInput(incomingDraft.input);
+      }
+      if ((incomingDraft.pastedImages?.length ?? 0) > 0) {
+        setPastedImages(incomingDraft.pastedImages as string[]);
+      }
+      if (setAttachedDocs && (incomingDraft.attachedDocs?.length ?? 0) > 0) {
+        setAttachedDocs(incomingDraft.attachedDocs as any[]);
+      }
+      if (setPendingDocs && (incomingDraft.pendingDocs?.length ?? 0) > 0) {
+        setPendingDocs(incomingDraft.pendingDocs as any[]);
+      }
+    }
 
     // Update activeConversationId in store
     try {
@@ -661,9 +1253,30 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const branchedMessages = messages.slice(0, msgIndex + 1);
     if (branchedMessages.length === 0) return;
 
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const store = useChatStore.getState();
+    const outgoingSid = piSessionIdRef.current;
+    if (outgoingSid && store.sessions[outgoingSid]) {
+      const outgoingKind = store.sessions[outgoingSid].kind;
+      if (outgoingKind !== "pipe-watch") {
+        store.actions.snapshotSession(outgoingSid, {
+          messages: messages as any,
+          streamingText: piStreamingTextRef.current,
+          streamingMessageId: piMessageIdRef.current,
+          contentBlocks: [...piContentBlocksRef.current],
+          isStreaming,
+          isLoading,
+        });
+      }
+    }
+
     const newId = crypto.randomUUID();
-    const firstUserMsg = branchedMessages.find((m) => m.role === "user");
-    const title = (firstUserMsg?.content.slice(0, 47) || "Branched Chat") + "…";
+    const currentTitle = store.sessions[outgoingSid]?.title?.trim();
+    const title = currentTitle || "Branched Chat";
+    const createdAt = Date.now();
+    const lastUserMessageAt = [...branchedMessages]
+      .reverse()
+      .find((m) => m.role === "user")?.timestamp;
 
     const conversation: ChatConversation = {
       id: newId,
@@ -688,19 +1301,60 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           id: m.id,
           role: m.role,
           content,
+          ...(m.intent ? { intent: m.intent } : {}),
+          ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
           timestamp: m.timestamp,
+          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
           ...(blocks?.length ? { contentBlocks: blocks } : {}),
           ...(m.images?.length ? { images: m.images } : {}),
+          ...((m as any).attachments?.length ? { attachments: (m as any).attachments } : {}),
           ...(m.model ? { model: m.model } : {}),
           ...(m.provider ? { provider: m.provider } : {}),
+          ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
+          ...(m.steeredResponse ? { steeredResponse: true } : {}),
         };
       }),
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt,
+      updatedAt: createdAt,
+      ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
     };
 
     await saveConversationFile(conversation);
     await refreshFileConversations();
+
+    try {
+      store.actions.upsert({
+        id: newId,
+        title: conversation.title,
+        preview: "",
+        status: "idle",
+        messageCount: conversation.messages.length,
+        createdAt: conversation.createdAt,
+        updatedAt: conversation.updatedAt,
+        pinned: false,
+        hidden: false,
+        unread: false,
+        draft: false,
+        ...(conversation.lastUserMessageAt
+          ? { lastUserMessageAt: conversation.lastUserMessageAt }
+          : {}),
+      });
+      store.actions.setMessages(newId, conversation.messages as any);
+      store.actions.setCurrent(newId);
+      store.actions.setPanelSession(newId);
+    } catch (e) {
+      console.warn("[chat] failed to sync branched conversation to store:", e);
+    }
+
+    try {
+      await emit("chat-conversation-saved", {
+        id: conversation.id,
+        title: conversation.title,
+      });
+    } catch {
+      // ignore broadcast failures; local branch save already succeeded
+    }
+    emit("chat-current-session", { id: newId });
 
     // Switch to the branched conversation
     piSessionIdRef.current = newId;
@@ -754,6 +1408,17 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         isStreaming,
         isLoading,
       });
+      // Snapshot the outgoing composer draft so coming back to this
+      // chat (via the sidebar) restores text + attachments. Same
+      // shape as the snapshot in loadConversation.
+      if (inputValueRef && pastedImagesRef) {
+        store.actions.setComposerDraft(outgoingSid, {
+          input: inputValueRef.current,
+          pastedImages: [...pastedImagesRef.current],
+          attachedDocs: attachedDocsRef ? [...attachedDocsRef.current] : [],
+          pendingDocs: pendingDocsRef ? [...pendingDocsRef.current] : [],
+        });
+      }
     }
 
     // Clear panel state
@@ -768,6 +1433,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     if (inputRef.current) inputRef.current.style.height = "auto";
     setShowHistory(false);
     setPastedImages([]);
+    // Clear any in-progress doc attachments — they belong to the chat the
+    // user was on, not to the new one we're switching to.
+    setAttachedDocs?.([]);
+    setPendingDocs?.([]);
 
     // New session ID — Pi will be started fresh when the first message is sent.
     // Pair with setCurrent so the router immediately knows the new id is

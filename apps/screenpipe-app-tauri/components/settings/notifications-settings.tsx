@@ -21,6 +21,9 @@ const defaultPrefs = {
   pipeSuggestions: true,
   pipeNotifications: true,
   displayChanges: true,
+  meetingLiveNotes: true,
+  audioCaptureStalled: true,
+  liveTranscriptStalled: true,
   mutedPipes: [] as string[],
 };
 
@@ -55,6 +58,7 @@ export function NotificationsSettings() {
             </p>
           </div>
           <Switch
+            data-testid="notification-pref-capture-stalls"
             checked={prefs.captureStalls ?? true}
             onCheckedChange={(v) => {
               updateSettings({
@@ -74,6 +78,7 @@ export function NotificationsSettings() {
             </p>
           </div>
           <Switch
+            data-testid="notification-pref-app-updates"
             checked={prefs.appUpdates ?? true}
             onCheckedChange={(v) => updatePref("appUpdates", v)}
           />
@@ -117,6 +122,7 @@ export function NotificationsSettings() {
               </SelectContent>
             </Select>
             <Switch
+              data-testid="notification-pref-pipe-suggestions"
               checked={settings.pipeSuggestionsEnabled !== false}
               onCheckedChange={(checked) => {
                 updateSettings({
@@ -143,6 +149,7 @@ export function NotificationsSettings() {
             </p>
           </div>
           <Switch
+            data-testid="notification-pref-pipe-notifications"
             checked={prefs.pipeNotifications ?? true}
             onCheckedChange={(v) => updatePref("pipeNotifications", v)}
           />
@@ -157,8 +164,54 @@ export function NotificationsSettings() {
             </p>
           </div>
           <Switch
+            data-testid="notification-pref-display-changes"
             checked={prefs.displayChanges ?? true}
             onCheckedChange={(v) => updatePref("displayChanges", v)}
+          />
+        </div>
+
+        {/* Meeting live notes */}
+        <div className="flex items-center justify-between py-3 border-b border-border">
+          <div>
+            <p className="text-sm font-medium">Meeting live notes</p>
+            <p className="text-xs text-muted-foreground">
+              Prompt to open a live note when a meeting is detected
+            </p>
+          </div>
+          <Switch
+            data-testid="notification-pref-meeting-live-notes"
+            checked={prefs.meetingLiveNotes ?? true}
+            onCheckedChange={(v) => updatePref("meetingLiveNotes", v)}
+          />
+        </div>
+
+        {/* Meeting audio stall */}
+        <div className="flex items-center justify-between py-3 border-b border-border">
+          <div>
+            <p className="text-sm font-medium">Meeting audio not capturing</p>
+            <p className="text-xs text-muted-foreground">
+              OS notification when a meeting is detected but no audio reaches the recorder within 60s
+            </p>
+          </div>
+          <Switch
+            data-testid="notification-pref-audio-capture-stalled"
+            checked={prefs.audioCaptureStalled ?? true}
+            onCheckedChange={(v) => updatePref("audioCaptureStalled", v)}
+          />
+        </div>
+
+        {/* Meeting transcript stall */}
+        <div className="flex items-center justify-between py-3 border-b border-border">
+          <div>
+            <p className="text-sm font-medium">Live transcript not flowing</p>
+            <p className="text-xs text-muted-foreground">
+              In-app alert when audio is captured but no live transcript arrives within 60s
+            </p>
+          </div>
+          <Switch
+            data-testid="notification-pref-live-transcript-stalled"
+            checked={prefs.liveTranscriptStalled ?? true}
+            onCheckedChange={(v) => updatePref("liveTranscriptStalled", v)}
           />
         </div>
       </div>

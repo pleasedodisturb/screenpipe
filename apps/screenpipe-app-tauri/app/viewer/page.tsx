@@ -5,7 +5,7 @@
 "use client";
 
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 // PrismAsyncLight lazy-loads each language pack only when a code block
 // in that language is actually rendered — keeps the initial viewer
 // bundle small. The Prism build (root export) eager-imports every
@@ -15,7 +15,11 @@ import { invoke } from "@tauri-apps/api/core";
 // chunks fetched on demand.
 import { PrismAsyncLight as SyntaxHighlighter } from "react-syntax-highlighter";
 import { coldarkDark, coldarkCold } from "react-syntax-highlighter/dist/cjs/styles/prism";
-import { MemoizedReactMarkdown } from "@/components/markdown";
+import {
+  MemoizedReactMarkdown,
+  openScreenpipeViewerLink,
+  viewerUrlTransform,
+} from "@/components/markdown";
 import remarkGfm from "remark-gfm";
 import { useIsFullscreen } from "@/lib/hooks/use-is-fullscreen";
 
@@ -218,8 +222,11 @@ export default function ViewerPage() {
       setContent({ kind: "error", message: "no path provided", path: "" });
       return;
     }
-    invoke<ViewerContent>("read_viewer_file", { path: p })
-      .then(setContent)
+    commands.readViewerFile(p)
+      .then((res) => {
+        if (res.status === "error") throw new Error(res.error);
+        setContent(res.data);
+      })
       .catch((e) => {
         setContent({
           kind: "error",
@@ -242,7 +249,7 @@ export default function ViewerPage() {
   const openInDefault = useCallback(async () => {
     if (!path) return;
     try {
-      await invoke("open_note_path", { path });
+      await commands.openNotePath(path);
     } catch (e) {
       console.error("open_note_path failed:", e);
     }
@@ -251,7 +258,7 @@ export default function ViewerPage() {
   const revealInFinder = useCallback(async () => {
     if (!path) return;
     try {
-      await invoke("reveal_in_default_browser", { path });
+      await commands.revealInDefaultBrowser(path);
     } catch (e) {
       console.error("reveal_in_default_browser failed:", e);
     }
@@ -260,7 +267,7 @@ export default function ViewerPage() {
   const copyPath = useCallback(async () => {
     if (!path) return;
     try {
-      await invoke("copy_text_to_clipboard", { text: path });
+      await commands.copyTextToClipboard(path);
       setCopyToast(true);
       setTimeout(() => setCopyToast(false), 1200);
     } catch (e) {
@@ -276,7 +283,7 @@ export default function ViewerPage() {
     const text =
       detection?.kind === "json" ? prettifyJson(content.text) : content.text;
     try {
-      await invoke("copy_text_to_clipboard", { text });
+      await commands.copyTextToClipboard(text);
       setCopyContentToast(true);
       setTimeout(() => setCopyContentToast(false), 1200);
     } catch (e) {
@@ -432,6 +439,7 @@ export default function ViewerPage() {
           >
             <MemoizedReactMarkdown
               remarkPlugins={[remarkGfm]}
+              urlTransform={viewerUrlTransform}
               components={{
                 a: ({ href, children, ...props }) => (
                   <a
@@ -440,14 +448,7 @@ export default function ViewerPage() {
                       e.preventDefault();
                       if (!href) return;
                       try {
-                        if (href.startsWith("screenpipe://view")) {
-                          const u = new URL(href);
-                          const inner = u.searchParams.get("path");
-                          if (inner) {
-                            await invoke("open_viewer_window", { path: inner });
-                            return;
-                          }
-                        }
+                        if (await openScreenpipeViewerLink(href)) return;
                         const { open } = await import("@tauri-apps/plugin-shell");
                         await open(href);
                       } catch (err) {

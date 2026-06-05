@@ -60,8 +60,8 @@ Don't jump to heavy `/search` calls. Escalate:
 Decision tree:
 - "What was I doing?" → Step 1 only
 - "Summarize my meeting" → Step 2 with `content_type=audio`, NO q param. Add `content_type=all` for screen context.
-- "How long on X?" → Step 1 (`/activity-summary` has `active_minutes`)
-- "Which apps today?" → Step 1 (do NOT use frame counts or SQL)
+- "How long on X?" → Step 1 (`/activity-summary` → `total_active_minutes` for the whole range, plus per-app/window `minutes`)
+- "Which apps today?" → Step 1 (do NOT use frame counts or raw SQLite)
 - "What button did I click?" → Step 3 (`/elements` with role=AXButton)
 - "Show me what I saw" → Step 2 (find frame_id) → Step 4
 
@@ -98,12 +98,15 @@ curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030
 ```
 
 Returns a rich overview with:
-- **apps**: usage with `active_minutes`, first/last seen
-- **windows**: every distinct window/tab with title, `browser_url`, and time spent — this is the most valuable field, it tells you exactly what the user was working on
+- **total_active_minutes**: authoritative total active screen time for the whole range (every app, idle gaps excluded). Use this as the grand total / denominator. Do NOT sum `windows[].minutes` (capped at 30) and do NOT open `db.sqlite` to recompute durations — this field already is the answer.
+- **apps**: per-app `minutes` (active time), first/last seen
+- **windows**: every distinct window/tab with title, `browser_url`, and `minutes` spent — the most valuable field for *what* the user worked on (top 30 by time)
 - **key_texts**: one representative text snippet per window context (user input fields prioritized over static page text)
 - **audio_summary.top_transcriptions**: actual transcription text with speaker and timestamp (not just counts)
 
 This is usually enough to answer "what was I doing?" without further searches. Only drill into `/search` if you need verbatim quotes or specific content.
+
+> **Building a pipe/automation?** Same rule: call this endpoint for time math. The numbers are computed server-side from frame timestamps — never recompute durations from raw frames, and never ask an LLM to sum minutes (it will drift). Let the model label activities; let this endpoint own the durations.
 
 ---
 
@@ -158,19 +161,20 @@ Returns raw PNG. **Never fetch more than 2-3 frames per query** (~1000-2000 toke
 
 ---
 
-## 5. Media Export — `POST /frames/export`
+## 5. Media Export — `POST /export`
+
+Renders a real-time MP4 (screen frames at their true timestamps + synced microphone audio). The clip's duration matches the wall-clock span you ask for — it is NOT a sped-up timelapse.
 
 ```bash
-curl -X POST http://localhost:3030/frames/export \
+curl -X POST http://localhost:3030/export \
   -H "Content-Type: application/json" \
-  -d '{"start_time": "5m ago", "end_time": "now", "fps": 1.0}'
+  -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \
+  -d '{"start": "5m ago", "end": "now"}'
 ```
 
-Fields: `start_time`, `end_time` (or `frame_ids` array), `fps` (default 1.0). Max 10,000 frames.
+Fields: `start` + `end` (ISO 8601 or relative like `"2h ago"`, `"now"`; `end` defaults to now), OR `meeting_id` to export a whole meeting. Optional `output_path` writes the MP4 to a specific absolute path (e.g. `~/Downloads/clip.mp4`); otherwise it lands in the data dir's `exports/` folder.
 
-FPS guidelines: 5min→1.0, 30min→0.5, 1h→0.2, 2h+→0.1
-
-Returns `{"file_path": "...", "frame_count": N, "duration_secs": N}`. Show path as inline code block for playback.
+Returns `{"output_path": "...", "frame_count": N, "audio_chunk_count": N, "duration_secs": N, "file_size_bytes": N}`. Show `output_path` as an inline code block for playback. Long ranges can take a few minutes.
 
 ### Audio & ffmpeg
 
@@ -285,10 +289,11 @@ If not connected, tell user to set up in Settings > Connections.
 
 ```bash
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings?start_time=1d%20ago&end_time=now&limit=10&offset=0"
+curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings?q=alice%40acme.com"
 curl -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" "http://localhost:3030/meetings/42"
 ```
 
-Returns detected meetings (from calendar, app detection, window titles, UI elements, multi-speaker audio).
+Returns detected meetings (from calendar, app detection, window titles, UI elements, multi-speaker audio). `q` is a case-insensitive substring filter against title, attendees, and notes.
 
 | Field | Type | Description |
 |-------|------|-------------|

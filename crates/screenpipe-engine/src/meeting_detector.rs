@@ -27,7 +27,7 @@ use crate::meeting_telemetry::{capture_detection_decision, MeetingDetectionScanS
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
-use screenpipe_db::DatabaseManager;
+use screenpipe_db::{DatabaseManager, MEETING_END_REASON_AUTO_END, MEETING_END_REASON_SHUTDOWN};
 use screenpipe_events::subscribe_to_event;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -194,6 +194,23 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     role: "AXButton",
                     name_contains: "end meeting",
                 },
+                // Screen-share rescue: while sharing, Zoom hides the leave/end
+                // buttons above and collapses controls into a floating share
+                // toolbar, so a call that STARTS already-sharing is never detected —
+                // the whole presentation is then captured only by the delayed
+                // background path (issue: 30+ min of a Zoom presentation transcribed
+                // by batch alone). "Stop Share" / "Pause Share" / "You are screen
+                // sharing" appear ONLY during an active share inside a live meeting
+                // (the idle home screen shows "Share Screen", not "Stop Share"), so
+                // they are safe standalone start signals. NameContains is role-agnostic
+                // so it matches whether Zoom exposes these on the toolbar button or a
+                // "Meeting" menu item.
+                // NOTE: Zoom's AX exposure while sharing is not yet verified against a
+                // live repro; if screen-share-only meetings still go undetected, capture
+                // Zoom's AX tree mid-share and adjust these strings.
+                CallSignal::NameContains("Stop Share"),
+                CallSignal::NameContains("Pause Share"),
+                CallSignal::NameContains("You are screen sharing"),
                 // Generic fallbacks for other Windows Zoom versions
                 CallSignal::AutomationIdContains("leave"),
                 CallSignal::KeyboardShortcut("Alt+Q"),
@@ -502,7 +519,12 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     "butter.us",
                     "livestorm.co",
                     "ping.gg",
-                    "cal.com",
+                    // Cal.com is primarily a scheduling product — its booking
+                    // dashboard (app.cal.com/event-types) and booking pages
+                    // (cal.com/{user}/{event}) aren't calls. Only Cal Video
+                    // (app.cal.com/video/{uid}) is a live meeting URL. Matching
+                    // bare "cal.com" caused false positives on the dashboard.
+                    "cal.com/video",
                     "daily.co",
                     "app.daily.co",
                     "pop.com",
@@ -579,8 +601,10 @@ pub struct ScanResult {
 /// controls (text areas, scroll areas, etc.).
 pub struct MeetingUiScanner {
     /// Maximum depth to walk in the AX tree.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     max_depth: usize,
     /// Timeout for scanning ALL windows of a single process.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     scan_timeout: Duration,
 }
 
@@ -594,15 +618,30 @@ impl MeetingUiScanner {
     /// Create a new scanner with default settings (depth=25, timeout=5s).
     pub fn new() -> Self {
         Self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             max_depth: 25,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             scan_timeout: Duration::from_millis(5000),
         }
     }
 
     /// Create a scanner with custom settings.
-    pub fn with_config(max_depth: usize, scan_timeout: Duration) -> Self {
+    pub fn with_config(
+        #[cfg_attr(
+            not(any(target_os = "macos", target_os = "windows")),
+            allow(unused_variables)
+        )]
+        max_depth: usize,
+        #[cfg_attr(
+            not(any(target_os = "macos", target_os = "windows")),
+            allow(unused_variables)
+        )]
+        scan_timeout: Duration,
+    ) -> Self {
         Self {
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             max_depth,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             scan_timeout,
         }
     }
@@ -622,6 +661,7 @@ impl MeetingUiScanner {
         let max_depth = self.max_depth;
         let scan_timeout = self.scan_timeout;
         let precomputed = PrecomputedSignal::from_signals(&profile.call_signals);
+        let attr_needs = AttrNeeds::from_signals(&precomputed);
         let min_required = profile.min_signals_required;
 
         // Wrap in catch_unwind to survive cidre/ObjC FFI panics
@@ -662,6 +702,7 @@ impl MeetingUiScanner {
                     walk_for_signals(
                         window,
                         &precomputed,
+                        attr_needs,
                         0,
                         max_depth,
                         &start,
@@ -789,6 +830,7 @@ impl MeetingUiScanner {
 fn walk_for_signals(
     elem: &cidre::ax::UiElement,
     signals: &[PrecomputedSignal],
+    needs: AttrNeeds,
     depth: usize,
     max_depth: usize,
     start: &Instant,
@@ -808,9 +850,24 @@ fn walk_for_signals(
         Err(_) => return,
     };
 
-    let title = get_ax_string_attr(elem, cidre::ax::attr::title());
-    let desc = get_ax_string_attr(elem, cidre::ax::attr::desc());
-    let identifier = get_ax_identifier(elem);
+    // Only fetch attributes the current signal set actually consults — each
+    // get_* is a synchronous cross-process AX IPC and was the dominant cost
+    // in CPU profiling.
+    let title = if needs.title {
+        get_ax_string_attr(elem, cidre::ax::attr::title())
+    } else {
+        None
+    };
+    let desc = if needs.desc {
+        get_ax_string_attr(elem, cidre::ax::attr::desc())
+    } else {
+        None
+    };
+    let identifier = if needs.identifier {
+        get_ax_identifier(elem)
+    } else {
+        None
+    };
 
     // Lowercase node fields ONCE, not once per signal
     let title_lower = title.as_deref().map(|t| t.to_lowercase());
@@ -860,6 +917,7 @@ fn walk_for_signals(
             walk_for_signals(
                 child,
                 signals,
+                needs,
                 depth + 1,
                 max_depth,
                 start,
@@ -877,6 +935,59 @@ struct PrecomputedSignal {
     signal: CallSignal,
     /// Pre-lowercased match string (the substring to search for).
     lower: String,
+}
+
+/// Which AX attributes the current signal set actually consults.
+///
+/// Computed once per scan from a `PrecomputedSignal` slice and threaded
+/// through `walk_for_signals` so per-node AX IPC calls (each a cross-process
+/// roundtrip) are only paid for attrs at least one signal might match against.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(any(target_os = "macos", test))]
+struct AttrNeeds {
+    title: bool,
+    desc: bool,
+    identifier: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
+impl AttrNeeds {
+    fn from_signals(signals: &[PrecomputedSignal]) -> Self {
+        Self::from_call_signals(signals.iter().map(|ps| &ps.signal))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl AttrNeeds {
+    /// Derive needs from a sequence of `CallSignal`s. Kept generic over the
+    /// iterator source so the same derivation drives both production
+    /// (`PrecomputedSignal` on macOS) and unit tests.
+    fn from_call_signals<'a>(signals: impl IntoIterator<Item = &'a CallSignal>) -> Self {
+        let mut n = Self::default();
+        for s in signals {
+            match s {
+                CallSignal::AutomationId(_)
+                | CallSignal::AutomationIdContains(_)
+                | CallSignal::MenuItemId(_) => {
+                    n.identifier = true;
+                }
+                CallSignal::KeyboardShortcut(_)
+                | CallSignal::RoleWithName { .. }
+                | CallSignal::NameContains(_) => {
+                    n.title = true;
+                    n.desc = true;
+                }
+                CallSignal::MenuBarItem { .. } | CallSignal::WindowTitle { .. } => {
+                    n.title = true;
+                }
+            }
+            if n.title && n.desc && n.identifier {
+                break;
+            }
+        }
+        n
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -902,6 +1013,30 @@ impl PrecomputedSignal {
             })
             .collect()
     }
+}
+
+/// Compare AX role strings across backends.
+///
+/// macOS (cidre) gives `AXButton`; Windows UIA gives `"button"` (lowercase,
+/// localized, may contain spaces e.g. `"menu item"`). Normalise by stripping
+/// any `AX` prefix and whitespace, then case-insensitive compare.
+#[cfg(any(target_os = "windows", test))]
+fn role_matches(actual: &str, expected: &str) -> bool {
+    fn normalise(s: &str) -> String {
+        let trimmed = s
+            .strip_prefix("AX")
+            .or_else(|| s.strip_prefix("ax"))
+            .unwrap_or(s);
+        trimmed
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    if actual.eq_ignore_ascii_case(expected) {
+        return true;
+    }
+    normalise(actual) == normalise(expected)
 }
 
 /// Check if a [`CallSignal`] matches the given element properties.
@@ -934,7 +1069,9 @@ fn check_signal_match(
             role: r,
             name_contains,
         } => {
-            if role != *r {
+            // Profile roles are macOS-style (`AXButton`); Windows UIA roles are
+            // lowercase/localized. Use role_matches, not strict `!=`.
+            if !role_matches(role, r) {
                 return false;
             }
             let name_lower = name_contains.to_lowercase();
@@ -943,8 +1080,8 @@ fn check_signal_match(
             in_title || in_desc
         }
         CallSignal::MenuBarItem { title_contains } => {
-            // Match AXMenuBarItem by title (Zoom's "Meeting" menu bar item)
-            if role != "AXMenuBarItem" {
+            // Match AXMenuBarItem by title (Zoom's "Meeting" menu bar item).
+            if !role_matches(role, "AXMenuBarItem") {
                 return false;
             }
             let needle = title_contains.to_lowercase();
@@ -952,7 +1089,7 @@ fn check_signal_match(
         }
         CallSignal::MenuItemId(expected_id) => {
             // Match AXMenuItem by automation ID (Zoom's "onMuteAudio:" etc.)
-            if role != "AXMenuItem" {
+            if !role_matches(role, "AXMenuItem") {
                 return false;
             }
             identifier == Some(*expected_id)
@@ -1029,6 +1166,7 @@ fn check_signal_match_precomputed(
 }
 
 /// Format a human-readable label for a matched signal (used in debug logging).
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn format_signal_match(
     signal: &CallSignal,
     role: &str,
@@ -1186,8 +1324,12 @@ fn windows_enumerate_window_titles() -> Vec<(i32, String)> {
         EnumWindows, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     };
 
-    let results: Arc<Mutex<Vec<(i32, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let results_clone = results.clone();
+    // Stack-pinned Mutex passed as LPARAM. Do NOT use Arc here: the previous
+    // implementation kept a second strong ref alive across the call, which
+    // made `Arc::try_unwrap` always return Err, and the trailing
+    // `unwrap_or_default()` silently replaced the collected results with an
+    // empty Vec — killing every browser meeting detection on Windows.
+    let results: Mutex<Vec<(i32, String)>> = Mutex::new(Vec::new());
 
     unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let results = &*(lparam.0 as *const Mutex<Vec<(i32, String)>>);
@@ -1210,14 +1352,11 @@ fn windows_enumerate_window_titles() -> Vec<(i32, String)> {
     unsafe {
         let _ = EnumWindows(
             Some(enum_callback),
-            LPARAM(&*results_clone as *const Mutex<Vec<(i32, String)>> as isize),
+            LPARAM(&results as *const Mutex<Vec<(i32, String)>> as isize),
         );
     }
 
-    Arc::try_unwrap(results)
-        .unwrap_or_default()
-        .into_inner()
-        .unwrap_or_default()
+    results.into_inner().unwrap_or_default()
 }
 
 /// Enumerate visible windows belonging to a specific PID.
@@ -1386,60 +1525,59 @@ fn windows_scan_process_uia(
                 };
 
                 if let Ok(results) = element.FindAll(TreeScope_Descendants, &search_condition) {
-                    if let Ok(len) = results.Length() {
-                        for i in 0..len {
-                            if found.len() >= min_required {
-                                break;
-                            }
-                            if let Ok(el) = results.GetElement(i) {
-                                let name = el.CurrentName().ok().map(|s| s.to_string());
-                                let auto_id = el.CurrentAutomationId().ok().map(|s| s.to_string());
-                                let role = el
-                                    .CurrentLocalizedControlType()
-                                    .ok()
-                                    .map(|s| s.to_string())
-                                    .unwrap_or_default();
+                    let len = results.Length().unwrap_or(0);
+                    // Observability: distinguishes "UIA returned nothing"
+                    // from "UIA returned candidates but none re-verified".
+                    if len > 0 {
+                        info!(
+                            "meeting scanner (windows): UIA FindAll pid={} hwnd={:?} returned {} candidate(s) (signals={})",
+                            pid,
+                            hwnd.0,
+                            len,
+                            signals.len()
+                        );
+                    } else {
+                        debug!(
+                            "meeting scanner (windows): UIA FindAll pid={} hwnd={:?} returned 0 candidates (signals={}) -- if a browser meeting is live the Chromium AX tree may not be materialised",
+                            pid,
+                            hwnd.0,
+                            signals.len()
+                        );
+                    }
+                    for i in 0..len {
+                        if found.len() >= min_required {
+                            break;
+                        }
+                        if let Ok(el) = results.GetElement(i) {
+                            let name = el.CurrentName().ok().map(|s| s.to_string());
+                            let auto_id = el.CurrentAutomationId().ok().map(|s| s.to_string());
+                            let role = el
+                                .CurrentLocalizedControlType()
+                                .ok()
+                                .map(|s| s.to_string())
+                                .unwrap_or_default();
+                            debug!(
+                                "meeting scanner: UIA candidate pid={} role={:?} name={:?} auto_id={:?}",
+                                pid, role, name, auto_id
+                            );
 
-                                // Verify this element actually matches one of our signals
-                                for signal in signals {
-                                    if check_signal_match(
-                                        signal,
-                                        &role,
-                                        name.as_deref(),
-                                        None,
-                                        auto_id.as_deref(),
-                                    ) {
-                                        let label = format_signal_match(
-                                            signal,
-                                            &role,
-                                            name.as_deref(),
-                                            None,
-                                        );
-                                        if !found.contains(&label) {
-                                            found.push(label);
-                                        }
-                                        break;
+                            // Single pass — check_signal_match (via role_matches)
+                            // now accepts both `AXButton` and `button`, so the
+                            // historical AX-prefix retry is no longer needed.
+                            for signal in signals {
+                                if check_signal_match(
+                                    signal,
+                                    &role,
+                                    name.as_deref(),
+                                    None,
+                                    auto_id.as_deref(),
+                                ) {
+                                    let label =
+                                        format_signal_match(signal, &role, name.as_deref(), None);
+                                    if !found.contains(&label) {
+                                        found.push(label);
                                     }
-                                    // Also check with AX prefix for cross-platform compat
-                                    let ax_role = format!("AX{}", role);
-                                    if check_signal_match(
-                                        signal,
-                                        &ax_role,
-                                        name.as_deref(),
-                                        None,
-                                        auto_id.as_deref(),
-                                    ) {
-                                        let label = format_signal_match(
-                                            signal,
-                                            &role,
-                                            name.as_deref(),
-                                            None,
-                                        );
-                                        if !found.contains(&label) {
-                                            found.push(label);
-                                        }
-                                        break;
-                                    }
+                                    break;
                                 }
                             }
                         }
@@ -1534,6 +1672,31 @@ const ENDING_TIMEOUT_BROWSER: Duration = Duration::from_secs(300); // 5 minutes
 /// ticking during transient visibility, so genuine end-of-call still fires
 /// after `ENDING_TIMEOUT` of true silence.
 const REENTRY_HYSTERESIS_SCANS: u8 = 2;
+
+/// Match a browser window title against a `browser_title_patterns` entry.
+///
+/// Accepts either exact equality (Arc titles its window just `"Meet"`) or a
+/// prefix at position 0 followed by a non-alphanumeric separator
+/// (`"Meet - abc - Google Chrome"`, `"Meet — Mozilla Firefox"`). The anchor +
+/// separator rule is what keeps `"Meeting reminders"` and
+/// `"Join with Google Meet - Calendar"` from triggering detection.
+///
+/// `title_lower` must already be lowercased — hot path, called per window.
+fn browser_title_matches_pattern(title_lower: &str, pattern: &str) -> bool {
+    let p_lower = pattern.to_lowercase();
+    if p_lower.is_empty() {
+        return false;
+    }
+    if title_lower == p_lower {
+        return true;
+    }
+    if title_lower.len() <= p_lower.len() || !title_lower.starts_with(&p_lower[..]) {
+        return false;
+    }
+    // ASCII alnum check is sufficient: multi-byte separators (U+2014 em dash,
+    // U+200B zero-width space) have non-ASCII leading bytes.
+    !(title_lower.as_bytes()[p_lower.len()] as char).is_ascii_alphanumeric()
+}
 
 /// Check if an app name is a known browser.
 fn is_browser_app(app_name: &str) -> bool {
@@ -2063,6 +2226,64 @@ pub fn find_running_meeting_apps(
         "vivaldi.exe",
     ];
 
+    // Per-scan diagnostic dump. Three slices so one log line tells us which
+    // stage failed:
+    //   (b) windows whose title looks meet-shaped, with their resolved exe
+    //       — if exe is missing or not in the allow-list, that's the bug.
+    //   (c) windows whose owning PID maps to a known browser exe.
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let total = window_titles.len();
+        let proc_name_of = |pid: i32| -> Option<String> {
+            process_map
+                .iter()
+                .find(|p| p.pid == pid as u32)
+                .map(|p| p.name.clone())
+        };
+
+        // (b) meet-shaped titles, unfiltered by browser — surfaces broken
+        // exe lookups.
+        let meet_shaped: Vec<_> = window_titles
+            .iter()
+            .filter(|(_, t)| {
+                let lt = t.to_lowercase();
+                lt.starts_with("meet") || lt.contains(" - meet ") || lt.contains("meet.google.com")
+            })
+            .map(|(pid, t)| {
+                let exe = proc_name_of(*pid).unwrap_or_else(|| "<pid not in snapshot>".into());
+                format!("pid={} exe={:?} title={:?}", pid, exe, t)
+            })
+            .collect();
+        if !meet_shaped.is_empty() {
+            info!(
+                "meeting detector (windows): {} meet-shaped window(s) currently visible: {:?}",
+                meet_shaped.len(),
+                meet_shaped
+            );
+        }
+
+        // (c) the browser-filtered set the matching loop actually consumes.
+        let browser_windows: Vec<_> = window_titles
+            .iter()
+            .filter(|(pid, _)| {
+                proc_name_of(*pid)
+                    .map(|n| n.to_lowercase())
+                    .is_some_and(|n| browser_process_names.iter().any(|b| n == *b))
+            })
+            .collect();
+        debug!(
+            "meeting detector (windows): EnumWindows saw {} top-level visible window(s); {} classified as browser windows: {:?}",
+            total,
+            browser_windows.len(),
+            browser_windows
+                .iter()
+                .map(|(pid, t)| {
+                    let exe = proc_name_of(*pid).unwrap_or_else(|| "<unknown>".into());
+                    format!("pid={} exe={:?} title={:?}", pid, exe, t)
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
     for (idx, profile) in profiles.iter().enumerate() {
         if profile.app_identifiers.browser_url_patterns.is_empty()
             && profile.app_identifiers.browser_title_patterns.is_empty()
@@ -2093,12 +2314,26 @@ pub fn find_running_meeting_apps(
                 .browser_url_patterns
                 .iter()
                 .any(|p| title_lower.contains(&p.to_lowercase()));
+            // See `browser_title_matches_pattern` for the matching rules.
             let title_match = profile
                 .app_identifiers
                 .browser_title_patterns
                 .iter()
-                .any(|p| title_lower == p.to_lowercase());
+                .any(|p| browser_title_matches_pattern(&title_lower, p));
             if url_match || title_match {
+                // Confirms screenpipe saw the meeting window; pairs with the
+                // scanner's UIA scan line via pid + profile_idx. DEBUG, not
+                // INFO: titles can contain sensitive context (URLs, attendee
+                // names) and users routinely share logs for support.
+                debug!(
+                    "meeting detector (windows): profile_idx={} MATCHED browser window pid={} proc={:?} title={:?} (url_match={} title_match={})",
+                    idx,
+                    pid,
+                    proc_name.as_deref().unwrap_or("?"),
+                    title,
+                    url_match,
+                    title_match
+                );
                 results.push(RunningMeetingApp {
                     pid: *pid,
                     app_name: proc_name.unwrap_or_default(),
@@ -2107,8 +2342,43 @@ pub fn find_running_meeting_apps(
                 });
                 seen_pids.insert(*pid);
                 break;
+            } else if !profile.app_identifiers.browser_title_patterns.is_empty()
+                || !profile.app_identifiers.browser_url_patterns.is_empty()
+            {
+                // Per (profile × window) miss. Cardinality is high — keep at
+                // TRACE. Useful for diagnosing localized title formats.
+                tracing::trace!(
+                    "meeting detector (windows): profile_idx={} no match pid={} proc={:?} title={:?} (url_patterns={:?} title_patterns={:?})",
+                    idx,
+                    pid,
+                    proc_name.as_deref().unwrap_or("?"),
+                    title,
+                    profile.app_identifiers.browser_url_patterns,
+                    profile.app_identifiers.browser_title_patterns,
+                );
             }
         }
+    }
+
+    if results.is_empty() {
+        debug!(
+            "meeting detector (windows): find_running_meeting_apps returned 0 matches across {} profile(s)",
+            profiles.len()
+        );
+    } else {
+        // DEBUG, not INFO: `browser_url` carries the window title which can
+        // include URLs / attendee names. Users share logs for support.
+        debug!(
+            "meeting detector (windows): find_running_meeting_apps returning {} match(es): {:?}",
+            results.len(),
+            results
+                .iter()
+                .map(|r| format!(
+                    "pid={} app={} profile_idx={} url={:?}",
+                    r.pid, r.app_name, r.profile_index, r.browser_url
+                ))
+                .collect::<Vec<_>>()
+        );
     }
 
     results
@@ -2182,14 +2452,13 @@ async fn db_find_browser_meetings(
                         let p_lower = p.to_lowercase();
                         window_lower.contains(&p_lower) || url_lower.contains(&p_lower)
                     });
-            // Check title patterns as exact match against window_name
-            // (e.g. window title "Meet" matches pattern "Meet")
+            // See `browser_title_matches_pattern` for the matching rules.
             let title_match = has_title_patterns
                 && profile
                     .app_identifiers
                     .browser_title_patterns
                     .iter()
-                    .any(|p| window_lower == p.to_lowercase());
+                    .any(|p| browser_title_matches_pattern(&window_lower, p));
             if url_match || title_match {
                 #[cfg(target_os = "macos")]
                 let pid = cidre::objc::ar_pool(|| -> i32 {
@@ -2238,6 +2507,7 @@ pub async fn run_meeting_detection_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     scan_interval: Option<Duration>,
     detector: Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
+    close_orphaned_meetings_on_start: bool,
 ) {
     let profiles = load_detection_profiles();
     let scanner = Arc::new(MeetingUiScanner::new());
@@ -2252,11 +2522,33 @@ pub async fn run_meeting_detection_loop(
             || !p.app_identifiers.browser_title_patterns.is_empty()
     });
 
-    // Close any orphaned meetings from a prior crash
-    match db.close_orphaned_meetings().await {
-        Ok(0) => debug!("meeting v2: no orphaned meetings"),
-        Ok(n) => info!("meeting v2: closed {} orphaned meeting(s)", n),
-        Err(e) => warn!("meeting v2: failed to close orphaned meetings: {}", e),
+    if close_orphaned_meetings_on_start {
+        // Close any orphaned meetings from a prior crash.
+        match db.close_orphaned_meetings().await {
+            Ok(0) => debug!("meeting v2: no orphaned meetings"),
+            Ok(n) => info!("meeting v2: closed {} orphaned meeting(s)", n),
+            Err(e) => warn!("meeting v2: failed to close orphaned meetings: {}", e),
+        }
+    } else {
+        debug!("meeting v2: preserving active meetings across capture restart");
+    }
+
+    if let Ok(Some(meeting)) = db.get_most_recent_active_meeting().await {
+        let started_at = DateTime::parse_from_rfc3339(&meeting.meeting_start)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        info!(
+            "meeting v2: reattached active meeting on watcher start (id={}, app={})",
+            meeting.id, meeting.meeting_app
+        );
+        state = MeetingState::Active {
+            meeting_id: meeting.id,
+            app: meeting.meeting_app,
+            started_at,
+            last_seen: Instant::now(),
+            is_browser: false,
+        };
+        sync_meeting_flag(true, &in_meeting_flag, &detector);
     }
 
     // Calendar enrichment: subscribe to calendar events from the event bus.
@@ -2266,6 +2558,17 @@ pub async fn run_meeting_detection_loop(
 
     // Subscribe to explicit stop signals from the API layer
     let mut stop_sub = subscribe_to_event::<DetectorStopSignal>("detector_stop_tracking");
+    let mut auto_end_sub =
+        subscribe_to_event::<MeetingAutoEndRequest>("meeting_auto_end_requested");
+
+    // Defense-in-depth against the meeting-merge bug: the DB filter in
+    // `find_recent_meeting_for_app` already excludes explicit_stop rows, but
+    // there is a small race window between the API writing `end_reason` and
+    // the detector seeing the next StartMeeting. We also remember the most
+    // recently explicit-stopped meeting in memory and refuse to merge into
+    // it for the rest of this detector lifetime. Cleared on app restart,
+    // which is fine — the DB filter takes over from there.
+    let mut last_explicit_stop_id: Option<i64> = None;
 
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={})",
@@ -2286,7 +2589,10 @@ pub async fn run_meeting_detection_loop(
                         let now = Utc::now()
                             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                             .to_string();
-                        if let Err(e) = db.end_meeting(*meeting_id, &now).await {
+                        if let Err(e) = db
+                            .end_meeting(*meeting_id, &now, Some(MEETING_END_REASON_SHUTDOWN))
+                            .await
+                        {
                             error!("meeting v2: failed to end meeting on shutdown: {}", e);
                         }
                     }
@@ -2320,6 +2626,67 @@ pub async fn run_meeting_detection_loop(
                     state = MeetingState::Idle;
                     current_interval = IDLE_APPS_SCAN_INTERVAL;
                     sync_meeting_flag(false, &in_meeting_flag, &detector);
+                    last_explicit_stop_id = Some(stop_signal.meeting_id);
+                }
+            }
+        }
+
+        if let Some(event) = auto_end_sub.next().now_or_never().flatten() {
+            let request = event.data;
+            let manual_matches = { *manual_meeting.read().await == Some(request.meeting_id) };
+            let detector_matches = matches!(
+                &state,
+                MeetingState::Active { meeting_id, .. }
+                    | MeetingState::Ending { meeting_id, .. }
+                    if *meeting_id == request.meeting_id
+            );
+
+            if manual_matches || detector_matches {
+                let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                match db
+                    .end_meeting_with_typed_text(
+                        request.meeting_id,
+                        &now,
+                        false,
+                        Some(MEETING_END_REASON_AUTO_END),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "meeting v2: auto-ended inactive live meeting (id={}, reason={})",
+                            request.meeting_id,
+                            request.reason.as_deref().unwrap_or("unknown")
+                        );
+                        if manual_matches {
+                            let mut manual = manual_meeting.write().await;
+                            if *manual == Some(request.meeting_id) {
+                                *manual = None;
+                            }
+                        }
+                        if detector_matches {
+                            state = MeetingState::Idle;
+                            current_interval = IDLE_APPS_SCAN_INTERVAL;
+                        }
+                        sync_meeting_flag(false, &in_meeting_flag, &detector);
+                        if let Ok(status) =
+                            resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
+                        {
+                            emit_meeting_status_changed(&status);
+                        }
+                        if let Err(e) = screenpipe_events::send_event(
+                            "meeting_ended",
+                            serde_json::json!({ "meeting_id": request.meeting_id }),
+                        ) {
+                            warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "meeting v2: failed to auto-end inactive live meeting {}: {}",
+                            request.meeting_id, e
+                        );
+                    }
                 }
             }
         }
@@ -2395,12 +2762,37 @@ pub async fn run_meeting_detection_loop(
         }
 
         if running_apps.is_empty() {
-            // No meeting apps running — handle fast path for process exit
-            let (new_state, ended_id) = handle_no_apps_running(state);
+            // No meeting apps running — handle fast path for process exit.
+            // Treat as natural grace-timeout end (end_reason = NULL) since the
+            // detector decided to end it, not the user. Eligible for merge if
+            // a new meeting in the same app starts within the window.
+            //
+            // Output audio is a liveness signal: a transient scan miss (browser
+            // extension websocket drop, app relaunch / PID change) must not end a
+            // call that is still audibly in progress. Only Active/Ending states
+            // can be kept alive by it.
+            //
+            // Note this gate is `Active | Ending`, wider than the apps-present
+            // path (which checks audio only in `Ending`): there `advance_state`
+            // always routes Active->Ending first, whereas here we keep an Active
+            // meeting alive directly to avoid a needless Ending dip on a blip.
+            let keep_alive = if matches!(
+                state,
+                MeetingState::Active { .. } | MeetingState::Ending { .. }
+            ) {
+                db.has_recent_output_audio(30).await.unwrap_or(false)
+                    || has_active_calendar_event(&calendar_events, Utc::now())
+            } else {
+                false
+            };
+            let (new_state, ended_id) = handle_no_apps_running(state, keep_alive);
             state = new_state;
             if let Some(meeting_id) = ended_id {
                 let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                match db
+                    .end_meeting_with_typed_text(meeting_id, &now, true, None)
+                    .await
+                {
                     Ok(()) => {
                         if let Err(e) = screenpipe_events::send_event(
                             "meeting_ended",
@@ -2481,9 +2873,18 @@ pub async fn run_meeting_detection_loop(
         } else {
             false
         };
+        // A meeting also stays alive while a scheduled (non-all-day) calendar event
+        // is in progress: controls vanish during screen-share / minimize, but the
+        // event is strong evidence the meeting is still going. This only sustains an
+        // already-detected meeting (it never starts one), so a "Lunch" calendar
+        // entry can't trigger recording on its own. `has_output_audio` is kept
+        // separate so detection-decision telemetry stays audio-accurate.
+        let keep_alive = has_output_audio
+            || (matches!(state, MeetingState::Ending { .. })
+                && has_active_calendar_event(&calendar_events, Utc::now()));
 
         // 3. Advance state machine
-        let (new_state, action) = advance_state(state, &scan_results, has_output_audio);
+        let (new_state, action) = advance_state(state, &scan_results, keep_alive);
         state = new_state;
 
         // Adaptive interval based on state
@@ -2502,11 +2903,23 @@ pub async fn run_meeting_detection_loop(
                         find_overlapping_calendar_event(&calendar_events);
                     let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
 
-                    // Try to merge with recently-ended meeting
-                    let (meeting_id, decision_trigger) = match db
-                        .find_recent_meeting_for_app(&app, 120)
-                        .await
-                    {
+                    // Try to merge with recently-ended meeting. The DB query
+                    // already filters out explicit_stop rows; the
+                    // `last_explicit_stop_id` check below catches the race
+                    // where the API has not yet committed end_reason by the
+                    // time this scan tick runs.
+                    let merge_candidate = match db.find_recent_meeting_for_app(&app, 120).await {
+                        Ok(Some(recent)) if last_explicit_stop_id == Some(recent.id) => {
+                            info!(
+                                "meeting v2: skipping merge into explicitly-stopped meeting (id={}, app={})",
+                                recent.id, app
+                            );
+                            Ok(None)
+                        }
+                        other => other,
+                    };
+
+                    let (meeting_id, decision_trigger) = match merge_candidate {
                         Ok(Some(recent)) => match db.reopen_meeting(recent.id).await {
                             Ok(()) => {
                                 info!(
@@ -2611,8 +3024,15 @@ pub async fn run_meeting_detection_loop(
                 }
                 StateAction::EndMeeting { meeting_id } => {
                     if meeting_id >= 0 {
+                        // Natural grace-timeout end (controls disappeared and
+                        // the Ending grace period elapsed). Leave end_reason
+                        // NULL so the merge window still applies if the user
+                        // rejoins the same call within ~120s.
                         let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-                        match db.end_meeting_with_typed_text(meeting_id, &now, true).await {
+                        match db
+                            .end_meeting_with_typed_text(meeting_id, &now, true, None)
+                            .await
+                        {
                             Ok(()) => {
                                 info!("meeting v2: meeting ended (id={})", meeting_id);
                                 // Emit event so triggered pipes can react
@@ -2669,17 +3089,48 @@ fn get_active_tracking(
 
 /// Handle the case where no meeting apps are running.
 ///
+/// `has_output_audio`: when true, the audio output device has had recent data,
+/// so the user is still audibly in a call. A momentary failure to find the
+/// meeting-app process (browser-extension websocket drop, app relaunch / PID
+/// change, AX reflow) must not end a live call — this mirrors the audio-liveness
+/// guard in `advance_state`'s Ending→Active path.
+///
 /// Returns the new state and optionally a meeting ID that should be ended in the DB.
-fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
+fn handle_no_apps_running(
+    state: MeetingState,
+    has_output_audio: bool,
+) -> (MeetingState, Option<i64>) {
     match state {
         MeetingState::Active {
             meeting_id,
             app,
             started_at,
+            is_browser,
             ..
         } => {
-            // When the app process exits, use a short timeout (not the browser one)
-            // because the process is actually gone, not just a tab switch.
+            // Output audio still flowing → the process scan missed transiently;
+            // keep the meeting alive rather than ending an in-progress call.
+            if has_output_audio {
+                info!(
+                    "meeting v2: no meeting app process found but output audio active — keeping meeting alive (app={}, id={})",
+                    app, meeting_id
+                );
+                return (
+                    MeetingState::Active {
+                        meeting_id,
+                        app,
+                        started_at,
+                        last_seen: Instant::now(),
+                        is_browser,
+                    },
+                    None,
+                );
+            }
+            // No output audio + no app process found. Use the short timeout
+            // (not the browser one): a live browser call was already kept alive
+            // by the audio guard above, so reaching here means no remote audio
+            // for the whole window — the call is genuinely over, not a tab
+            // switch, and there is no reason to hold the browser's long grace.
             info!(
                 "meeting v2: Active -> Ending (app process exited, app={})",
                 app
@@ -2690,7 +3141,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
                     app,
                     started_at,
                     since: Instant::now(),
-                    is_browser: false, // process exited → use short timeout
+                    is_browser: false, // gone + silent → use short timeout
                     controls_seen_in_ending: 0,
                 },
                 None,
@@ -2711,6 +3162,24 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
             is_browser,
             controls_seen_in_ending,
         } => {
+            // Audio still flowing → return to Active instead of ending, even
+            // though the app process scan came up empty. Mirrors advance_state.
+            if has_output_audio {
+                info!(
+                    "meeting v2: Ending -> Active (output audio still active, no app process, app={}, id={})",
+                    app, meeting_id
+                );
+                return (
+                    MeetingState::Active {
+                        meeting_id,
+                        app,
+                        started_at,
+                        last_seen: Instant::now(),
+                        is_browser,
+                    },
+                    None,
+                );
+            }
             let timeout = if is_browser {
                 ENDING_TIMEOUT_BROWSER
             } else {
@@ -2770,6 +3239,13 @@ struct CalendarEventSignal {
     pub is_all_day: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct MeetingAutoEndRequest {
+    meeting_id: i64,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DetectorStopSignal {
     pub meeting_id: i64,
@@ -2804,6 +3280,28 @@ fn find_overlapping_calendar_event(
     (None, None)
 }
 
+/// True if a non-all-day calendar event is happening at `now`. Used as a
+/// keep-alive signal so a detected meeting doesn't end while its scheduled event
+/// is still in progress (e.g. UI controls hidden during a screen-share). `now` is
+/// a parameter for deterministic testing. All-day events are excluded because the
+/// upstream stream already filters them, and they'd otherwise pin a meeting open
+/// all day.
+fn has_active_calendar_event(events: &[CalendarEventSignal], now: DateTime<Utc>) -> bool {
+    events.iter().any(|e| {
+        if e.is_all_day {
+            return false;
+        }
+        matches!(
+            (
+                DateTime::parse_from_rfc3339(&e.start),
+                DateTime::parse_from_rfc3339(&e.end),
+            ),
+            (Ok(start), Ok(end))
+                if start.with_timezone(&Utc) <= now && end.with_timezone(&Utc) >= now
+        )
+    })
+}
+
 /// Insert a new meeting into the database with optional calendar enrichment.
 /// Returns the meeting ID, or -1 on failure.
 async fn insert_new_meeting(
@@ -2821,7 +3319,12 @@ async fn insert_new_meeting(
             // Emit event so triggered pipes can react
             if let Err(e) = screenpipe_events::send_event(
                 "meeting_started",
-                serde_json::json!({ "meeting_id": id, "app": app, "title": title }),
+                serde_json::json!({
+                    "meeting_id": id,
+                    "app": app,
+                    "title": title,
+                    "detection_source": "ui_scan",
+                }),
             ) {
                 warn!("meeting v2: failed to emit meeting_started event: {}", e);
             }
@@ -2841,6 +3344,122 @@ async fn insert_new_meeting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── AttrNeeds tests ────────────────────────────────────────────────
+
+    #[test]
+    fn attr_needs_empty_signal_set_needs_nothing() {
+        let needs = AttrNeeds::from_call_signals(std::iter::empty());
+        assert_eq!(needs, AttrNeeds::default());
+    }
+
+    #[test]
+    fn attr_needs_identifier_only_signals() {
+        let signals = [
+            CallSignal::AutomationId("foo"),
+            CallSignal::AutomationIdContains("bar"),
+            CallSignal::MenuItemId("baz"),
+        ];
+        let needs = AttrNeeds::from_call_signals(signals.iter());
+        assert_eq!(
+            needs,
+            AttrNeeds {
+                title: false,
+                desc: false,
+                identifier: true
+            }
+        );
+    }
+
+    #[test]
+    fn attr_needs_title_only_signals() {
+        let signals = [
+            CallSignal::MenuBarItem {
+                title_contains: "Meeting",
+            },
+            CallSignal::WindowTitle {
+                title_contains: "Zoom",
+            },
+        ];
+        let needs = AttrNeeds::from_call_signals(signals.iter());
+        assert_eq!(
+            needs,
+            AttrNeeds {
+                title: true,
+                desc: false,
+                identifier: false
+            }
+        );
+    }
+
+    #[test]
+    fn attr_needs_title_and_desc_signals() {
+        let signals = [
+            CallSignal::NameContains("Leave call"),
+            CallSignal::KeyboardShortcut("⌘⇧M"),
+            CallSignal::RoleWithName {
+                role: "AXButton",
+                name_contains: "Mute",
+            },
+        ];
+        let needs = AttrNeeds::from_call_signals(signals.iter());
+        assert_eq!(
+            needs,
+            AttrNeeds {
+                title: true,
+                desc: true,
+                identifier: false
+            }
+        );
+    }
+
+    #[test]
+    fn attr_needs_mixed_signals_unions_all_attrs() {
+        let signals = [
+            CallSignal::AutomationId("foo"),
+            CallSignal::NameContains("Leave"),
+        ];
+        let needs = AttrNeeds::from_call_signals(signals.iter());
+        assert_eq!(
+            needs,
+            AttrNeeds {
+                title: true,
+                desc: true,
+                identifier: true
+            }
+        );
+    }
+
+    #[test]
+    fn attr_needs_covers_every_call_signal_variant() {
+        // Belt-and-suspenders: when a new CallSignal variant is added, this
+        // test forces an explicit match-arm decision in `from_call_signals`.
+        // If a contributor adds a variant without updating the derivation,
+        // they need to add it here too and consciously pick its attr needs.
+        let all_variants: Vec<CallSignal> = vec![
+            CallSignal::AutomationId(""),
+            CallSignal::AutomationIdContains(""),
+            CallSignal::KeyboardShortcut(""),
+            CallSignal::RoleWithName {
+                role: "",
+                name_contains: "",
+            },
+            CallSignal::MenuBarItem { title_contains: "" },
+            CallSignal::MenuItemId(""),
+            CallSignal::NameContains(""),
+            CallSignal::WindowTitle { title_contains: "" },
+        ];
+        let needs = AttrNeeds::from_call_signals(all_variants.iter());
+        assert_eq!(
+            needs,
+            AttrNeeds {
+                title: true,
+                desc: true,
+                identifier: true
+            },
+            "all variants together should require every attribute"
+        );
+    }
 
     // ── Profile tests ──────────────────────────────────────────────────
 
@@ -2900,6 +3519,79 @@ mod tests {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_zoom_screen_share_starts_detection() {
+        // A Zoom call that begins while screen-sharing hides the leave/end-meeting
+        // buttons (controls collapse into a floating share toolbar). "Stop Share" /
+        // "Pause Share" / "You are screen sharing" must still trigger detection so the
+        // live transcription path starts instead of relying on the delayed background
+        // path.
+        let profiles = load_detection_profiles();
+        let zoom = profiles
+            .iter()
+            .find(|p| p.app_identifiers.macos_app_names.contains(&"zoom.us"))
+            .expect("zoom profile should exist");
+
+        let matches_any = |role: &str, title: &str| {
+            zoom.call_signals
+                .iter()
+                .any(|s| check_signal_match(s, role, Some(title), None, None))
+        };
+
+        // Share controls present only during an active in-meeting share.
+        assert!(matches_any("AXButton", "Stop Share"));
+        assert!(matches_any("AXMenuItem", "Pause Share"));
+        assert!(matches_any("AXStaticText", "You are screen sharing"));
+
+        // The idle home-screen "Share Screen" button must NOT trigger detection —
+        // it exists without an active call.
+        assert!(!matches_any("AXButton", "Share Screen"));
+    }
+
+    #[test]
+    fn test_calendar_event_keep_alive() {
+        let now = Utc::now();
+        let rfc = |t: DateTime<Utc>| t.to_rfc3339();
+        let ev = |start, end, all_day| CalendarEventSignal {
+            title: "Standup".to_string(),
+            start: rfc(start),
+            end: rfc(end),
+            attendees: vec![],
+            is_all_day: all_day,
+        };
+
+        // Event in progress now → keep the meeting alive.
+        assert!(has_active_calendar_event(
+            &[ev(
+                now - chrono::Duration::minutes(5),
+                now + chrono::Duration::minutes(25),
+                false,
+            )],
+            now,
+        ));
+
+        // All-day event → must NOT pin a meeting open all day.
+        assert!(!has_active_calendar_event(
+            &[ev(
+                now - chrono::Duration::hours(2),
+                now + chrono::Duration::hours(10),
+                true,
+            )],
+            now,
+        ));
+
+        // Past event and no events → no keep-alive.
+        assert!(!has_active_calendar_event(
+            &[ev(
+                now - chrono::Duration::hours(2),
+                now - chrono::Duration::hours(1),
+                false,
+            )],
+            now,
+        ));
+        assert!(!has_active_calendar_event(&[], now));
     }
 
     // ── Signal matching tests ──────────────────────────────────────────
@@ -3037,6 +3729,114 @@ mod tests {
             assert!(
                 mute_matches.is_empty(),
                 "profile should not match standalone 'Mute' button"
+            );
+        }
+    }
+
+    /// Returns the generic-fallback profile (the one with broad URL patterns
+    /// like `daily.co`, `cal.com/video`, `pop.com`). Picks it by detecting the
+    /// distinctive `meet.jit.si` URL pattern.
+    fn generic_profile() -> MeetingDetectionProfile {
+        load_detection_profiles()
+            .into_iter()
+            .find(|p| {
+                p.app_identifiers
+                    .browser_url_patterns
+                    .contains(&"meet.jit.si")
+            })
+            .expect("generic fallback profile present")
+    }
+
+    /// Mirrors the lowercase substring match used by `has_browser_meeting_url`
+    /// and `db_find_browser_meetings`.
+    fn url_matches_any_pattern(url: &str, patterns: &[&str]) -> bool {
+        let url_lower = url.to_lowercase();
+        patterns
+            .iter()
+            .any(|p| url_lower.contains(&p.to_lowercase()))
+    }
+
+    #[test]
+    fn test_generic_profile_rejects_cal_dashboard_url() {
+        // Regression: bare `cal.com` URL pattern matched the cal.com booking
+        // dashboard, which then put Arc into the "candidate browser" set and
+        // let an unrelated tab's "Leave at the door" button fire a phantom
+        // meeting. Dashboard URLs are not calls.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            "https://app.cal.com/event-types",
+            "https://app.cal.com/bookings/upcoming",
+            "https://cal.com/louis/30min",
+            "https://cal.com/pricing",
+        ] {
+            assert!(
+                !url_matches_any_pattern(url, patterns),
+                "cal.com dashboard URL {url:?} should NOT match a meeting profile"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_matches_cal_video_url() {
+        // The actual Cal Video URL (live meeting) must still match.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            "https://app.cal.com/video/abc123",
+            "https://app.cal.com/video/8f3e-meeting-uid",
+        ] {
+            assert!(
+                url_matches_any_pattern(url, patterns),
+                "Cal Video URL {url:?} should match the generic profile"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_url_patterns_are_path_qualified_for_known_lookalikes() {
+        // Any URL pattern that is just `<service>.com` for a service that
+        // also runs a marketing/dashboard site at the same host will trip
+        // the same class of false positive that hit cal.com (regression in
+        // f9cdb1bb7). Lock in the path-qualified shape for services we've
+        // already narrowed — re-broadening them in the patterns list should
+        // require updating this test, which is the whole point.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+
+        let must_be_path_qualified = ["cal.com", "dialpad.com"];
+        for host in must_be_path_qualified {
+            let bare_present = patterns.contains(&host);
+            assert!(
+                !bare_present,
+                "url pattern {host:?} must be path-qualified (e.g. {host}/<call-route>), \
+                 not a bare host — otherwise dashboard/marketing URLs match"
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_profile_rejects_marketing_lookalikes_for_narrowed_hosts() {
+        // Concrete URL regression set for hosts we've already narrowed. If
+        // any of these match, we've silently re-broadened the pattern and
+        // the cal.com-class bug is back. Add hosts here as we narrow them.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            // cal.com marketing/dashboard — only /video is a call.
+            "https://cal.com/",
+            "https://cal.com/blog/how-to-schedule-meetings",
+            "https://cal.com/signup",
+            "https://app.cal.com/settings/billing",
+            // dialpad — only /meetings is a call route.
+            "https://www.dialpad.com/",
+            "https://www.dialpad.com/pricing",
+            "https://dialpad.com/blog",
+        ] {
+            assert!(
+                !url_matches_any_pattern(url, patterns),
+                "marketing/dashboard URL {url:?} should NOT match a meeting profile \
+                 (regression of the cal.com false-positive class)"
             );
         }
     }
@@ -3477,7 +4277,7 @@ mod tests {
             last_seen: Instant::now(),
             is_browser: false,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
         assert!(ended_id.is_none()); // not ended yet, just transitioning
     }
@@ -3489,7 +4289,7 @@ mod tests {
             app: "Zoom".to_string(),
             profile_index: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Idle));
         assert!(ended_id.is_none());
     }
@@ -3506,7 +4306,7 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Idle));
         assert_eq!(ended_id, Some(42));
     }
@@ -3521,7 +4321,7 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (new_state, ended_id) = handle_no_apps_running(state);
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
         assert!(ended_id.is_none());
     }
@@ -3539,8 +4339,302 @@ mod tests {
             is_browser: false,
             controls_seen_in_ending: 0,
         };
-        let (_, ended_id) = handle_no_apps_running(state);
+        let (_, ended_id) = handle_no_apps_running(state, false);
         assert!(ended_id.is_none(), "should not end meeting with id=-1");
+    }
+
+    #[test]
+    fn test_handle_no_apps_active_kept_alive_by_audio() {
+        // Process scan came up empty (e.g. browser-extension websocket drop /
+        // app relaunch) but output audio is still playing — the call is live,
+        // so the meeting must NOT begin ending.
+        let state = MeetingState::Active {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(new_state, MeetingState::Active { .. }),
+            "active meeting with live output audio should stay Active"
+        );
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_ending_revived_by_audio() {
+        // Even past the ending timeout, live output audio revives the meeting
+        // rather than ending it when the app process scan is empty.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or(Instant::now()),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(new_state, MeetingState::Active { .. }),
+            "ending meeting with live output audio should return to Active"
+        );
+        assert!(
+            ended_id.is_none(),
+            "must not end a meeting that still has audio"
+        );
+    }
+
+    #[test]
+    fn test_handle_no_apps_active_kept_alive_preserves_identity() {
+        // Keeping a meeting alive must not lose its identity: same id, same
+        // start time, same browser-ness — only last_seen is refreshed.
+        let started = Utc::now();
+        let state = MeetingState::Active {
+            meeting_id: 99,
+            app: "Arc".to_string(),
+            started_at: started,
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        let MeetingState::Active {
+            meeting_id,
+            app,
+            started_at,
+            is_browser,
+            ..
+        } = new_state
+        else {
+            panic!("expected Active");
+        };
+        assert_eq!(meeting_id, 99);
+        assert_eq!(app, "Arc");
+        assert_eq!(started_at, started, "start time must be preserved");
+        assert!(is_browser, "browser-ness must be preserved");
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_active_to_ending_flattens_browser_flag() {
+        // With no audio and no process, a browser meeting drops into the SHORT
+        // (non-browser) grace: the call is silent + gone, so we don't hold the
+        // 5-minute browser grace. Identity is still preserved into Ending.
+        let started = Utc::now();
+        let state = MeetingState::Active {
+            meeting_id: 7,
+            app: "Arc".to_string(),
+            started_at: started,
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
+        let MeetingState::Ending {
+            meeting_id,
+            started_at,
+            is_browser,
+            ..
+        } = new_state
+        else {
+            panic!("expected Ending");
+        };
+        assert_eq!(meeting_id, 7);
+        assert_eq!(started_at, started);
+        assert!(
+            !is_browser,
+            "exited + silent browser meeting must use the short timeout"
+        );
+        assert!(
+            ended_id.is_none(),
+            "Ending transition does not end the meeting"
+        );
+    }
+
+    #[test]
+    fn test_handle_no_apps_confirming_ignores_audio() {
+        // A meeting that was never confirmed must NOT be promoted/kept alive by
+        // ambient output audio — audio liveness only applies once a meeting is
+        // established (Active/Ending). Confirming + no process → Idle, always.
+        let state = MeetingState::Confirming {
+            since: Instant::now(),
+            app: "Zoom".to_string(),
+            profile_index: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(new_state, MeetingState::Idle),
+            "audio must not keep an unconfirmed meeting alive"
+        );
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_idle_is_noop() {
+        // Idle is inert regardless of audio: no process, nothing to keep alive.
+        for audio in [true, false] {
+            let (new_state, ended_id) = handle_no_apps_running(MeetingState::Idle, audio);
+            assert!(matches!(new_state, MeetingState::Idle));
+            assert!(ended_id.is_none());
+        }
+    }
+
+    #[test]
+    fn test_handle_no_apps_ending_revived_before_timeout_by_audio() {
+        // Audio short-circuits the timeout entirely — even a brand-new Ending
+        // (well within grace) returns to Active when audio is flowing.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now(),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, true);
+        assert!(matches!(new_state, MeetingState::Active { .. }));
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_ending_browser_holds_during_long_grace() {
+        // A browser meeting past the 30s non-browser timeout but within the
+        // 300s browser grace must NOT end (proves the browser timeout is the
+        // one being applied), and audio is absent so it can't be revived.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(30))
+                .unwrap_or_else(Instant::now),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
+        assert!(
+            matches!(new_state, MeetingState::Ending { .. }),
+            "browser meeting within 300s grace must stay Ending"
+        );
+        assert!(ended_id.is_none());
+    }
+
+    #[test]
+    fn test_handle_no_apps_ending_browser_ends_after_long_timeout() {
+        // Past the full browser grace with no audio, the meeting finally ends.
+        let state = MeetingState::Ending {
+            meeting_id: 55,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT_BROWSER + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let (new_state, ended_id) = handle_no_apps_running(state, false);
+        assert!(matches!(new_state, MeetingState::Idle));
+        assert_eq!(ended_id, Some(55));
+    }
+
+    // --- Trajectory tests: compose advance_state + handle_no_apps_running across
+    //     successive scans, the way run_meeting_detection_loop does. ---
+
+    #[test]
+    fn test_trajectory_transient_misses_with_audio_keep_meeting() {
+        // The incident shape: an Active browser call hits repeated process-scan
+        // misses while audio keeps flowing. It must stay Active across every
+        // miss, never emitting an end. When audio finally stops it transitions
+        // to Ending (still not ended yet).
+        let mut state = MeetingState::Active {
+            meeting_id: 7,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        for scan in 0..5 {
+            let (next, ended) = handle_no_apps_running(state, true);
+            state = next;
+            assert!(
+                matches!(state, MeetingState::Active { meeting_id: 7, .. }),
+                "scan {scan}: live audio must keep the meeting Active"
+            );
+            assert!(ended.is_none(), "scan {scan}: must not end a live meeting");
+        }
+        // Audio stops → begins ending (but is not ended on this tick).
+        let (next, ended) = handle_no_apps_running(state, false);
+        assert!(matches!(next, MeetingState::Ending { meeting_id: 7, .. }));
+        assert!(ended.is_none());
+    }
+
+    #[test]
+    fn test_trajectory_advance_to_ending_then_no_apps_audio_revives() {
+        // advance_state pushes Active->Ending when controls vanish; then the
+        // app process disappears entirely (no_apps path) but audio is live —
+        // the meeting must be revived rather than ended.
+        let state = MeetingState::Active {
+            meeting_id: 12,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            last_seen: Instant::now(),
+            is_browser: true,
+        };
+        // Controls gone, no audio yet → Ending (advance_state path).
+        let (state, action) = advance_state(state, &[], false);
+        assert!(matches!(state, MeetingState::Ending { meeting_id: 12, .. }));
+        assert!(action.is_none());
+        // Now the process scan comes up empty AND audio is flowing → revive.
+        let (state, ended) = handle_no_apps_running(state, true);
+        assert!(
+            matches!(state, MeetingState::Active { meeting_id: 12, .. }),
+            "no-apps path with live audio must revive the Ending meeting"
+        );
+        assert!(ended.is_none());
+    }
+
+    #[test]
+    fn test_trajectory_no_apps_no_audio_ends_after_grace() {
+        // Full negative path: Active -> Ending (no audio, process gone), then a
+        // later tick past the short grace with still no audio ends the meeting.
+        let state = MeetingState::Active {
+            meeting_id: 21,
+            app: "SomeNativeApp".to_string(),
+            started_at: Utc::now(),
+            last_seen: Instant::now(),
+            is_browser: false,
+        };
+        let (state, ended) = handle_no_apps_running(state, false);
+        assert!(matches!(state, MeetingState::Ending { meeting_id: 21, .. }));
+        assert!(ended.is_none());
+        // Simulate the grace window elapsing (Instant can't be fast-forwarded,
+        // so rebuild the Ending with an aged `since`).
+        let MeetingState::Ending {
+            meeting_id,
+            app,
+            started_at,
+            is_browser,
+            controls_seen_in_ending,
+            ..
+        } = state
+        else {
+            panic!("expected Ending");
+        };
+        let aged = MeetingState::Ending {
+            meeting_id,
+            app,
+            started_at,
+            since: Instant::now()
+                .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
+                .unwrap_or_else(Instant::now),
+            is_browser,
+            controls_seen_in_ending,
+        };
+        let (state, ended) = handle_no_apps_running(aged, false);
+        assert!(matches!(state, MeetingState::Idle));
+        assert_eq!(ended, Some(21));
     }
 
     #[test]
@@ -4226,6 +5320,286 @@ mod tests {
                 title
             );
         }
+    }
+
+    // ── browser_title_matches_pattern + Google Meet on Windows ─────────────────
+    //
+    // These guard the historical bug where Google Meet auto-recording silently
+    // failed in Chrome/Edge/Firefox/Brave on Windows. The original matching was
+    // strict equality (`title_lower == "meet"`), which only worked for Arc.
+    // See `browser_title_matches_pattern` doc comment for the rules.
+
+    #[test]
+    fn browser_title_pattern_matches_arc_bare_title() {
+        // Arc shows just "Meet" as the window title.
+        assert!(browser_title_matches_pattern("meet", "Meet"));
+    }
+
+    #[test]
+    fn browser_title_pattern_matches_chromium_browser_suffix() {
+        // Chrome, Edge, Brave all use " - <Browser>" suffix on Windows.
+        // The page title "Meet" sits at the start with a hyphen after it.
+        //
+        // The Edge case with "and N more page" is a real captured fixture from
+        // an AX inspector dump on Windows: Edge appends " and N more page(s)"
+        // to the active tab title whenever the window has additional tabs open
+        // in the same tab group. This was the exact title that failed detection
+        // in the field while the meeting was live.
+        for title in [
+            "meet - abc-defg-hij - google chrome",
+            "meet - microsoft\u{200b} edge",
+            "meet - abc-defg-hij - brave",
+            "meet - opera",
+            "meet - vivaldi",
+            // Real Edge title captured from AX inspector during a live meeting:
+            // "Meet - test-meet and 1 more page - Personal - Microsoft Edge".
+            "meet - test-meet and 1 more page - personal - microsoft edge",
+            // Same shape with multiple extra tabs (plural "pages").
+            "meet - standup and 3 more pages - work - microsoft edge",
+        ] {
+            assert!(
+                browser_title_matches_pattern(title, "Meet"),
+                "title {:?} should match pattern 'Meet'",
+                title
+            );
+        }
+    }
+
+    #[test]
+    fn browser_title_pattern_matches_firefox_em_dash_suffix() {
+        // Firefox uses an em dash (U+2014) instead of a hyphen.
+        assert!(browser_title_matches_pattern(
+            "meet \u{2014} mozilla firefox",
+            "Meet"
+        ));
+    }
+
+    #[test]
+    fn browser_title_pattern_rejects_non_prefix_and_word_continuations() {
+        // The matcher is anchored at the start AND requires a non-alphanumeric
+        // separator after the pattern. These are real-world false positives
+        // the strict-equality version implicitly avoided and that a naive
+        // contains() would re-introduce.
+        for title in [
+            // Pattern at position 0 but continues into a larger word —
+            // separator check fails.
+            "meeting reminders - gmail - google chrome",
+            "meetup.com - upcoming events - firefox",
+            // Pattern appears mid-string, never at the start — the actual
+            // bug-bait case (Google Calendar event popup mentioning Meet).
+            "join with google meet - calendar - google chrome",
+            "submeeting notes - notion",
+            "unmeet\u{2019}d topics - obsidian",
+            "inbox - meeting reminders - gmail",
+        ] {
+            assert!(
+                !browser_title_matches_pattern(title, "Meet"),
+                "title {:?} should NOT match pattern 'Meet'",
+                title
+            );
+        }
+    }
+
+    #[test]
+    fn browser_title_pattern_empty_pattern_never_matches() {
+        assert!(!browser_title_matches_pattern("meet", ""));
+        assert!(!browser_title_matches_pattern("", ""));
+    }
+
+    #[test]
+    fn browser_title_pattern_case_insensitive() {
+        assert!(browser_title_matches_pattern(
+            "meet - google chrome",
+            "MEET"
+        ));
+        assert!(browser_title_matches_pattern(
+            "meet - google chrome",
+            "mEeT"
+        ));
+    }
+
+    #[test]
+    fn test_google_meet_browser_titles_match_on_all_browsers() {
+        // End-to-end regression test for the Windows bug. Exercises the same
+        // matching predicate that `find_running_meeting_apps` and
+        // `db_find_browser_meetings` now use against the Google Meet profile.
+        let profiles = load_detection_profiles();
+        let meet = profiles
+            .iter()
+            .find(|p| {
+                p.app_identifiers
+                    .browser_url_patterns
+                    .contains(&"meet.google.com")
+            })
+            .expect("Google Meet profile not found");
+
+        // Real window-title strings observed on Windows during a live Meet call.
+        // None of these contain "meet.google.com" (Chrome/Edge/Firefox/Brave do
+        // not put the URL in the window title), so detection must rely on
+        // `browser_title_patterns` ("Meet").
+        let live_meet_titles = [
+            "Meet - abc-defg-hij - Google Chrome",
+            "Meet - abc-defg-hij - Microsoft\u{200b} Edge",
+            "Meet \u{2014} Mozilla Firefox",
+            "Meet - abc-defg-hij - Brave",
+            "Meet", // Arc
+        ];
+
+        for title in &live_meet_titles {
+            let title_lower = title.to_lowercase();
+            let url_match = meet
+                .app_identifiers
+                .browser_url_patterns
+                .iter()
+                .any(|p| title_lower.contains(&p.to_lowercase()));
+            let title_match = meet
+                .app_identifiers
+                .browser_title_patterns
+                .iter()
+                .any(|p| browser_title_matches_pattern(&title_lower, p));
+            assert!(
+                url_match || title_match,
+                "Live Google Meet title {:?} should match the Google Meet profile \
+                 via url_patterns OR title_patterns (got url_match={}, title_match={})",
+                title,
+                url_match,
+                title_match
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_meet_titles_do_not_match_google_meet_profile() {
+        // Negative cases: pages that look superficially like Meet must NOT
+        // trigger detection. Without word-bounded matching these regressed
+        // (e.g. "Meeting reminders" would match a bare "Meet" pattern).
+        let profiles = load_detection_profiles();
+        let meet = profiles
+            .iter()
+            .find(|p| {
+                p.app_identifiers
+                    .browser_url_patterns
+                    .contains(&"meet.google.com")
+            })
+            .expect("Google Meet profile not found");
+
+        let non_meet_titles = [
+            "Meeting reminders - Gmail - Google Chrome",
+            "Meetup.com - Upcoming events - Firefox",
+            "Join with Google Meet - Calendar - Google Chrome",
+            "Google Calendar - Week of March 16, 2026",
+            "Inbox (3) - user@example.com - Gmail",
+        ];
+
+        for title in &non_meet_titles {
+            let title_lower = title.to_lowercase();
+            let url_match = meet
+                .app_identifiers
+                .browser_url_patterns
+                .iter()
+                .any(|p| title_lower.contains(&p.to_lowercase()));
+            let title_match = meet
+                .app_identifiers
+                .browser_title_patterns
+                .iter()
+                .any(|p| browser_title_matches_pattern(&title_lower, p));
+            assert!(
+                !(url_match || title_match),
+                "Non-Meet title {:?} should NOT match Google Meet profile \
+                 (got url_match={}, title_match={})",
+                title,
+                url_match,
+                title_match
+            );
+        }
+    }
+
+    // ── role_matches cross-platform tolerance ──────────────────────────────────
+    //
+    // Profiles declare roles as macOS PascalCase (`AXButton`, `AXMenuItem`,
+    // `AXMenuBarItem`). On Windows, `IUIAutomationElement::CurrentLocalizedControlType`
+    // returns a lowercase localised string (`"button"`, `"menu item"`,
+    // `"menu bar item"`). The old `role != *r` strict equality silently rejected
+    // every Windows match — only `NameContains` signals were actually firing,
+    // which is why Google Meet still missed on Edge even after the title-matcher
+    // fix. These cases pin the matrix.
+
+    #[test]
+    fn test_role_matches_macos_pascalcase_identity() {
+        // macOS path: cidre returns exact `AXButton` — strict equality must work.
+        assert!(role_matches("AXButton", "AXButton"));
+        assert!(role_matches("AXMenuItem", "AXMenuItem"));
+        assert!(role_matches("AXMenuBarItem", "AXMenuBarItem"));
+    }
+
+    #[test]
+    fn test_role_matches_windows_localized_lowercase() {
+        // Windows path: CurrentLocalizedControlType returns lowercase, no AX prefix.
+        // This was the silently-broken case for every Chromium browser meeting.
+        assert!(role_matches("button", "AXButton"));
+        assert!(role_matches("menu item", "AXMenuItem"));
+        assert!(role_matches("menu bar item", "AXMenuBarItem"));
+    }
+
+    #[test]
+    fn test_role_matches_windows_ax_prefix_mash() {
+        // The pre-fix caller also tried `format!("AX{}", role)` to bridge to
+        // macOS naming — that produced "AXbutton" (lowercase tail). role_matches
+        // must accept that pseudo-prefix form too, otherwise existing on-the-wire
+        // call sites would regress.
+        assert!(role_matches("AXbutton", "AXButton"));
+        assert!(role_matches("AXmenu item", "AXMenuItem"));
+    }
+
+    #[test]
+    fn test_role_matches_rejects_unrelated_roles() {
+        // Sanity: a Text/Image/Pane element must not be accepted as a Button just
+        // because both pass through the normaliser. The Google Meet profile
+        // requires `AXButton`-shaped signals — false positives here would let
+        // any element on the page with `name == "leave call"` trip detection.
+        assert!(!role_matches("text", "AXButton"));
+        assert!(!role_matches("AXStaticText", "AXButton"));
+        assert!(!role_matches("image", "AXMenuBarItem"));
+        assert!(!role_matches("pane", "AXButton"));
+    }
+
+    #[test]
+    fn test_check_signal_match_role_with_name_matches_windows_button() {
+        // End-to-end: the Google Meet "Leave call" button as observed on Edge.
+        // From the AX inspector dump: ControlType=Button,
+        // LocalizedControlType="button", Name="Leave call". The profile signal
+        // is RoleWithName { role: "AXButton", name_contains: "leave call" }.
+        // This is the exact predicate that silently returned false before the
+        // fix and made Windows detection rely entirely on the NameContains
+        // fallback.
+        let signal = CallSignal::RoleWithName {
+            role: "AXButton",
+            name_contains: "leave call",
+        };
+        assert!(check_signal_match(
+            &signal,
+            "button",
+            Some("Leave call"),
+            None,
+            None,
+        ));
+        // AX-prefixed lowercase form (caller used to try both) must also match.
+        assert!(check_signal_match(
+            &signal,
+            "AXbutton",
+            Some("Leave call"),
+            None,
+            None,
+        ));
+        // Wrong role must still be rejected — a Text element named "Leave call"
+        // (e.g. a tooltip label) must NOT count as the button.
+        assert!(!check_signal_match(
+            &signal,
+            "text",
+            Some("Leave call"),
+            None,
+            None,
+        ));
     }
 }
 

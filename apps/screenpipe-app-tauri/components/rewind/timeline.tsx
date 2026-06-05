@@ -19,6 +19,7 @@ import { getStartDate } from "@/lib/actions/get-start-date";
 import { useTimelineData } from "@/lib/hooks/use-timeline-data";
 import { useCurrentFrame } from "@/lib/hooks/use-current-frame";
 import { TimelineSlider } from "@/components/rewind/timeline/timeline";
+import { SearchResultStrip } from "@/components/rewind/search-result-strip";
 import { useMeetings } from "@/lib/hooks/use-meetings";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
 import { findNearestDateWithFrames } from "@/lib/actions/has-frames-date";
@@ -86,65 +87,6 @@ export interface TimeRange {
 const easeOutCubic = (x: number): number => {
 	return 1 - Math.pow(1 - x, 3);
 };
-
-// Tiny dot-strip showing all search-result positions; click to jump.
-// Each result is a small bar; the active one is bright yellow with a glow.
-// Renders nothing for ≤1 result (the counter alone is sufficient).
-function SearchResultStrip({
-	resultsLength,
-	activeIndex,
-	onJump,
-}: {
-	resultsLength: number;
-	activeIndex: number;
-	onJump: (index: number) => void;
-}) {
-	if (resultsLength <= 1) return null;
-	const stripWidth = 110;
-	const stripHeight = 14;
-	const denom = Math.max(1, resultsLength - 1);
-	return (
-		<div
-			className="relative shrink-0"
-			style={{ width: stripWidth, height: stripHeight }}
-			role="slider"
-			aria-label="Search result position"
-			aria-valuemin={1}
-			aria-valuemax={resultsLength}
-			aria-valuenow={activeIndex + 1}
-		>
-			<div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-px bg-white/15" />
-			{Array.from({ length: resultsLength }).map((_, i) => {
-				const isActive = i === activeIndex;
-				const x = (i / denom) * stripWidth;
-				return (
-					<button
-						key={i}
-						type="button"
-						onClick={() => onJump(i)}
-						className="absolute top-1/2 cursor-pointer focus:outline-none"
-						style={{
-							left: x - (isActive ? 2 : 1),
-							width: isActive ? 4 : 2,
-							height: isActive ? 10 : 5,
-							transform: "translateY(-50%)",
-							borderRadius: 1.5,
-							backgroundColor: isActive
-								? "rgb(250, 204, 21)"
-								: "rgba(255, 255, 255, 0.45)",
-							boxShadow: isActive
-								? "0 0 5px rgba(250, 204, 21, 0.7)"
-								: "none",
-							transition: "all 120ms ease-out",
-							zIndex: isActive ? 2 : 1,
-						}}
-						title={`Match ${i + 1}`}
-					/>
-				);
-			})}
-		</div>
-	);
-}
 
 export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const { isMac } = usePlatform();
@@ -1047,6 +989,34 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	// The same Timeline component is used in both overlay and window mode.
 	// The window sizing/decoration is handled by Rust (window_api.rs).
+
+	// Timeline disabled by the user: render a lightweight placeholder and never
+	// mount CurrentFrameTimeline (which attaches the native Live Text overlay).
+	// This both honors the setting and prevents the VisionKit overlay from
+	// leaking a native selection layer over other windows (e.g. the chat input).
+	if (settings?.disableTimeline === true) {
+		return (
+			<div
+				className="inset-0 flex flex-col items-center justify-center text-foreground relative bg-background"
+				data-testid="section-timeline-disabled"
+				style={{ height: embedded ? "100%" : "100vh" }}
+			>
+				<div className="text-center p-8 max-w-md">
+					<div className="mx-auto mb-6 w-16 h-16 rounded-full bg-muted/50 border border-border flex items-center justify-center">
+						<MonitorOff className="w-8 h-8 text-muted-foreground" />
+					</div>
+					<h3 className="text-lg font-mono font-semibold uppercase tracking-wide mb-2">
+						Timeline Disabled
+					</h3>
+					<p className="text-sm font-mono text-muted-foreground leading-relaxed">
+						The timeline is turned off in settings. Re-enable it under
+						Display settings to browse your recorded history.
+					</p>
+				</div>
+			</div>
+		);
+	}
+
 	return (
 		<TimelineProvider>
 			<div
@@ -1166,7 +1136,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 									</p>
 
 									<button
-										onClick={() => commands.showWindow({ Home: { page: null } })}
+										onClick={() => commands.showWindow({ Home: { page: "recording" } })}
 										className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-full text-sm font-medium hover:bg-primary/90 transition-colors"
 									>
 										<Settings className="w-4 h-4" />
@@ -1260,28 +1230,36 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 				{(() => {
 					const browserUrl = currentFrame?.devices?.[0]?.metadata?.browser_url;
 					if (!browserUrl) return null;
+					// browser_url from screenpipe often lacks a protocol (e.g. "github.com/foo");
+					// both tauri shell.open and window.open reject/misroute schemeless inputs.
+					const openableUrl = browserUrl.includes("://") ? browserUrl : `https://${browserUrl}`;
+					const isHttps = openableUrl.startsWith("https://");
 					return (
 						<div className={`absolute ${embedded ? "top-[56px]" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
 							<button
 								type="button"
 								className="flex items-center gap-1.5 max-w-lg min-w-0 px-3 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 hover:bg-black/80 hover:border-white/20 transition-colors cursor-pointer pointer-events-auto"
-								title={`Open ${browserUrl}`}
-								onClick={async () => {
+								title={`Open ${openableUrl}`}
+								onClick={async (e) => {
+									e.stopPropagation();
 									try {
-										const { open } = await import("@tauri-apps/plugin-shell");
-										await open(browserUrl);
-									} catch {
-										window.open(browserUrl, "_blank");
+										const { openUrl } = await import("@tauri-apps/plugin-opener");
+										await openUrl(openableUrl);
+									} catch (err) {
+										console.error("failed to open url", openableUrl, err);
+										try {
+											window.open(openableUrl, "_blank", "noopener,noreferrer");
+										} catch {}
 									}
 								}}
 							>
-								{browserUrl.startsWith("https") ? (
+								{isHttps ? (
 									<Lock className="w-3 h-3 text-green-400/80 shrink-0" />
 								) : (
 									<Globe className="w-3 h-3 text-white/40 shrink-0" />
 								)}
 								<span className="text-[12px] font-mono text-white/80 truncate">
-									{browserUrl.replace(/^https?:\/\/(www\.)?/, "")}
+									{openableUrl.replace(/^https?:\/\/(www\.)?/, "")}
 								</span>
 								<ExternalLink className="w-3 h-3 text-white/40 shrink-0" />
 							</button>

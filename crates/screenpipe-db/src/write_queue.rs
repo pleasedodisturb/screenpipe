@@ -19,6 +19,7 @@
 //! to ~5ms amortized over the entire batch.
 
 use chrono::{DateTime, Utc};
+use sqlx::migrate::MigrateDatabase;
 use sqlx::{Pool, Sqlite};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -138,31 +139,17 @@ pub(crate) enum WriteOp {
         time_end: String,
     },
     InsertUiEvent {
-        timestamp: String,
-        session_id: Option<String>,
-        relative_ms: i64,
-        event_type: String,
-        x: Option<i32>,
-        y: Option<i32>,
-        delta_x: Option<i32>,
-        delta_y: Option<i32>,
-        button: Option<i32>,
-        click_count: Option<i32>,
-        key_code: Option<i32>,
-        modifiers: Option<i32>,
-        text_content: Option<String>,
-        text_length: Option<i32>,
-        app_name: Option<String>,
-        app_pid: Option<i32>,
-        window_title: Option<String>,
-        browser_url: Option<String>,
-        element_role: Option<String>,
-        element_name: Option<String>,
-        element_value: Option<String>,
-        element_description: Option<String>,
-        element_automation_id: Option<String>,
-        element_bounds: Option<String>,
-        frame_id: Option<i64>,
+        event: UiEventWrite,
+    },
+    InsertUiEventsBatch {
+        events: Vec<UiEventWrite>,
+    },
+    /// Update `ui_events.frame_id` for a single row. Used by the frame
+    /// linker to fill in the frame that a UI event triggered, after the
+    /// capture loop reports the resulting frame_id.
+    UpdateUiEventFrameId {
+        row_id: i64,
+        frame_id: i64,
     },
     DeleteAudioChunksBatch {
         chunk_ids: Vec<i64>,
@@ -307,6 +294,35 @@ pub(crate) struct FrameBatchWindow {
     pub text_json: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UiEventWrite {
+    pub timestamp: String,
+    pub session_id: Option<String>,
+    pub relative_ms: i64,
+    pub event_type: String,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub delta_x: Option<i32>,
+    pub delta_y: Option<i32>,
+    pub button: Option<i32>,
+    pub click_count: Option<i32>,
+    pub key_code: Option<i32>,
+    pub modifiers: Option<i32>,
+    pub text_content: Option<String>,
+    pub text_length: Option<i32>,
+    pub app_name: Option<String>,
+    pub app_pid: Option<i32>,
+    pub window_title: Option<String>,
+    pub browser_url: Option<String>,
+    pub element_role: Option<String>,
+    pub element_name: Option<String>,
+    pub element_value: Option<String>,
+    pub element_description: Option<String>,
+    pub element_automation_id: Option<String>,
+    pub element_bounds: Option<String>,
+    pub frame_id: Option<i64>,
+}
+
 /// Which table to mark as synced.
 #[derive(Debug, Clone)]
 pub enum SyncTable {
@@ -327,6 +343,10 @@ pub(crate) enum WriteResult {
     Unit,
     /// Result of InsertFramesBatch: Vec of (frame_id, window_index) pairs.
     FrameBatch(Vec<(i64, usize)>),
+    /// Result of InsertUiEventsBatch: one row id per inserted event, in order.
+    /// Callers need this so frame-linker correlation ids can be paired with
+    /// the actual `ui_events.id` after batch flush.
+    Ids(Vec<i64>),
 }
 
 /// A pending write: the operation plus a channel to send the result back.
@@ -364,10 +384,11 @@ impl WriteQueue {
 pub(crate) fn spawn_write_drain(
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
 ) -> WriteQueue {
     let (tx, rx) = mpsc::channel::<PendingWrite>(CHANNEL_CAPACITY);
 
-    tokio::spawn(drain_loop(rx, write_pool, write_semaphore));
+    tokio::spawn(drain_loop(rx, write_pool, write_semaphore, db_path));
 
     WriteQueue { tx }
 }
@@ -376,6 +397,7 @@ async fn drain_loop(
     mut rx: mpsc::Receiver<PendingWrite>,
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
 ) {
     let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
 
@@ -414,7 +436,7 @@ async fn drain_loop(
         }
 
         debug!("write_queue: draining batch of {} writes", batch.len());
-        execute_batch(&write_pool, &write_semaphore, &mut batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut batch, &db_path).await;
         batch.clear();
     }
 
@@ -426,7 +448,7 @@ async fn drain_loop(
             "write_queue: shutdown — flushing {} remaining writes",
             tail_batch.len()
         );
-        execute_batch(&write_pool, &write_semaphore, &mut tail_batch).await;
+        execute_batch(&write_pool, &write_semaphore, &mut tail_batch, &db_path).await;
         tail_batch.clear();
     }
     debug!("write_queue: drain loop exited");
@@ -436,6 +458,7 @@ async fn execute_batch(
     write_pool: &Pool<Sqlite>,
     write_semaphore: &Arc<Semaphore>,
     batch: &mut Vec<PendingWrite>,
+    db_path: &str,
 ) {
     // Acquire write semaphore once for the entire batch
     let _permit: OwnedSemaphorePermit = match tokio::time::timeout(
@@ -462,18 +485,39 @@ async fn execute_batch(
     let mut conn_opt = None;
 
     for attempt in 1..=max_retries {
-        let mut conn =
-            match tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => {
-                    send_error_to_all(batch, e);
-                    return;
+        // Bind the timeout result first: inlining it into `match` puts this
+        // construct right at rustfmt's width boundary, where the formatter is
+        // non-idempotent (it flip-flops the layout, failing `fmt --check`).
+        let acquired = tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await;
+        let mut conn = match acquired {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                // Retry runtime connection-loss errors before failing queued
+                // writes. CANTOPEN needs explicit file recovery; IOERR/malformed
+                // usually clears by letting sqlx discard the failed acquire path
+                // and trying a fresh handle.
+                if should_recycle_sqlite_connection(&e) && attempt < max_retries {
+                    let recovered = if is_cantopen_error(&e) {
+                        ensure_db_openable(db_path).await
+                    } else {
+                        false
+                    };
+                    warn!(
+                        "write_queue: acquire connection error (attempt {}/{}), db_recovered={}, retrying: {}",
+                        attempt, max_retries, recovered, e
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    continue;
                 }
-                Err(_) => {
-                    send_error_to_all(batch, sqlx::Error::PoolTimedOut);
-                    return;
-                }
-            };
+                send_error_to_all(batch, e);
+                return;
+            }
+            Err(_) => {
+                send_error_to_all(batch, sqlx::Error::PoolTimedOut);
+                return;
+            }
+        };
 
         match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
             Ok(_) => {
@@ -505,6 +549,25 @@ async fn execute_batch(
                 last_error = Some(e);
                 tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
                 continue;
+            }
+            Err(e) if should_recycle_sqlite_connection(&e) => {
+                let recovered = if is_cantopen_error(&e) {
+                    ensure_db_openable(db_path).await
+                } else {
+                    false
+                };
+                warn!(
+                    "write_queue: BEGIN IMMEDIATE connection error (attempt {}/{}), db_recovered={}, detaching connection: {}",
+                    attempt, max_retries, recovered, e
+                );
+                let _raw = conn.detach();
+                if attempt < max_retries {
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    continue;
+                }
+                send_error_to_all(batch, e);
+                return;
             }
             Err(e) => {
                 warn!("write_queue: BEGIN IMMEDIATE failed: {}", e);
@@ -640,6 +703,25 @@ async fn execute_single_write(
             .execute(&mut **conn)
             .await?;
 
+            // Flip the chunk's processing status in the same TX so the
+            // reconciliation sweep can't re-pick this chunk between the
+            // INSERT landing and a separate UPDATE. INSERT OR IGNORE
+            // collisions (UNIQUE on chunk_id+text) still count as
+            // "transcribed" — the row already exists, we've considered
+            // this chunk.
+            sqlx::query(
+                "UPDATE audio_chunks \
+                 SET transcription_status = 'transcribed', \
+                     transcription_attempts = transcription_attempts + 1, \
+                     last_transcription_attempt_at = ?1, \
+                     transcription_failure_reason = NULL \
+                 WHERE id = ?2",
+            )
+            .bind(ts)
+            .bind(audio_chunk_id)
+            .execute(&mut **conn)
+            .await?;
+
             if result.rows_affected() == 0 {
                 Ok(WriteResult::Id(0))
             } else {
@@ -663,34 +745,65 @@ async fn execute_single_write(
         } => {
             let ts = timestamp.unwrap_or_else(Utc::now);
 
-            // If transcription is duplicate, just ensure chunk exists
+            // Cross-device duplicate detected by the read-side dedup check.
+            // The chunk row still needs to exist (so the audio file is
+            // findable on disk for playback / future reconciliation), but no
+            // transcription row is recorded. We mark status='transcribed'
+            // because we *did* process this chunk — its content is captured
+            // on the other device's row. Without this flip the reconciliation
+            // sweep would re-pick the chunk forever (the original zombie loop).
             if *is_duplicate {
-                if *existing_chunk_id != 0 {
-                    return Ok(WriteResult::Id(*existing_chunk_id));
-                }
-                let id =
+                let audio_chunk_id = if *existing_chunk_id != 0 {
+                    *existing_chunk_id
+                } else {
                     sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
                         .bind(file_path.as_str())
                         .bind(ts)
                         .execute(&mut **conn)
                         .await?
-                        .last_insert_rowid();
-                return Ok(WriteResult::Id(id));
+                        .last_insert_rowid()
+                };
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'transcribed', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?2",
+                )
+                .bind(ts)
+                .bind(audio_chunk_id)
+                .execute(&mut **conn)
+                .await?;
+                return Ok(WriteResult::Id(audio_chunk_id));
             }
 
-            // If transcription is empty, just ensure chunk exists
+            // Empty STT result — same story as Duplicate but marked 'silent'
+            // so ops can distinguish silent capture from dedup-suppressed.
             if transcription.trim().is_empty() {
-                if *existing_chunk_id != 0 {
-                    return Ok(WriteResult::Id(*existing_chunk_id));
-                }
-                let id =
+                let audio_chunk_id = if *existing_chunk_id != 0 {
+                    *existing_chunk_id
+                } else {
                     sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
                         .bind(file_path.as_str())
                         .bind(ts)
                         .execute(&mut **conn)
                         .await?
-                        .last_insert_rowid();
-                return Ok(WriteResult::Id(id));
+                        .last_insert_rowid()
+                };
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'silent', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?2",
+                )
+                .bind(ts)
+                .bind(audio_chunk_id)
+                .execute(&mut **conn)
+                .await?;
+                return Ok(WriteResult::Id(audio_chunk_id));
             }
 
             // Insert chunk if needed
@@ -705,7 +818,7 @@ async fn execute_single_write(
                     .last_insert_rowid()
             };
 
-            // Insert transcription
+            // Insert transcription + flip status atomically.
             let text_length = transcription.len() as i64;
             sqlx::query(
                 "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -721,6 +834,19 @@ async fn execute_single_write(
             .bind(start_time)
             .bind(end_time)
             .bind(text_length)
+            .execute(&mut **conn)
+            .await?;
+
+            sqlx::query(
+                "UPDATE audio_chunks \
+                 SET transcription_status = 'transcribed', \
+                     transcription_attempts = transcription_attempts + 1, \
+                     last_transcription_attempt_at = ?1, \
+                     transcription_failure_reason = NULL \
+                 WHERE id = ?2",
+            )
+            .bind(ts)
+            .bind(audio_chunk_id)
             .execute(&mut **conn)
             .await?;
 
@@ -764,13 +890,21 @@ async fn execute_single_write(
                 )"#,
             )
             .bind(timestamp)
-            .bind(snapshot_path.as_str())
+            .bind(if snapshot_path.is_empty() {
+                None
+            } else {
+                Some(snapshot_path.as_str())
+            })
             .bind(browser_url.as_deref())
             .bind(app_name.as_deref())
             .bind(window_name.as_deref())
             .bind(focused)
             .bind(device_name.as_str())
-            .bind(snapshot_path.as_str())
+            .bind(if snapshot_path.is_empty() {
+                None
+            } else {
+                Some(snapshot_path.as_str())
+            })
             .bind(capture_trigger.as_deref())
             .bind(accessibility_text.as_deref())
             .bind(text_source.as_deref())
@@ -894,46 +1028,29 @@ async fn execute_single_write(
             Ok(WriteResult::Unit)
         }
 
-        WriteOp::InsertUiEvent {
-            timestamp,
-            session_id,
-            relative_ms,
-            event_type,
-            x,
-            y,
-            delta_x,
-            delta_y,
-            button,
-            click_count,
-            key_code,
-            modifiers,
-            text_content,
-            text_length,
-            app_name,
-            app_pid,
-            window_title,
-            browser_url,
-            element_role,
-            element_name,
-            element_value,
-            element_description,
-            element_automation_id,
-            element_bounds,
-            frame_id,
-        } => {
-            let result = sqlx::query(
-                "INSERT INTO ui_events (timestamp, session_id, relative_ms, event_type, x, y, delta_x, delta_y, button, click_count, key_code, modifiers, text_content, text_length, app_name, app_pid, window_title, browser_url, element_role, element_name, element_value, element_description, element_automation_id, element_bounds, frame_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
-            )
-            .bind(timestamp.as_str()).bind(session_id.as_deref()).bind(relative_ms).bind(event_type.as_str())
-            .bind(x).bind(y).bind(delta_x).bind(delta_y)
-            .bind(button).bind(click_count).bind(key_code).bind(modifiers)
-            .bind(text_content.as_deref()).bind(text_length)
-            .bind(app_name.as_deref()).bind(app_pid).bind(window_title.as_deref()).bind(browser_url.as_deref())
-            .bind(element_role.as_deref()).bind(element_name.as_deref()).bind(element_value.as_deref())
-            .bind(element_description.as_deref()).bind(element_automation_id.as_deref()).bind(element_bounds.as_deref())
-            .bind(frame_id)
-            .execute(&mut **conn).await?;
-            Ok(WriteResult::Id(result.last_insert_rowid()))
+        WriteOp::InsertUiEvent { event } => {
+            let id = insert_ui_event_row(conn, event).await?;
+            Ok(WriteResult::Id(id))
+        }
+
+        WriteOp::InsertUiEventsBatch { events } => {
+            let mut ids = Vec::with_capacity(events.len());
+            for event in events {
+                ids.push(insert_ui_event_row(conn, event).await?);
+            }
+            Ok(WriteResult::Ids(ids))
+        }
+
+        WriteOp::UpdateUiEventFrameId { row_id, frame_id } => {
+            // FrameLinker emits UPDATEs after pairing a trigger event with
+            // the frame it caused us to capture. `frame_id IS NULL` guards
+            // against accidental clobber if a duplicate update is enqueued.
+            sqlx::query("UPDATE ui_events SET frame_id = ?1 WHERE id = ?2 AND frame_id IS NULL")
+                .bind(frame_id)
+                .bind(row_id)
+                .execute(&mut **conn)
+                .await?;
+            Ok(WriteResult::Unit)
         }
 
         WriteOp::DeleteAudioChunksBatch { chunk_ids } => {
@@ -1342,12 +1459,48 @@ async fn execute_single_write(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+async fn insert_ui_event_row(
+    conn: &mut sqlx::pool::PoolConnection<Sqlite>,
+    event: &UiEventWrite,
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO ui_events (timestamp, session_id, relative_ms, event_type, x, y, delta_x, delta_y, button, click_count, key_code, modifiers, text_content, text_length, app_name, app_pid, window_title, browser_url, element_role, element_name, element_value, element_description, element_automation_id, element_bounds, frame_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+    )
+    .bind(event.timestamp.as_str())
+    .bind(event.session_id.as_deref())
+    .bind(event.relative_ms)
+    .bind(event.event_type.as_str())
+    .bind(event.x)
+    .bind(event.y)
+    .bind(event.delta_x)
+    .bind(event.delta_y)
+    .bind(event.button)
+    .bind(event.click_count)
+    .bind(event.key_code)
+    .bind(event.modifiers)
+    .bind(event.text_content.as_deref())
+    .bind(event.text_length)
+    .bind(event.app_name.as_deref())
+    .bind(event.app_pid)
+    .bind(event.window_title.as_deref())
+    .bind(event.browser_url.as_deref())
+    .bind(event.element_role.as_deref())
+    .bind(event.element_name.as_deref())
+    .bind(event.element_value.as_deref())
+    .bind(event.element_description.as_deref())
+    .bind(event.element_automation_id.as_deref())
+    .bind(event.element_bounds.as_deref())
+    .bind(event.frame_id)
+    .execute(&mut **conn)
+    .await?;
+
+    Ok(result.last_insert_rowid())
+}
+
 fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
     let err_str = error.to_string();
     for pw in batch.drain(..) {
-        let _ = pw
-            .respond
-            .send(Err(sqlx::Error::Protocol(err_str.clone().into())));
+        let _ = pw.respond.send(Err(sqlx::Error::Protocol(err_str.clone())));
     }
     // Log the original error that caused the batch failure
     error!("write_queue: batch failed: {}", error);
@@ -1365,21 +1518,17 @@ fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
 /// malformed" until the connection is dropped. Treat them as fatal so
 /// the batch loop drops the connection instead of reusing it for
 /// follow-on writes that will all fail in confusing ways.
+#[cfg(test)]
 fn is_fatal_sqlite_message(msg_lower: &str) -> bool {
-    msg_lower.contains("disk i/o error") || msg_lower.contains("malformed")
+    crate::sqlite_error::is_fatal_sqlite_message(msg_lower)
 }
 
 fn is_connection_error(e: &sqlx::Error) -> bool {
-    if matches!(
-        e,
-        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut
-    ) {
-        return true;
-    }
-    if let sqlx::Error::Database(db) = e {
-        return is_fatal_sqlite_message(&db.message().to_lowercase());
-    }
-    false
+    crate::sqlite_error::is_sqlite_connection_error(e)
+}
+
+fn should_recycle_sqlite_connection(e: &sqlx::Error) -> bool {
+    crate::sqlite_error::should_recycle_sqlite_connection(e)
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
@@ -1393,12 +1542,104 @@ fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
 }
 
 fn is_busy_error(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::Database(db_err) => {
-            let msg = db_err.message().to_lowercase();
-            msg.contains("database is locked") || msg.contains("database table is locked")
+    crate::sqlite_error::is_sqlite_busy_error(e)
+}
+
+/// SQLITE_CANTOPEN — "unable to open database file". At runtime this means the
+/// data dir/file vanished out from under an open pool (deleted folder, etc.).
+fn is_cantopen_error(e: &sqlx::Error) -> bool {
+    crate::sqlite_error::is_sqlite_cantopen_error(e)
+}
+
+/// Ensure the database file's parent directory exists.
+///
+/// Fixes "unable to open database file" (SQLITE_CANTOPEN): a missing parent dir
+/// fails every open. Called at startup (`create_tree = true`, builds the whole
+/// path for fresh installs) and from the write_queue's runtime recovery
+/// (`create_tree = false`). Skips in-memory DBs. Returns true if it created the
+/// directory.
+///
+/// Runtime recovery is mountpoint-safe: when the whole tree is gone (the
+/// grandparent is also missing — the signature of an unmounted volume) it does
+/// nothing, so we never shadow a mountpoint with a stray local dir when the
+/// volume returns. It only heals the recoverable case: a single deleted dir
+/// whose parent still exists.
+pub(crate) fn ensure_db_parent_dir(database_path: &str, create_tree: bool) -> bool {
+    if database_path.contains(":memory:") {
+        return false;
+    }
+    let parent = match std::path::Path::new(database_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    if parent.exists() {
+        return false;
+    }
+    if !create_tree {
+        if let Some(gp) = parent.parent() {
+            if !gp.as_os_str().is_empty() && !gp.exists() {
+                warn!(
+                    "db: parent tree of {} is gone (likely unmounted volume); not recreating",
+                    parent.display()
+                );
+                return false;
+            }
         }
-        _ => false,
+    }
+    match std::fs::create_dir_all(parent) {
+        Ok(_) => {
+            warn!("db: created missing parent dir {}", parent.display());
+            true
+        }
+        Err(e) => {
+            warn!(
+                "db: failed to create parent dir {}: {}",
+                parent.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Make the database openable again after the data dir/file vanished mid-run
+/// (the SQLITE_CANTOPEN runtime recovery). Recreates the parent dir
+/// (mountpoint-safe, via [`ensure_db_parent_dir`]) AND an empty db file —
+/// recreating the dir alone is not enough because the write pool opens with
+/// `create_if_missing = false`, so a fresh `acquire()` against a missing file
+/// would CANTOPEN again.
+///
+/// The recreated db is **empty**: the schema is restored by migrations on the
+/// next startup. This only clears CANTOPEN so the pool can reconnect instead of
+/// erroring every queued write; it does not recover the lost rows.
+///
+/// Returns true if the db file exists (is openable) afterward. In-memory DBs are
+/// always openable. Stays mountpoint-safe: if `ensure_db_parent_dir` declined to
+/// recreate the dir (e.g. unmounted volume), the file is not created either.
+async fn ensure_db_openable(db_path: &str) -> bool {
+    if db_path.contains(":memory:") {
+        return true;
+    }
+    ensure_db_parent_dir(db_path, false);
+    // Only recreate the file if the parent dir actually exists now —
+    // ensure_db_parent_dir is mountpoint-safe and may have intentionally
+    // skipped recreation (don't shadow an unmounted volume with a stray file).
+    match std::path::Path::new(db_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() && !p.exists() => return false,
+        _ => {}
+    }
+    let connection_string = format!("sqlite:{}", db_path);
+    // create_database opens with create_if_missing(true) then closes; it is a
+    // no-op (does not truncate) if the file already exists.
+    match sqlx::Sqlite::create_database(&connection_string).await {
+        Ok(_) => {
+            warn!("db: recreated empty database file {}", db_path);
+            true
+        }
+        Err(e) => {
+            warn!("db: failed to recreate database file {}: {}", db_path, e);
+            false
+        }
     }
 }
 
@@ -1408,6 +1649,79 @@ fn is_busy_error(e: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn ensure_db_parent_dir_creates_and_is_mountpoint_safe() {
+        let base = std::env::temp_dir().join(format!("sp_wq_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = base.join("a/b/db.sqlite");
+        // create_tree builds the whole missing path (fresh install)
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), true));
+        assert!(db.parent().unwrap().exists());
+        // runtime recovery heals a single deleted dir whose parent still exists
+        std::fs::remove_dir_all(base.join("a/b")).unwrap();
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), false));
+        // mountpoint-safe: whole tree gone + runtime mode => no-op (don't shadow)
+        std::fs::remove_dir_all(&base).unwrap();
+        let deep = base.join("gone/db.sqlite");
+        assert!(!ensure_db_parent_dir(&deep.to_string_lossy(), false));
+        assert!(!base.exists());
+        // in-memory is always skipped
+        assert!(!ensure_db_parent_dir("sqlite::memory:", true));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression for SCREENPIPE-CLI-HA: after the data dir/file vanishes
+    /// mid-run, the runtime recovery must make a *fresh* connection openable
+    /// again. Recreating the parent dir alone is NOT enough — the write pool
+    /// opens with create_if_missing=false, so the file must be recreated too.
+    #[tokio::test]
+    async fn ensure_db_openable_recreates_file_and_clears_cantopen() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use sqlx::{ConnectOptions, Connection};
+
+        let base = std::env::temp_dir().join(format!("sp_wq_cantopen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let conn_str = format!("sqlite:{}", db_path_str);
+
+        // prod-like options (mirror db.rs): NO create_if_missing => default false
+        let opts: SqliteConnectOptions = conn_str.parse().unwrap();
+
+        // file exists -> opens fine
+        sqlx::Sqlite::create_database(&conn_str).await.unwrap();
+        opts.clone().connect().await.unwrap().close().await.unwrap();
+
+        // data dir vanishes mid-run
+        std::fs::remove_dir_all(&dir).unwrap();
+        // precondition: a fresh open now CANTOPENs (the bug)
+        assert!(opts.clone().connect().await.is_err());
+
+        // recovery: must recreate dir AND file so a fresh open succeeds
+        assert!(ensure_db_openable(&db_path_str).await);
+        assert!(db_path.exists(), "recovery must recreate the db file");
+        opts.clone()
+            .connect()
+            .await
+            .expect("fresh connection must open after recovery")
+            .close()
+            .await
+            .unwrap();
+
+        // mountpoint-safe: whole tree gone (unmounted volume) => no file created
+        std::fs::remove_dir_all(&base).unwrap();
+        let on_volume = base.join("vol/db.sqlite");
+        assert!(!ensure_db_openable(&on_volume.to_string_lossy()).await);
+        assert!(!base.exists(), "must not shadow an unmounted volume");
+
+        // in-memory is always openable
+        assert!(ensure_db_openable("sqlite::memory:").await);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     async fn setup_test_db() -> (Pool<Sqlite>, Arc<Semaphore>) {
         let pool = SqlitePoolOptions::new()
@@ -1420,7 +1734,11 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS audio_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                transcription_status TEXT NOT NULL DEFAULT 'pending',
+                transcription_attempts INTEGER NOT NULL DEFAULT 0,
+                last_transcription_attempt_at TIMESTAMP,
+                transcription_failure_reason TEXT
             )",
         )
         .execute(&pool)
@@ -1509,7 +1827,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunk {
@@ -1535,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_coalescing() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Submit many writes concurrently — they should be batched
         let mut handles = Vec::new();
@@ -1569,7 +1887,7 @@ mod tests {
     #[tokio::test]
     async fn test_ordering_chunk_before_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Insert chunk first
         let chunk_result = queue
@@ -1618,7 +1936,7 @@ mod tests {
     #[tokio::test]
     async fn test_combined_chunk_and_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1671,7 +1989,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1707,7 +2025,7 @@ mod tests {
     #[tokio::test]
     async fn test_video_chunk_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertVideoChunkWithFps {
@@ -1733,7 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_frame_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertSnapshotFrameWithOcr {
@@ -1775,7 +2093,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mixed_writes() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let mut handles = Vec::new();
 
@@ -1826,7 +2144,12 @@ mod tests {
         let queue = WriteQueue { tx };
 
         let pool_clone = pool.clone();
-        let handle = tokio::spawn(drain_loop(rx, pool_clone, sem));
+        let handle = tokio::spawn(drain_loop(
+            rx,
+            pool_clone,
+            sem,
+            std::sync::Arc::from("sqlite::memory:"),
+        ));
 
         // Submit a write
         let result = queue
@@ -1859,7 +2182,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1927,6 +2250,22 @@ mod tests {
         assert!(is_connection_error(&sqlx::Error::PoolTimedOut));
         assert!(is_connection_error(&sqlx::Error::Io(
             std::io::Error::other("broken pipe")
+        )));
+    }
+
+    #[test]
+    fn sqlite_connection_recycle_classifies_begin_and_acquire_failures() {
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 522) disk i/o error".into()
+        )));
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 11) database disk image is malformed".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "database is locked".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "no such table: foo".into()
         )));
     }
 

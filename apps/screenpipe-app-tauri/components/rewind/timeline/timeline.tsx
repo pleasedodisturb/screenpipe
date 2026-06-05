@@ -1491,6 +1491,12 @@ export const TimelineSlider = ({
 								dir="rtl"
 								style={{
 									// borderLeft removed — caused visible white lines between groups
+									cursor: "pointer",
+								}}
+								onClick={(e) => {
+									const rect = e.currentTarget.getBoundingClientRect();
+									setPopoverAnchor({ x: rect.left + rect.width / 2, y: rect.top });
+									setActivePopoverGroup(activePopoverGroup === groupIndex ? null : groupIndex);
 								}}
 							>
 								{/* Vertical stacked icons - favicons for browser groups, app icons otherwise */}
@@ -1658,6 +1664,8 @@ export const TimelineSlider = ({
 										<motion.div
 											key={`${frame.timestamp}-${frameIdx}`}
 											data-timestamp={frame.timestamp}
+											data-frame-id={frameId || undefined}
+											data-current={isCurrent ? "true" : undefined}
 											data-selected={isSelected || isInRange ? "true" : undefined}
 											className={cn(
 												"flex-shrink-0 cursor-ew-resize rounded-t relative hover:z-50 transition-all duration-200",
