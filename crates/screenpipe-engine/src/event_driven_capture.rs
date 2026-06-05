@@ -1818,10 +1818,31 @@ async fn do_capture(
         config.walk_timeout_override = Some(decision.timeout);
     }
 
-    let tree_walk_result = tokio::task::spawn_blocking(move || {
-        screenpipe_capture::paired_capture::walk_accessibility_tree(&config)
-    })
-    .await?;
+    // DISABLED: walking a Chromium/Electron app's AX tree makes the renderer
+    // enter accessibility mode, and when screenpipe disconnects (process exit or
+    // Ctrl+C) Chromium REPLAYS recently typed text into the focused field — the
+    // phantom-keystroke / on-close duplication bug (type "abcd", quit screenpipe,
+    // the focused field gains "bcdbcdbcd"). The poke is not the cause: even with
+    // AXEnhancedUserInterface never set, descending into the AXWebArea is enough
+    // to trip it. This walk was wired into the `record` capture path in c50423318
+    // (2026-05-22) — exactly when the duplication started; before that, `record`
+    // captured via OCR only and there was no phantom.
+    //
+    // Returning NotFound makes every frame fall through to the OCR safety net
+    // below — the pre-c50423318 behavior. Skipping only Chromium/Electron would
+    // keep native-app a11y, but missing a single Electron app re-triggers the bug
+    // (most desktop apps are Electron: Discord, Slack, Obsidian, VS Code, Hyper…),
+    // so we disable the deep walk outright. Re-enable only once Chromium stops
+    // replaying input on assistive-tech disconnect.
+    const AX_TREE_WALK_ENABLED: bool = false;
+    let tree_walk_result = if AX_TREE_WALK_ENABLED {
+        tokio::task::spawn_blocking(move || {
+            screenpipe_capture::paired_capture::walk_accessibility_tree(&config)
+        })
+        .await?
+    } else {
+        TreeWalkResult::NotFound
+    };
 
     // If the window was skipped (incognito/private browsing or user filter),
     // bail out entirely — don't OCR the screenshot.
