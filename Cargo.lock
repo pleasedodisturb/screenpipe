@@ -8101,6 +8101,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "rusqlite",
+ "screenpipe-config",
  "screenpipe-core",
  "screenpipe-db",
  "serde",
