@@ -4334,6 +4334,10 @@ impl PipeManager {
                 "meeting-summary",
                 include_str!("../../assets/pipes/meeting-summary/pipe.md"),
             ),
+            (
+                "follow-ups",
+                include_str!("../../assets/pipes/follow-ups/pipe.md"),
+            ),
         ];
 
         let tombstones = read_tombstones(&self.pipes_dir);
