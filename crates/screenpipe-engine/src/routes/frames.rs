@@ -752,6 +752,20 @@ pub struct FrameTextQuery {
     pub query: Option<String>,
 }
 
+/// Scrub PII from served OCR / accessibility text positions when PII removal is
+/// enabled. Bounds and confidence are left untouched.
+fn redact_text_positions(
+    mut positions: Vec<TextPosition>,
+    use_pii_removal: bool,
+) -> Vec<TextPosition> {
+    if use_pii_removal {
+        for p in &mut positions {
+            p.text = screenpipe_core::pii_removal::remove_pii(&p.text);
+        }
+    }
+    positions
+}
+
 /// Get OCR text positions with bounding boxes for a specific frame.
 /// Falls back to accessibility tree node bounds when no OCR data exists.
 /// Both OCR and accessibility bounds are normalized to 0-1 relative to the
@@ -859,7 +873,7 @@ pub async fn get_frame_text_data(
 
     Ok(JsonResponse(FrameTextResponse {
         frame_id,
-        text_positions,
+        text_positions: redact_text_positions(text_positions, state.use_pii_removal),
     }))
 }
 
@@ -877,7 +891,7 @@ pub async fn run_frame_ocr(
         Ok(existing) if !existing.is_empty() => {
             return Ok(JsonResponse(FrameTextResponse {
                 frame_id,
-                text_positions: existing,
+                text_positions: redact_text_positions(existing, state.use_pii_removal),
             }));
         }
         _ => {}
@@ -1011,7 +1025,7 @@ pub async fn run_frame_ocr(
 
     Ok(JsonResponse(FrameTextResponse {
         frame_id,
-        text_positions,
+        text_positions: redact_text_positions(text_positions, state.use_pii_removal),
     }))
 }
 
@@ -1139,3 +1153,39 @@ pub use super::content::FrameContent;
 
 /// extract_high_quality_frame re-export for video export
 pub use crate::video_utils::extract_high_quality_frame as extract_hq_frame;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pos(text: &str) -> TextPosition {
+        TextPosition {
+            text: text.to_string(),
+            confidence: 0.9,
+            bounds: screenpipe_db::TextBounds {
+                left: 0.1,
+                top: 0.2,
+                width: 0.3,
+                height: 0.05,
+            },
+        }
+    }
+
+    #[test]
+    fn test_redact_text_positions_scrubs_text_when_enabled() {
+        let input = vec![pos("email john@example.com"), pos("plain text")];
+
+        let redacted = redact_text_positions(input.clone(), true);
+        // PII in the OCR text is scrubbed...
+        assert!(!redacted[0].text.contains("john@example.com"));
+        // ...non-PII text is left alone...
+        assert_eq!(redacted[1].text, "plain text");
+        // ...and bounds/confidence are untouched.
+        assert_eq!(redacted[0].confidence, 0.9);
+        assert_eq!(redacted[0].bounds.left, 0.1);
+
+        // Disabled → passthrough, nothing scrubbed.
+        let untouched = redact_text_positions(input, false);
+        assert_eq!(untouched[0].text, "email john@example.com");
+    }
+}
