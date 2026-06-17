@@ -113,6 +113,7 @@ import {
   validatePresetName,
   validateUrl,
   validateApiKey,
+  isPrivateOrLocalhostUrl,
   debounce,
   FieldValidationResult
 } from "@/lib/utils/validation";
@@ -130,16 +131,6 @@ const formatPresetName = (name: string): string => {
     return `Preset ${name.slice(0, 8)}...`;
   }
   return name;
-};
-
-const isLocalhostUrl = (url?: string): boolean => {
-  if (!url) return false;
-  try {
-    const hostname = new URL(url).hostname.toLowerCase();
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
-  } catch {
-    return false;
-  }
 };
 
 type DiagnosticStatus = "pass" | "fail" | "skip" | "pending" | "running";
@@ -680,7 +671,7 @@ const AISection = ({
     } else {
       // Local custom providers often do not implement browser CORS preflight on /models.
       const modelsFetchFn =
-        settingsPreset?.provider === "custom" && isLocalhostUrl(settingsPreset?.url)
+        settingsPreset?.provider === "custom" && isPrivateOrLocalhostUrl(settingsPreset?.url)
           ? tauriFetch
           : fetch;
       try {
@@ -956,7 +947,7 @@ const AISection = ({
           break;
         case "custom":
           try {
-            const customFetchFn = isLocalhostUrl(settingsPreset?.url) ? tauriFetch : fetch;
+            const customFetchFn = isPrivateOrLocalhostUrl(settingsPreset?.url) ? tauriFetch : fetch;
             const customResponse = await customFetchFn(
               `${settingsPreset?.url}/models`,
               {

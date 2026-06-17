@@ -271,6 +271,53 @@ export const validatePresetName = (name: string, visiblePresets: AIPreset[], cur
   return { isValid: true };
 };
 
+// Detect URLs that point at the local machine or a private/LAN network.
+// These endpoints (localhost, RFC1918 ranges, link-local, .local mDNS) usually
+// don't implement browser CORS preflight, so connection tests must route through
+// Tauri's native HTTP client instead of the webview `fetch` to avoid CORS failures.
+export const isPrivateOrLocalhostUrl = (url?: string): boolean => {
+  if (!url) return false;
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+
+  // Loopback + mDNS / single-label LAN hostnames (e.g. "my-nas", "ollama.local")
+  if (
+    hostname === "localhost" ||
+    hostname === "::1" ||
+    hostname.endsWith(".localhost") ||
+    hostname.endsWith(".local") ||
+    !hostname.includes(".") // bare hostname with no domain → LAN
+  ) {
+    return true;
+  }
+
+  // IPv6 literals are bracket-stripped by URL.hostname; check ULA (fc00::/7)
+  // and link-local (fe80::/10) prefixes.
+  if (hostname.includes(":")) {
+    return /^f[cd]/.test(hostname) || /^fe[89ab]/.test(hostname);
+  }
+
+  // IPv4 private + loopback + link-local ranges.
+  const octets = hostname.split(".");
+  if (
+    octets.length === 4 &&
+    octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255)
+  ) {
+    const [a, b] = octets.map(Number);
+    if (a === 127) return true; // 127.0.0.0/8 loopback
+    if (a === 10) return true; // 10.0.0.0/8
+    if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+    if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  }
+
+  return false;
+};
+
 // URL validation
 export const validateUrl = (url: string): FieldValidationResult => {
   if (!url.trim()) {
