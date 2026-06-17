@@ -1015,10 +1015,16 @@ fn ensure_screenpipe_skill(project_dir: &str) -> Result<(), String> {
 }
 
 /// Ensure the web-search extension exists in the project's .pi/extensions directory
-/// Install or remove the web-search extension based on provider.
-/// Web search uses the screenpipe cloud backend (Gemini + Google Search),
-/// so we only enable it for screenpipe-cloud presets to avoid sending
-/// user data to our backend when they chose a local/custom provider.
+/// Install the web-search extension based on provider.
+///
+/// Web search uses the screenpipe cloud backend (Gemini + Google Search), so
+/// the real tool only works for screenpipe-cloud presets. For other providers
+/// (OpenAI / Anthropic / Ollama / custom) we install a stub variant of the same
+/// tool that makes NO network call and instead returns a clear message telling
+/// the user to switch to the screenpipe-cloud preset. This both preserves the
+/// privacy guarantee (no user data sent to our backend when they chose a
+/// local/custom provider) and avoids the confusing "the assistant just can't
+/// search and won't say why" behavior reported in #4177.
 fn ensure_web_search_extension(
     project_dir: &str,
     provider_config: Option<&PiProviderConfig>,
@@ -1033,21 +1039,22 @@ fn ensure_web_search_extension(
         None => true, // default preset = screenpipe cloud
     };
 
+    std::fs::create_dir_all(&ext_dir)
+        .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
+
+    let ext_content = if is_screenpipe_cloud {
+        include_str!("../assets/extensions/web-search.ts")
+    } else {
+        include_str!("../assets/extensions/web-search-unavailable.ts")
+    };
+    std::fs::write(&ext_path, ext_content)
+        .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
+
     if is_screenpipe_cloud {
-        std::fs::create_dir_all(&ext_dir)
-            .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
-
-        let ext_content = include_str!("../assets/extensions/web-search.ts");
-        std::fs::write(&ext_path, ext_content)
-            .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
-
         debug!("Web search extension installed at {:?}", ext_path);
-    } else if ext_path.exists() {
-        std::fs::remove_file(&ext_path)
-            .map_err(|e| format!("Failed to remove web-search extension: {}", e))?;
-
+    } else {
         info!(
-            "Web search extension removed (provider {:?} is not screenpipe-cloud)",
+            "Web search stub installed (provider {:?} is not screenpipe-cloud)",
             provider_config.map(|c| &c.provider)
         );
     }
@@ -2641,8 +2648,7 @@ fn write_pi_settings(settings: &serde_json::Value) -> Result<(), String> {
     let settings_path = get_pi_config_dir()?.join("settings.json");
     let s = serde_json::to_string_pretty(settings)
         .map_err(|e| format!("Failed to serialize settings: {}", e))?;
-    std::fs::write(&settings_path, s)
-        .map_err(|e| format!("Failed to write settings.json: {}", e))
+    std::fs::write(&settings_path, s).map_err(|e| format!("Failed to write settings.json: {}", e))
 }
 
 fn read_pi_settings() -> Result<serde_json::Value, String> {
@@ -2676,7 +2682,10 @@ pub async fn pi_set_thinking_level(
         ));
     }
 
-    info!("pi_set_thinking_level: session={:?} level={}", session_id, level);
+    info!(
+        "pi_set_thinking_level: session={:?} level={}",
+        session_id, level
+    );
 
     // Always persist — Pi reads this on startup, so changing before a conversation works.
     // Pi also re-writes the clamped value after handling the RPC, which wins.
@@ -2690,18 +2699,31 @@ pub async fn pi_set_thinking_level(
     if let Some(ref sid) = session_id {
         let queue_opt = {
             let mut pool = state.0.lock().await;
-            pool.sessions
-                .get_mut(sid.as_str())
-                .and_then(|m| if m.is_running() { m.queue_handle.clone() } else { None })
+            pool.sessions.get_mut(sid.as_str()).and_then(|m| {
+                if m.is_running() {
+                    m.queue_handle.clone()
+                } else {
+                    None
+                }
+            })
         };
         if let Some(queue) = queue_opt {
             let cmd = json!({ "type": "set_thinking_level", "level": &level });
             match queue.send_immediate(cmd).await {
-                Ok(()) => info!("pi_set_thinking_level RPC sent ok: session={} level={}", sid, level),
-                Err(e) => warn!("pi_set_thinking_level RPC failed: session={} level={} err={}", sid, level, e),
+                Ok(()) => info!(
+                    "pi_set_thinking_level RPC sent ok: session={} level={}",
+                    sid, level
+                ),
+                Err(e) => warn!(
+                    "pi_set_thinking_level RPC failed: session={} level={} err={}",
+                    sid, level, e
+                ),
             }
         } else {
-            info!("pi_set_thinking_level: session {} not running, saved to settings.json only", sid);
+            info!(
+                "pi_set_thinking_level: session {} not running, saved to settings.json only",
+                sid
+            );
         }
     }
 
@@ -2710,21 +2732,38 @@ pub async fn pi_set_thinking_level(
 
 #[tauri::command]
 #[specta::specta]
-pub async fn pi_request_state(
-    state: State<'_, PiState>,
-    session_id: String,
-) -> Result<(), String> {
+pub async fn pi_request_state(state: State<'_, PiState>, session_id: String) -> Result<(), String> {
     info!("pi_request_state: session={}", session_id);
     let queue = {
         let mut pool = state.0.lock().await;
         pool.sessions
             .get_mut(session_id.as_str())
-            .and_then(|m| if m.is_running() { m.queue_handle.clone() } else { None })
-            .ok_or_else(|| format!("pi_request_state: session {} not found or not running", session_id))?
+            .and_then(|m| {
+                if m.is_running() {
+                    m.queue_handle.clone()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                format!(
+                    "pi_request_state: session {} not found or not running",
+                    session_id
+                )
+            })?
     };
     match queue.send_immediate(json!({ "type": "get_state" })).await {
-        Ok(()) => { info!("pi_request_state RPC sent ok: session={}", session_id); Ok(()) }
-        Err(e) => { warn!("pi_request_state RPC failed: session={} err={}", session_id, e); Err(e) }
+        Ok(()) => {
+            info!("pi_request_state RPC sent ok: session={}", session_id);
+            Ok(())
+        }
+        Err(e) => {
+            warn!(
+                "pi_request_state RPC failed: session={} err={}",
+                session_id, e
+            );
+            Err(e)
+        }
     }
 }
 
@@ -3699,6 +3738,80 @@ error: InstallFailed extracting tarball"#;
             max_tokens: 4096,
             system_prompt: None,
         }
+    }
+
+    fn read_web_search_ext(project_dir: &std::path::Path) -> String {
+        std::fs::read_to_string(project_dir.join(".pi/extensions/web-search.ts"))
+            .expect("web-search extension should exist")
+    }
+
+    #[test]
+    fn test_web_search_ext_cloud_installs_real_backend() {
+        for provider in ["screenpipe-cloud", "pi"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pc = make_provider_config(provider, "auto");
+            super::ensure_web_search_extension(dir.path().to_str().unwrap(), Some(&pc))
+                .expect("ensure web search ext");
+            let content = read_web_search_ext(dir.path());
+            // Real extension calls the cloud search backend.
+            assert!(
+                content.contains("https://api.screenpipe.com/v1/web-search"),
+                "provider {provider} should get the real cloud web-search extension"
+            );
+        }
+    }
+
+    #[test]
+    fn test_web_search_ext_default_preset_installs_real_backend() {
+        // No provider config = default screenpipe-cloud preset.
+        let dir = tempfile::tempdir().expect("tempdir");
+        super::ensure_web_search_extension(dir.path().to_str().unwrap(), None)
+            .expect("ensure web search ext");
+        let content = read_web_search_ext(dir.path());
+        assert!(content.contains("https://api.screenpipe.com/v1/web-search"));
+    }
+
+    #[test]
+    fn test_web_search_ext_non_cloud_installs_offline_stub() {
+        // The #4177 fix: non-cloud providers get a stub that explains the tool
+        // needs screenpipe-cloud, instead of the tool silently disappearing.
+        for provider in ["openai", "anthropic", "native-ollama", "custom"] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pc = make_provider_config(provider, "some-model");
+            super::ensure_web_search_extension(dir.path().to_str().unwrap(), Some(&pc))
+                .expect("ensure web search ext");
+            let content = read_web_search_ext(dir.path());
+            // Tool is still registered under the same name...
+            assert!(content.contains("sp_web_search"));
+            // ...but points the user at screenpipe-cloud...
+            assert!(
+                content.contains("screenpipe-cloud"),
+                "stub for {provider} should mention screenpipe-cloud"
+            );
+            // ...and makes NO network call (privacy guarantee preserved).
+            assert!(
+                !content.contains("fetch(") && !content.contains("api.screenpipe.com"),
+                "stub for {provider} must not make any network request"
+            );
+        }
+    }
+
+    #[test]
+    fn test_web_search_ext_switching_providers_overwrites() {
+        // Switching cloud -> non-cloud (and back) must swap the extension content,
+        // not leave a stale real extension that would send data to the backend.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_str().unwrap();
+
+        let cloud = make_provider_config("screenpipe-cloud", "auto");
+        super::ensure_web_search_extension(path, Some(&cloud)).unwrap();
+        assert!(read_web_search_ext(dir.path()).contains("api.screenpipe.com"));
+
+        let local = make_provider_config("native-ollama", "llama3");
+        super::ensure_web_search_extension(path, Some(&local)).unwrap();
+        let after = read_web_search_ext(dir.path());
+        assert!(!after.contains("api.screenpipe.com"));
+        assert!(after.contains("screenpipe-cloud"));
     }
 
     #[tokio::test]
