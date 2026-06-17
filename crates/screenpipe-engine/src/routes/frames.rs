@@ -11,7 +11,7 @@ use axum::{
 use oasgen::{oasgen, OaSchema};
 
 use chrono::{DateTime, Utc};
-use screenpipe_core::pii_removal::detect_pii_regions;
+use screenpipe_core::pii_removal::{detect_pii_regions, remove_pii};
 use screenpipe_db::TextPosition;
 
 use image::GenericImageView;
@@ -547,6 +547,24 @@ pub struct FrameContextResponse {
     pub text_source: String,
 }
 
+/// Redact PII from an accessibility node's text and its string-valued
+/// properties (e.g. `value`, `help_text`, `placeholder`). Coordinates and
+/// non-string properties are left untouched. Used when `use_pii_removal` is on.
+fn redact_node_pii(mut node: AccessibilityNode) -> AccessibilityNode {
+    node.text = remove_pii(&node.text);
+    if let Some(serde_json::Value::Object(props)) = node.properties.take() {
+        let redacted = props
+            .into_iter()
+            .map(|(k, v)| match v {
+                serde_json::Value::String(s) => (k, serde_json::Value::String(remove_pii(&s))),
+                other => (k, other),
+            })
+            .collect();
+        node.properties = Some(serde_json::Value::Object(redacted));
+    }
+    node
+}
+
 /// Get frame context: accessibility text, tree nodes, and extracted URLs.
 /// Falls back to OCR data for legacy frames without accessibility data.
 #[oasgen]
@@ -659,9 +677,20 @@ pub async fn get_frame_context(
             }
         }
 
+        // Redact PII from served text + nodes when PII removal is enabled.
+        // (URLs are extracted above, before redaction, so links still resolve.)
+        let (text, nodes) = if state.use_pii_removal {
+            (
+                a11y_text.map(|t| remove_pii(&t)),
+                nodes.into_iter().map(redact_node_pii).collect(),
+            )
+        } else {
+            (a11y_text, nodes)
+        };
+
         return Ok(JsonResponse(FrameContextResponse {
             frame_id,
-            text: a11y_text,
+            text,
             nodes,
             urls,
             text_source: "accessibility".to_string(),
@@ -695,6 +724,12 @@ pub async fn get_frame_context(
             }
         }
     }
+
+    let text = if state.use_pii_removal {
+        text.map(|t| remove_pii(&t))
+    } else {
+        text
+    };
 
     Ok(JsonResponse(FrameContextResponse {
         frame_id,
@@ -1139,3 +1174,54 @@ pub use super::content::FrameContent;
 
 /// extract_high_quality_frame re-export for video export
 pub use crate::video_utils::extract_high_quality_frame as extract_hq_frame;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_node_pii_scrubs_text_and_string_properties() {
+        let mut props = serde_json::Map::new();
+        props.insert(
+            "value".to_string(),
+            serde_json::Value::String("ssn 123-45-6789".to_string()),
+        );
+        props.insert("is_enabled".to_string(), serde_json::Value::Bool(true));
+
+        let node = AccessibilityNode {
+            role: "textfield".to_string(),
+            text: "email me at john@example.com".to_string(),
+            depth: 0,
+            bounds: None,
+            properties: Some(serde_json::Value::Object(props)),
+        };
+
+        let redacted = redact_node_pii(node);
+
+        // text field is scrubbed
+        assert!(!redacted.text.contains("john@example.com"));
+        let props = redacted.properties.expect("properties preserved");
+        // string-valued property is scrubbed
+        let value = props.get("value").and_then(|v| v.as_str()).unwrap();
+        assert!(!value.contains("123-45-6789"));
+        // non-string property is left untouched
+        assert_eq!(
+            props.get("is_enabled"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn test_redact_node_pii_no_properties_is_noop_on_clean_text() {
+        let node = AccessibilityNode {
+            role: "button".to_string(),
+            text: "Submit".to_string(),
+            depth: 1,
+            bounds: None,
+            properties: None,
+        };
+        let redacted = redact_node_pii(node);
+        assert_eq!(redacted.text, "Submit");
+        assert!(redacted.properties.is_none());
+    }
+}
