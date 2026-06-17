@@ -664,6 +664,11 @@ mod tests {
         // "tv" is matched exactly — apps merely containing "tv" must not be flagged.
         assert!(!is_drm_app("Plex TV"));
         assert!(!is_drm_app("DevTools"));
+        // App/tab names that merely end in "tv" must not match (review feedback):
+        // is_drm_app is called on the app/owner name, and only the bare native
+        // Apple TV app reports its name as exactly "TV".
+        assert!(!is_drm_app("Tella TV"));
+        assert!(!is_drm_app("screenpipe tv"));
     }
 
     #[test]
