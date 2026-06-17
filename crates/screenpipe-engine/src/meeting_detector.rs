@@ -513,8 +513,14 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     "gotomeeting.exe",
                 ],
                 browser_url_patterns: &[
+                    // Public Jitsi host. NOTE: a bare "jitsi" substring used to
+                    // live here too, but it matched any URL containing the word
+                    // (e.g. github.com/jitsi/jitsi-meet), making the browser a
+                    // meeting candidate and letting an unrelated tab's "Leave"
+                    // button fire a phantom meeting (#4246). Self-hosted Jitsi on
+                    // a custom domain is no longer auto-detected by hostname; the
+                    // public service still is.
                     "meet.jit.si",
-                    "jitsi",
                     "riverside.fm",
                     "gather.town",
                     "app.gather.town",
@@ -2092,6 +2098,14 @@ fn contains_normalized_term(haystack: &str, term_lower: &str) -> bool {
     haystack.to_lowercase().contains(term_lower)
 }
 
+/// Return the part of a URL before the query string (`?`) and fragment (`#`).
+/// Meeting URL patterns are host/path shaped, so matching should ignore params:
+/// `https://x.com/p?to=meet.google.com` is an unrelated page, not a Meet call.
+fn url_without_query_or_fragment(url: &str) -> &str {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    &url[..end]
+}
+
 fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -2278,11 +2292,16 @@ fn has_browser_meeting_url(pid: i32, url_patterns: &[&str]) -> bool {
             let window = &windows[i];
             let _ = window.set_messaging_timeout_secs(0.2);
 
-            // Primary: check AXDocument attribute (actual page URL, most reliable)
+            // Primary: check AXDocument attribute (actual page URL, most reliable).
+            // Match only against the scheme+host+path, never the query/fragment:
+            // a meeting URL carried as a `?redirect=…` / `#…` parameter on an
+            // unrelated page is not the page you're on, and matching it makes the
+            // browser a phantom meeting candidate (#4246).
             if let Some(doc) = get_ax_string_attr(window, cidre::ax::attr::document()) {
+                let doc_for_match = url_without_query_or_fragment(&doc);
                 if url_patterns
                     .iter()
-                    .any(|p| contains_case_insensitive(&doc, p))
+                    .any(|p| contains_case_insensitive(doc_for_match, p))
                 {
                     return true;
                 }
@@ -4279,6 +4298,82 @@ mod tests {
                  (regression of the cal.com false-positive class)"
             );
         }
+    }
+
+    #[test]
+    fn test_generic_profile_jitsi_is_host_qualified() {
+        // #4246: a bare "jitsi" substring matched any URL containing the word
+        // (e.g. github.com/jitsi/...), making the browser a phantom meeting
+        // candidate. Lock in that only the public host pattern remains.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        assert!(
+            !patterns.contains(&"jitsi"),
+            "bare 'jitsi' substring must not be a URL pattern (matches unrelated URLs like github.com/jitsi/...)"
+        );
+        assert!(
+            patterns.contains(&"meet.jit.si"),
+            "the public Jitsi host pattern must remain"
+        );
+    }
+
+    #[test]
+    fn test_generic_profile_rejects_jitsi_in_unrelated_url() {
+        // Concrete #4246 regression set: ordinary browsing that contains the
+        // word "jitsi" (or is just an unrelated page) must NOT match.
+        let profile = generic_profile();
+        let patterns = profile.app_identifiers.browser_url_patterns;
+        for url in [
+            "https://github.com/jitsi/jitsi-meet",
+            "https://github.com/screenpipe/screenpipe/issues",
+            "https://news.ycombinator.com/item?id=jitsi",
+        ] {
+            assert!(
+                !url_matches_any_pattern(url, patterns),
+                "unrelated URL {url:?} must NOT match a meeting profile (#4246)"
+            );
+        }
+        // A real Jitsi call URL must still match.
+        assert!(url_matches_any_pattern(
+            "https://meet.jit.si/MyStandupRoom",
+            patterns
+        ));
+    }
+
+    #[test]
+    fn test_url_without_query_or_fragment_strips_params() {
+        assert_eq!(
+            url_without_query_or_fragment("https://x.com/page?ref=meet.google.com/abc"),
+            "https://x.com/page"
+        );
+        assert_eq!(
+            url_without_query_or_fragment("https://meet.google.com/abc-defg-hij#pinned"),
+            "https://meet.google.com/abc-defg-hij"
+        );
+        // No query/fragment → unchanged.
+        assert_eq!(
+            url_without_query_or_fragment("https://zoom.us/j/123"),
+            "https://zoom.us/j/123"
+        );
+    }
+
+    #[test]
+    fn test_meeting_url_in_query_does_not_match_after_stripping() {
+        // A meeting URL carried in a query param (share/redirect link) must not
+        // count as being on that meeting page — this mirrors the AXDocument
+        // matching in `has_browser_meeting_url`.
+        let url = "https://app.example.com/redirect?to=https://meet.google.com/abc-defg-hij";
+        assert!(contains_case_insensitive(url, "meet.google.com"));
+        assert!(!contains_case_insensitive(
+            url_without_query_or_fragment(url),
+            "meet.google.com"
+        ));
+        // The genuine page URL still matches after stripping.
+        let real = "https://meet.google.com/abc-defg-hij?authuser=0";
+        assert!(contains_case_insensitive(
+            url_without_query_or_fragment(real),
+            "meet.google.com"
+        ));
     }
 
     // ── State machine tests ────────────────────────────────────────────
