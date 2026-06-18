@@ -106,6 +106,19 @@ pub struct MeetingDetectionProfile {
     pub call_signals: Vec<CallSignal>,
     /// Minimum number of distinct signals required (typically 1 for leave/hangup).
     pub min_signals_required: usize,
+    /// Top-level window titles whose call signals must be IGNORED, even when they
+    /// match `call_signals`. Matched as exact, case-insensitive, trimmed equality
+    /// against each window's title.
+    ///
+    /// This is a per-window guard (not per-process): signals found in a window
+    /// whose title equals one of these are dropped, but signals in any *other*
+    /// window of the same process still count. It exists for apps that are used
+    /// for both messaging and meetings under one process — most notably Webex,
+    /// whose messaging window is titled exactly `Webex` while a real meeting
+    /// window carries the meeting/space name. Without this guard Webex's
+    /// messaging chrome (e.g. "Leave space"/"Leave team") trips the bare `leave`
+    /// signal and starts a phantom meeting. See issue #4145.
+    pub ignore_window_titles: &'static [&'static str],
 }
 
 /// Load all built-in detection profiles.
@@ -146,6 +159,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Zoom Desktop
         // Note: Zoom on macOS does NOT expose AXWindow — only AXMenuBar.
@@ -218,6 +232,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 CallSignal::KeyboardShortcut("Alt+Q"),
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Google Meet (browser)
         // NOTE: "google meet" removed from url_patterns — it's too broad and matches
@@ -246,6 +261,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 CallSignal::NameContains("leave call"),
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Slack Huddle (browser + desktop)
         MeetingDetectionProfile {
@@ -266,6 +282,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // FaceTime
         MeetingDetectionProfile {
@@ -286,6 +303,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Webex
         MeetingDetectionProfile {
@@ -307,6 +325,13 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            // Webex is used as both a messaging app and a meeting app under one
+            // process. Its messaging window is titled exactly `Webex`; a real
+            // meeting window is titled with the meeting/space name. Drop signals
+            // originating from the bare-`Webex` messaging window so chat chrome
+            // ("Leave space"/"Leave team") never starts a phantom meeting, while
+            // a real meeting window's leave/end signals still count. See #4145.
+            ignore_window_titles: &["webex"],
         },
         // Discord native — macOS.
         // Electron exposes 0 windows on macOS but the app menu bar has
@@ -339,6 +364,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 2,
+            ignore_window_titles: &[],
         },
         // Discord native — Windows.
         // UIA can't express MenuBarItem signals as PropertyConditions
@@ -369,6 +395,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 CallSignal::NameContains("Disconnect"),
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Discord in browser — require BOTH "Voice Connected" bar AND "Disconnect"
         // button. Either alone can appear without being in a call (e.g. seeing other
@@ -388,6 +415,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 2,
+            ignore_window_titles: &[],
         },
         // Signal — voice/video calls
         // macOS: "Signal" app with "End Call" / "Hang Up" button during active calls.
@@ -422,6 +450,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // WhatsApp — voice/video calls
         MeetingDetectionProfile {
@@ -447,6 +476,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Telegram — voice/video calls
         MeetingDetectionProfile {
@@ -473,6 +503,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
         // Generic fallback — catches apps like Skype, Around, Whereby, etc.
         MeetingDetectionProfile {
@@ -568,6 +599,7 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         },
     ]
 }
@@ -700,6 +732,21 @@ impl MeetingUiScanner {
                     let window = &windows[i];
                     let _ = window.set_messaging_timeout_secs(0.3);
 
+                    // Per-window guard: drop signals from a window whose title is
+                    // on the profile's ignore list (e.g. Webex's bare `Webex`
+                    // messaging window). Scoped per-window, so a real meeting
+                    // window of the same process is still scanned. See #4145.
+                    if !profile.ignore_window_titles.is_empty() {
+                        let window_title = get_ax_string_attr(window, cidre::ax::attr::title());
+                        if window_title_is_ignored(window_title.as_deref(), profile) {
+                            debug!(
+                                "meeting scanner: skipping ignored window title {:?} for pid {}",
+                                window_title, pid
+                            );
+                            continue;
+                        }
+                    }
+
                     // Walk this window's AX tree looking for signals
                     walk_for_signals(
                         window,
@@ -765,9 +812,17 @@ impl MeetingUiScanner {
         let scan_timeout = self.scan_timeout;
         let signals = profile.call_signals.clone();
         let min_required = profile.min_signals_required;
+        let ignore_window_titles = profile.ignore_window_titles;
 
         let scan_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            windows_scan_process_uia(pid, &signals, min_required, max_depth, scan_timeout)
+            windows_scan_process_uia(
+                pid,
+                &signals,
+                min_required,
+                max_depth,
+                scan_timeout,
+                ignore_window_titles,
+            )
         }));
 
         let matched_signals = match scan_result {
@@ -1111,6 +1166,41 @@ fn check_signal_match(
     }
 }
 
+/// Per-window guard: should call signals found in a window with this title be
+/// IGNORED?
+///
+/// Returns `true` when `window_title` (trimmed, case-insensitive) is exactly
+/// equal to one of `ignore_titles`. This is the discriminator that separates an
+/// app's messaging window from its meeting window when both live under one
+/// process.
+///
+/// Matching is exact-equality on purpose, not substring: Webex's messaging
+/// window title is *exactly* `Webex`, whereas a real meeting window is titled
+/// with the meeting/space name (e.g. `Project Update Call`, `VHM Calendar
+/// Hold`). A substring check would also drop a meeting whose name happened to
+/// contain "Webex", re-introducing the phantom-vs-real ambiguity. A window with
+/// no readable title (`None`) is never blocked — absence of a title can't prove
+/// it is the messaging window.
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
+fn window_title_is_ignored_titles(window_title: Option<&str>, ignore_titles: &[&str]) -> bool {
+    let Some(title) = window_title else {
+        return false;
+    };
+    let title = title.trim();
+    if title.is_empty() {
+        return false;
+    }
+    ignore_titles
+        .iter()
+        .any(|ignored| title.eq_ignore_ascii_case(ignored.trim()))
+}
+
+/// Profile-scoped convenience over [`window_title_is_ignored_titles`].
+#[cfg(any(target_os = "macos", test))]
+fn window_title_is_ignored(window_title: Option<&str>, profile: &MeetingDetectionProfile) -> bool {
+    window_title_is_ignored_titles(window_title, profile.ignore_window_titles)
+}
+
 /// Optimized signal match using pre-lowercased signal strings and pre-lowercased node fields.
 /// Avoids per-signal and per-node `.to_lowercase()` allocations on the hot path.
 #[cfg(target_os = "macos")]
@@ -1409,6 +1499,7 @@ fn windows_scan_process_uia(
     min_required: usize,
     _max_depth: usize,
     timeout: Duration,
+    profile_ignore_window_titles: &[&str],
 ) -> Result<Vec<String>, String> {
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
@@ -1475,6 +1566,24 @@ fn windows_scan_process_uia(
                 Ok(el) => el,
                 Err(_) => continue,
             };
+
+            // Per-window guard: drop signals from a window whose title is on the
+            // profile's ignore list (e.g. Webex's bare `Webex` messaging window).
+            // Scoped per-window, so a real meeting window of the same process is
+            // still scanned. See #4145.
+            if !profile_ignore_window_titles.is_empty() {
+                let window_title = element.CurrentName().ok().map(|n| n.to_string());
+                if window_title_is_ignored_titles(
+                    window_title.as_deref(),
+                    profile_ignore_window_titles,
+                ) {
+                    debug!(
+                        "meeting scanner (windows): skipping ignored window title {:?} for pid {}",
+                        window_title, pid
+                    );
+                    continue;
+                }
+            }
 
             // Strategy 0: Check root window element name against WindowTitle signals.
             // Zoom on Windows has a window titled "Zoom Meeting" but exposes NO
@@ -3717,6 +3826,7 @@ mod tests {
             },
             call_signals: vec![],
             min_signals_required: 1,
+            ignore_window_titles: &[],
         }
     }
 
@@ -3774,6 +3884,167 @@ mod tests {
             &p,
             &terms
         ));
+    }
+
+    // ── Webex messaging-vs-meeting window-title guard (#4145) ──────────
+    //
+    // Webex runs messaging and meetings under one process. The messaging window
+    // is titled exactly `Webex` and its chrome exposes "Leave space"/"Leave
+    // team" affordances that trip the bare `leave` signal — a phantom meeting.
+    // A real meeting window is titled with the meeting/space name. The
+    // per-window guard drops signals from the bare-`Webex` window while letting
+    // a meeting window's signals through. These tests model that scan decision
+    // without a live AX tree.
+
+    /// The Webex profile as loaded in production.
+    fn webex_profile() -> MeetingDetectionProfile {
+        load_detection_profiles()
+            .into_iter()
+            .find(|p| p.app_identifiers.macos_app_names.contains(&"webex"))
+            .expect("webex profile present")
+    }
+
+    /// True if ANY of the profile's call signals match a single AX node. This is
+    /// the per-node decision the live tree-walk makes; combined with the window
+    /// guard it reproduces the per-window scan outcome.
+    fn any_signal_matches(
+        profile: &MeetingDetectionProfile,
+        role: &str,
+        title: Option<&str>,
+        desc: Option<&str>,
+        identifier: Option<&str>,
+    ) -> bool {
+        profile
+            .call_signals
+            .iter()
+            .any(|s| check_signal_match(s, role, title, desc, identifier))
+    }
+
+    #[test]
+    fn webex_profile_ignores_bare_webex_window_title() {
+        let p = webex_profile();
+        assert_eq!(
+            p.ignore_window_titles,
+            &["webex"],
+            "webex profile must guard the bare `Webex` messaging window"
+        );
+    }
+
+    #[test]
+    fn bare_webex_messaging_window_is_guarded() {
+        let p = webex_profile();
+        // Exact title, plus case/whitespace variants Webex/AX may report.
+        assert!(window_title_is_ignored(Some("Webex"), &p));
+        assert!(window_title_is_ignored(Some("webex"), &p));
+        assert!(window_title_is_ignored(Some("  Webex  "), &p));
+    }
+
+    #[test]
+    fn real_webex_meeting_window_is_not_guarded() {
+        let p = webex_profile();
+        // Real meeting windows carry the meeting/space name, never bare `Webex`.
+        assert!(!window_title_is_ignored(Some("Project Update Call"), &p));
+        assert!(!window_title_is_ignored(Some("VHM Calendar Hold"), &p));
+        // A title that merely *contains* "Webex" is a meeting, not the bare
+        // messaging window — exact-equality (not substring) keeps it detectable.
+        assert!(!window_title_is_ignored(Some("Webex Standup"), &p));
+        assert!(!window_title_is_ignored(Some("Cisco Webex Meeting"), &p));
+        // No readable title can't prove it's the messaging window.
+        assert!(!window_title_is_ignored(None, &p));
+        assert!(!window_title_is_ignored(Some(""), &p));
+    }
+
+    #[test]
+    fn webex_messaging_leave_chrome_does_not_start_meeting() {
+        // Repro of the phantom: the messaging window exposes "Leave space" /
+        // "Leave team" buttons that match the bare `leave` signal. On their own
+        // they would declare a call active. The guard fires first because the
+        // owning window is titled exactly `Webex`, so no meeting starts.
+        let p = webex_profile();
+
+        // The chat-chrome buttons DO match a call signal (this is the root bug).
+        assert!(
+            any_signal_matches(&p, "AXButton", Some("Leave space"), None, None),
+            "sanity: chat 'Leave space' matches the bare `leave` signal"
+        );
+        assert!(any_signal_matches(
+            &p,
+            "AXButton",
+            Some("Leave team"),
+            None,
+            None
+        ));
+
+        // ...but the window guard suppresses them, so the scan finds no signals.
+        let messaging_window_title = Some("Webex");
+        let suppressed = window_title_is_ignored(messaging_window_title, &p);
+        assert!(
+            suppressed,
+            "bare `Webex` window must be skipped before walking"
+        );
+
+        // Net per-window decision: signals are dropped → no phantom meeting.
+        let in_call =
+            !suppressed && any_signal_matches(&p, "AXButton", Some("Leave space"), None, None);
+        assert!(!in_call, "Webex messaging must not auto-start a meeting");
+    }
+
+    #[test]
+    fn real_webex_meeting_still_detected() {
+        // A real meeting window: titled with the meeting name (not guarded) and
+        // exposing the in-call "Leave" / "Leave Meeting" control. Detection must
+        // still fire — the fix must not silence real meetings.
+        let p = webex_profile();
+        let meeting_window_title = Some("Project Update Call");
+
+        let suppressed = window_title_is_ignored(meeting_window_title, &p);
+        assert!(!suppressed, "a real meeting window must not be guarded");
+
+        let in_call =
+            !suppressed && any_signal_matches(&p, "AXButton", Some("Leave Meeting"), None, None);
+        assert!(
+            in_call,
+            "real Webex meeting must auto-start (signal counts)"
+        );
+
+        // The leave-button automation id also still counts in a meeting window.
+        let in_call_via_id = !suppressed
+            && any_signal_matches(&p, "AXButton", None, None, Some("leave-call-button"));
+        assert!(in_call_via_id);
+    }
+
+    #[test]
+    fn webex_messaging_open_during_meeting_still_detects_meeting() {
+        // Both windows open at once. The guard is per-window: signals from the
+        // bare-`Webex` messaging window are dropped, but the meeting window
+        // (matched by its own title) is still scanned and detected.
+        let p = webex_profile();
+
+        let messaging_dropped = window_title_is_ignored(Some("Webex"), &p);
+        let meeting_dropped = window_title_is_ignored(Some("Weekly Sync"), &p);
+        assert!(messaging_dropped);
+        assert!(!meeting_dropped);
+
+        // Aggregate scan outcome across both windows: meeting window contributes
+        // its signal, so the process is in a call.
+        let process_in_call = (!messaging_dropped
+            && any_signal_matches(&p, "AXButton", Some("Leave team"), None, None))
+            || (!meeting_dropped
+                && any_signal_matches(&p, "AXButton", Some("Leave Meeting"), None, None));
+        assert!(
+            process_in_call,
+            "meeting must still be detected when messaging is open alongside it"
+        );
+    }
+
+    #[test]
+    fn window_title_guard_is_noop_for_profiles_without_ignore_list() {
+        // Every other profile has an empty ignore list, so the guard never
+        // suppresses their windows.
+        let zoom = zoom_test_profile();
+        assert!(zoom.ignore_window_titles.is_empty());
+        assert!(!window_title_is_ignored(Some("Zoom Meeting"), &zoom));
+        assert!(!window_title_is_ignored(Some("anything"), &zoom));
     }
 
     // ── AttrNeeds tests ────────────────────────────────────────────────
