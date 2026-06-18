@@ -845,3 +845,98 @@ async fn frame_fulltext_falls_back_when_no_map() {
     );
     assert!(!a.contains("bob@example.com"), "raw email survived: {a:?}");
 }
+
+/// Issue #4116 — second-audit regression: the span-less / no-map path (the
+/// Tinfoil enclave; `RegexRedactor` stands in, its default
+/// `redact_with_map` => `None`) MUST also scrub `accessibility_tree_json`.
+///
+/// The original PR only scrubbed the tree on the `Some(map)` arm. On the
+/// `None` arm the worker redacted `full_text` and stamped
+/// `full_text_redacted_at` but never touched the tree — and because the
+/// fetch query filters `WHERE full_text_redacted_at IS NULL`, the frame is
+/// never re-selected, so the raw tree (full of the same PII) was served
+/// forever for enclave users. This test fails on the old code (tree keeps
+/// the raw email, watermark NULL) and passes once the None arm scrubs +
+/// stamps the tree before stamping full_text.
+#[tokio::test]
+async fn frame_fulltext_no_map_path_also_scrubs_tree_json() {
+    let pool = setup_db().await;
+    let email = "carol@example.com";
+    // PII lives in node TEXT fields (allowlisted) and in structural fields
+    // (role / automation_id — NOT allowlisted) so we can prove the walker
+    // scrubs the former and leaves the latter, even on the enclave path.
+    let tree = format!(
+        r#"[{{"role":"AXStaticText","text":"mail {email} now","depth":0,"on_screen":true,
+              "lines":[{{"start":5,"end":22}}]}},
+            {{"role":"AXTextField","value":"resend to {email}","automation_id":"emailField","depth":1}}]"#
+    );
+    let full = format!("mail {email} now\nocr resend to {email}");
+    sqlx::query("INSERT INTO frames (id, full_text, accessibility_tree_json) VALUES (1, ?, ?)")
+        .bind(&full)
+        .bind(&tree)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // RegexRedactor: span-less, drives the worker's None / enclave arm.
+    let redactor = Arc::new(RegexRedactor::new()) as Arc<dyn Redactor>;
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor, cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let row = sqlx::query(
+        "SELECT accessibility_tree_json, accessibility_tree_redacted_at, \
+                full_text, full_text_redacted_at FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let tree_red: String = row.get(0);
+    let tree_when: Option<i64> = row.get(1);
+    let full_red: String = row.get(2);
+    let full_when: Option<i64> = row.get(3);
+
+    // THE BUG: raw email must be gone from the tree on the enclave path.
+    assert!(
+        !tree_red.contains(email),
+        "raw email survived in accessibility_tree_json on the no-map path: {tree_red:?}"
+    );
+    assert!(
+        tree_red.contains("[EMAIL]"),
+        "tree json not redacted on the no-map path: {tree_red:?}"
+    );
+    // Watermark stamped so the row isn't (and the leak isn't) re-served.
+    assert!(
+        tree_when.is_some(),
+        "tree watermark must be stamped on the no-map path"
+    );
+    // full_text also redacted + stamped (and never stamped while the tree
+    // was still raw — both must be done together).
+    assert!(
+        full_red.contains("[EMAIL]") && full_when.is_some(),
+        "full_text not redacted/stamped: {full_red:?}"
+    );
+
+    // Structure preserved: still valid JSON, same node shape.
+    let parsed: serde_json::Value = serde_json::from_str(&tree_red).unwrap();
+    let arr = parsed.as_array().expect("tree must still be an array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["role"], "AXStaticText");
+    assert_eq!(arr[0]["on_screen"], true);
+    // Structural (non-allowlisted) field left intact.
+    assert_eq!(arr[1]["automation_id"], "emailField");
+    // Bug 2: node 0's `text` changed length, so its stale `lines` offsets
+    // were dropped (consumer falls back to the paragraph bbox).
+    assert!(
+        arr[0].get("lines").is_none(),
+        "stale lines offsets must be cleared when text is redacted: {:?}",
+        arr[0]
+    );
+}

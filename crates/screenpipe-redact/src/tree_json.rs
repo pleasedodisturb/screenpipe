@@ -51,10 +51,19 @@
 use serde_json::Value;
 
 use crate::redaction_map::RedactionMap;
+use crate::{RedactError, Redactor};
 
 /// Node string fields that hold free-form, human-readable text and may
 /// therefore carry PII. Kept narrow on purpose (issue #4116): everything
 /// else on the node is structural metadata.
+///
+/// NOTE: the allowlist only catches a `Value::String` sitting **directly**
+/// under one of these keys. A future free-text field shaped as an array
+/// (`Vec<String>` under an allowlisted name) would NOT be redacted by
+/// [`redact_value`] — it special-cases scalar strings, not string arrays.
+/// "Just add the key to the allowlist" is therefore only sufficient for
+/// scalar-string fields; an array-shaped free-text field needs walker
+/// support too.
 pub const REDACTABLE_FIELDS: &[&str] = &[
     "text",
     "value",
@@ -112,13 +121,43 @@ pub fn redact_tree_json(
 /// allowlist means structural strings (role, ids, class names) are never
 /// touched.
 fn redact_value(value: &mut Value, map: &RedactionMap, changed: &mut bool) {
+    redact_value_with(value, changed, &mut |s| {
+        let redacted = map.apply(s);
+        if redacted == *s {
+            None
+        } else {
+            Some(redacted)
+        }
+    });
+}
+
+/// Generic tree walker shared by the map-driven path ([`redact_tree_json`])
+/// and the direct-redactor path ([`redact_tree_json_with_redactor`], used by
+/// the span-less enclave backend that can't produce a [`RedactionMap`]).
+///
+/// `redact_str` is called on each allowlisted node text field and returns
+/// `Some(new)` when it actually changed the text, `None` when it left it
+/// untouched. When a node's `text` is rewritten, the node's sibling
+/// `lines[]` array is cleared: `lines` holds char-offset ranges into the
+/// *original* `text`, which desync the moment `text`'s length changes
+/// (overlay/highlight rendering). Dropping the stale `lines` makes the
+/// consumer fall back to the node's paragraph bbox instead of mis-mapping
+/// offsets — correctness over partial-precision on the redaction path.
+fn redact_value_with(
+    value: &mut Value,
+    changed: &mut bool,
+    redact_str: &mut dyn FnMut(&str) -> Option<String>,
+) {
     match value {
         Value::Object(obj) => {
+            let mut text_changed = false;
             for (key, child) in obj.iter_mut() {
                 if REDACTABLE_FIELDS.contains(&key.as_str()) {
                     if let Value::String(s) = child {
-                        let redacted = map.apply(s);
-                        if &redacted != s {
+                        if let Some(redacted) = redact_str(s) {
+                            if key == "text" {
+                                text_changed = true;
+                            }
                             *s = redacted;
                             *changed = true;
                         }
@@ -127,18 +166,138 @@ fn redact_value(value: &mut Value, map: &RedactionMap, changed: &mut bool) {
                     // Recurse into structural containers (e.g. nested
                     // children arrays) but never redact their
                     // non-allowlisted scalar strings.
-                    redact_value(child, map, changed);
+                    redact_value_with(child, changed, redact_str);
                 }
+            }
+            // The node's `text` changed length → its `lines` char offsets
+            // are now stale. Drop them so the consumer falls back to the
+            // paragraph bbox rather than highlighting the wrong span.
+            if text_changed {
+                obj.remove("lines");
             }
         }
         Value::Array(arr) => {
             for item in arr.iter_mut() {
-                redact_value(item, map, changed);
+                redact_value_with(item, changed, redact_str);
             }
         }
         _ => {}
     }
 }
+
+/// Like [`redact_tree_json`] but driven by a [`Redactor`] directly instead
+/// of a precomputed [`RedactionMap`]. This is the path the **span-less
+/// enclave** backend takes: its [`Redactor::redact_with_map`] returns
+/// `None` (detections aren't exposed as spans), so the worker can't build a
+/// map to propagate. Without this, the enclave path would scrub
+/// `full_text` but leave `accessibility_tree_json` raw forever — the
+/// frame's `full_text_redacted_at` gets stamped, so the fetch query never
+/// re-selects it, and the un-redacted tree (full of the same PII) is served
+/// verbatim by `/frames/:id/context` (issue #4116).
+///
+/// Each allowlisted node text field is redacted by an independent
+/// `redactor.redact()` call (no map to reuse here), collected via a single
+/// `redact_batch` so detection runs once over all fields rather than once
+/// per field. Structure is preserved; `lines` is cleared on any node whose
+/// `text` changed length (same rationale as the map path).
+///
+/// Returns `Ok(None)` when the tree parsed but nothing changed (caller can
+/// skip the write but should still stamp the watermark so the row isn't
+/// re-scanned forever). `Err` only on malformed JSON or a redactor error;
+/// the worker then leaves the row pending (NULL watermark) for retry.
+pub async fn redact_tree_json_with_redactor(
+    blob: &str,
+    redactor: &dyn Redactor,
+) -> Result<Option<String>, TreeRedactError> {
+    let mut value: Value = serde_json::from_str(blob).map_err(TreeRedactError::Json)?;
+
+    // Pass 1: collect every allowlisted node text string in document order.
+    let mut originals: Vec<String> = Vec::new();
+    collect_redactable(&value, &mut originals);
+    if originals.is_empty() {
+        // Parsed fine, no free text to scrub → preserve verbatim so the
+        // caller still stamps the watermark (row is genuinely clean).
+        return Ok(Some(blob.to_string()));
+    }
+
+    // One detection pass over all node text fields (order preserved).
+    let outputs = redactor
+        .redact_batch(&originals)
+        .await
+        .map_err(TreeRedactError::Redact)?;
+    if outputs.len() != originals.len() {
+        return Err(TreeRedactError::Redact(RedactError::Unexpected(format!(
+            "redactor returned {} outputs for {} tree fields",
+            outputs.len(),
+            originals.len()
+        ))));
+    }
+
+    // Pass 2: write the redacted strings back in the same order.
+    let mut idx = 0usize;
+    let mut changed = false;
+    redact_value_with(&mut value, &mut changed, &mut |s| {
+        let out = &outputs[idx];
+        idx += 1;
+        debug_assert_eq!(out.input, *s, "tree redaction order desynced");
+        if out.redacted == *s {
+            None
+        } else {
+            Some(out.redacted.clone())
+        }
+    });
+
+    if !changed {
+        return Ok(Some(blob.to_string()));
+    }
+    Ok(Some(
+        serde_json::to_string(&value).map_err(TreeRedactError::Json)?,
+    ))
+}
+
+/// Walk the tree collecting every allowlisted node text string (the same
+/// allowlist [`redact_value_with`] mutates), in document order, so the
+/// redactor batch and the write-back walk line up index-for-index.
+fn collect_redactable(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(obj) => {
+            for (key, child) in obj.iter() {
+                if REDACTABLE_FIELDS.contains(&key.as_str()) {
+                    if let Value::String(s) = child {
+                        out.push(s.clone());
+                    }
+                } else {
+                    collect_redactable(child, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter() {
+                collect_redactable(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Error from [`redact_tree_json_with_redactor`]: malformed JSON or a
+/// failure from the underlying redactor. Both leave the row pending.
+#[derive(Debug)]
+pub enum TreeRedactError {
+    Json(serde_json::Error),
+    Redact(RedactError),
+}
+
+impl std::fmt::Display for TreeRedactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TreeRedactError::Json(e) => write!(f, "malformed tree json: {e}"),
+            TreeRedactError::Redact(e) => write!(f, "redactor error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for TreeRedactError {}
 
 #[cfg(test)]
 mod tests {
@@ -278,5 +437,150 @@ mod tests {
         let out = redact_tree_json(blob, &m).unwrap().unwrap();
         assert!(out.contains("[E]"));
         assert!(!out.contains("alice@x.io"));
+    }
+
+    /// Bug 2 (map path): when a node's `text` is rewritten by redaction its
+    /// stale `lines[]` char offsets are dropped; a node whose `text` is
+    /// untouched keeps its `lines`.
+    #[test]
+    fn redacting_text_clears_stale_lines_only_for_changed_node() {
+        let blob = r#"[
+            {"role":"AXStaticText","text":"mail alice@x.io now","lines":[{"start":5,"end":15}],"depth":0},
+            {"role":"AXStaticText","text":"unchanged label","lines":[{"start":0,"end":5}],"depth":1}
+        ]"#;
+        let m = map(&[("alice@x.io", "[E]")]);
+        let out = redact_tree_json(blob, &m).unwrap().unwrap();
+        let arr = serde_json::from_str::<Value>(&out).unwrap();
+        // Node 0's text changed → lines removed.
+        assert!(
+            arr[0].get("lines").is_none(),
+            "changed node kept lines: {:?}",
+            arr[0]
+        );
+        assert_eq!(arr[0]["text"], "mail [E] now");
+        // Node 1's text untouched → lines preserved.
+        assert!(
+            arr[1].get("lines").is_some(),
+            "untouched node lost lines: {:?}",
+            arr[1]
+        );
+    }
+
+    // --- redactor-driven (span-less / enclave) path ----------------------
+
+    use crate::{RedactError, RedactionOutput, Redactor};
+    use async_trait::async_trait;
+
+    /// Minimal span-less redactor stub: replaces a fixed needle with a
+    /// label, exposes NO map (`redact_with_map` defaults to `None`) — this
+    /// is exactly the shape of the enclave backend that drove the leak.
+    struct StubEnclaveRedactor {
+        needle: String,
+        label: String,
+    }
+
+    #[async_trait]
+    impl Redactor for StubEnclaveRedactor {
+        fn name(&self) -> &str {
+            "stub-enclave"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        async fn redact_batch(
+            &self,
+            texts: &[String],
+        ) -> Result<Vec<RedactionOutput>, RedactError> {
+            Ok(texts
+                .iter()
+                .map(|t| RedactionOutput {
+                    input: t.clone(),
+                    redacted: t.replace(&self.needle, &self.label),
+                    spans: Vec::new(),
+                })
+                .collect())
+        }
+        // redact_with_map intentionally left as the trait default => None,
+        // so this stub drives the worker's enclave / None arm.
+    }
+
+    fn stub(needle: &str, label: &str) -> StubEnclaveRedactor {
+        StubEnclaveRedactor {
+            needle: needle.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    /// The span-less path scrubs allowlisted node text, leaves structural
+    /// fields, and clears stale `lines` — proving the enclave backend no
+    /// longer leaks the tree (issue #4116 second-audit fix).
+    #[tokio::test]
+    async fn redactor_path_scrubs_tree_and_clears_lines() {
+        let blob = r#"[
+            {"role":"AXStaticText","text":"mail alice@x.io now","lines":[{"start":5,"end":15}],"automation_id":"alice@x.io","depth":0},
+            {"role":"AXTextField","value":"call alice@x.io","depth":1}
+        ]"#;
+        let r = stub("alice@x.io", "[EMAIL]");
+        let out = redact_tree_json_with_redactor(blob, &r)
+            .await
+            .unwrap()
+            .unwrap();
+        let arr = serde_json::from_str::<Value>(&out).unwrap();
+
+        assert_eq!(arr[0]["text"], "mail [EMAIL] now");
+        assert_eq!(arr[1]["value"], "call [EMAIL]");
+        // Structural field NOT redacted (not in the allowlist).
+        assert_eq!(arr[0]["automation_id"], "alice@x.io");
+        // Raw PII gone from the redacted text fields.
+        assert!(!out.contains("\"text\":\"mail alice@x.io now\""));
+        // Stale lines dropped on the changed node.
+        assert!(arr[0].get("lines").is_none());
+    }
+
+    /// No redactable text → blob preserved verbatim (caller still stamps).
+    #[tokio::test]
+    async fn redactor_path_no_text_preserves_blob() {
+        let blob = r#"[{"role":"AXGroup","depth":0}]"#;
+        let r = stub("x", "[X]");
+        let out = redact_tree_json_with_redactor(blob, &r).await.unwrap();
+        assert_eq!(out, Some(blob.to_string()));
+    }
+
+    /// Text present but nothing matched → blob round-trips unchanged.
+    #[tokio::test]
+    async fn redactor_path_no_match_round_trips() {
+        let blob = r#"[{"role":"AXStaticText","text":"plain label","depth":0}]"#;
+        let r = stub("alice@x.io", "[E]");
+        let out = redact_tree_json_with_redactor(blob, &r)
+            .await
+            .unwrap()
+            .unwrap();
+        let arr = serde_json::from_str::<Value>(&out).unwrap();
+        assert_eq!(arr[0]["text"], "plain label");
+    }
+
+    /// Malformed JSON → Json error (worker leaves the row pending), never a
+    /// panic; redactor is never even called.
+    #[tokio::test]
+    async fn redactor_path_malformed_json_errors() {
+        let r = stub("x", "[X]");
+        let err = redact_tree_json_with_redactor("not json {", &r).await;
+        assert!(matches!(err, Err(TreeRedactError::Json(_))));
+    }
+
+    /// Nested children on the redactor path are traversed too.
+    #[tokio::test]
+    async fn redactor_path_redacts_nested_children() {
+        let blob = r#"[{
+            "role":"AXGroup","text":"top alice@x.io","depth":0,
+            "children":[{"role":"AXStaticText","text":"child alice@x.io","depth":1}]
+        }]"#;
+        let r = stub("alice@x.io", "[E]");
+        let out = redact_tree_json_with_redactor(blob, &r)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!out.contains("alice@x.io"));
+        assert_eq!(out.matches("[E]").count(), 2);
     }
 }

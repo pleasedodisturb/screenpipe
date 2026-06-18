@@ -410,8 +410,66 @@ impl Worker {
                     }
                 }
                 None => {
-                    // Span-less / no-map redactor: redact full_text the
-                    // plain way; accessibility_text is left to the
+                    // Span-less / no-map redactor (the Tinfoil ENCLAVE
+                    // backend, whose detections aren't exposed as spans, so
+                    // `redact_with_map` returns None). We can't build a
+                    // RedactionMap to propagate, so the tree must be scrubbed
+                    // by driving the redactor over each node text field
+                    // directly. CRITICAL: do this BEFORE stamping
+                    // full_text_redacted_at — the fetch query filters on
+                    // `full_text_redacted_at IS NULL`, so once full_text is
+                    // stamped the row is never re-selected. If we stamped
+                    // full_text but skipped the tree, the raw tree (same PII)
+                    // would be served forever for enclave users (issue
+                    // #4116). On a malformed tree we leave the WHOLE row
+                    // pending (no stamps) so it retries, exactly like the
+                    // Some(map) arm's malformed handling.
+                    if let Some(tree) = row.accessibility_tree_json.as_deref() {
+                        if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
+                            match crate::tree_json::redact_tree_json_with_redactor(
+                                tree,
+                                self.redactor.as_ref(),
+                            )
+                            .await
+                            {
+                                Ok(Some(redacted_json)) => {
+                                    tables::write_redacted_tree(&self.pool, row.id, &redacted_json)
+                                        .await?;
+                                    writes += 1;
+                                    propagated += 1;
+                                }
+                                // No redactable text in the tree → nothing to
+                                // write, but still stamp so the row isn't
+                                // re-scanned: write the verbatim blob back via
+                                // the tree writer to set the watermark.
+                                Ok(None) => {
+                                    tables::write_redacted_tree(&self.pool, row.id, tree).await?;
+                                    writes += 1;
+                                }
+                                Err(crate::tree_json::TreeRedactError::Json(e)) => {
+                                    warn!(
+                                        frame_id = row.id,
+                                        error = %e,
+                                        "skipping malformed accessibility_tree_json on enclave \
+                                         path; leaving the row pending for retry"
+                                    );
+                                    // Leave full_text unstamped too: do not
+                                    // mark the frame done while its tree still
+                                    // holds raw text. Skip to the next row.
+                                    continue;
+                                }
+                                Err(e @ crate::tree_json::TreeRedactError::Redact(_)) => {
+                                    // Transient redactor failure: propagate so
+                                    // the worker's retry/backoff handles it and
+                                    // the row stays pending.
+                                    return Err(e.into());
+                                }
+                            }
+                        }
+                    }
+
+                    // Tree is handled (or absent); now redact + stamp
+                    // full_text. accessibility_text is left to the
                     // Accessibility pass.
                     let out = self.redactor.redact(&row.full_text).await?;
                     tables::write_redacted(

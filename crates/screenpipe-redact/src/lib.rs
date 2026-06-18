@@ -88,7 +88,7 @@ pub use pipeline::{Pipeline, PipelineConfig};
 pub use pseudonym::Pseudonymizer;
 pub use redaction_map::RedactionMap;
 pub use span::{RedactedSpan, SpanLabel, TextRedactionPolicy};
-pub use tree_json::redact_tree_json;
+pub use tree_json::{redact_tree_json, redact_tree_json_with_redactor, TreeRedactError};
 
 use async_trait::async_trait;
 
