@@ -65,8 +65,7 @@ pub struct WorkerConfig {
     /// `idle_between_batches` floor between batches.
     pub max_active_fraction: f64,
     /// Tables to reconcile. Default: all of [`ALL_TARGET_TABLES`]
-    /// (frames:full_text, audio, accessibility, ui_events:keyboard,
-    /// ui_events:clipboard, elements).
+    /// (frames:full_text, audio, accessibility, ui_events, elements).
     pub tables: Vec<TargetTable>,
 }
 
@@ -318,13 +317,84 @@ impl Worker {
 
     /// Dispatch one table. `FullText` gets the per-frame path that also
     /// propagates to `accessibility_text` from a single detection
-    /// (screenpipe/website#291); everything else uses the generic
-    /// per-column path.
+    /// (screenpipe/website#291); `UiEvents` gets the multi-column
+    /// per-row path (issue #4115); everything else uses the generic
+    /// single-column path.
     async fn process_one(&self, table: TargetTable) -> Result<u32, anyhow::Error> {
         match table {
             TargetTable::FullText => self.process_frames_fulltext().await,
+            TargetTable::UiEvents => self.process_ui_events().await,
             other => self.process_table(other).await,
         }
+    }
+
+    /// Redact every free-text column of a `ui_events` row in one pass and
+    /// stamp the single `redacted_at` watermark. Unlike `text_content`,
+    /// the accessibility element columns (`element_name` / `element_value`
+    /// / `element_description`) and `window_title` are populated on EVERY
+    /// event — a click on a filled form field persists its contents in
+    /// `element_value` — so before this path those columns kept raw PII
+    /// indefinitely even with "AI PII removal" on (issue #4115).
+    ///
+    /// All non-empty columns of the batch are flattened into one
+    /// `redact_batch` call (the redactor amortizes a batch better than
+    /// per-column calls), then scattered back to their rows. The watermark
+    /// is stamped per row regardless of whether anything changed, so a row
+    /// with no PII is marked done and never re-fetched. Returns the number
+    /// of rows processed.
+    async fn process_ui_events(&self) -> Result<u32, anyhow::Error> {
+        let rows = tables::fetch_unredacted_ui_events(&self.pool, self.cfg.batch_size).await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        debug!(
+            count = rows.len(),
+            "redacting ui_events batch (multi-column)"
+        );
+
+        // Flatten every non-empty cell into one batch, remembering where
+        // each output goes (row index, column index).
+        let mut inputs: Vec<String> = Vec::new();
+        let mut coords: Vec<(usize, usize)> = Vec::new();
+        for (ri, row) in rows.iter().enumerate() {
+            for (ci, cell) in row.cols.iter().enumerate() {
+                if let Some(text) = cell {
+                    inputs.push(text.clone());
+                    coords.push((ri, ci));
+                }
+            }
+        }
+
+        // Per-row redacted output, parallel to UI_EVENT_TEXT_COLS; only
+        // the cells that had content get a Some(...) to write back.
+        let ncols = rows[0].cols.len();
+        let mut outputs_by_row: Vec<Vec<Option<String>>> =
+            rows.iter().map(|_| vec![None; ncols]).collect();
+
+        if !inputs.is_empty() {
+            let redacted = self.redactor.redact_batch(&inputs).await?;
+            if redacted.len() != inputs.len() {
+                anyhow::bail!(
+                    "redactor returned {} outputs for {} inputs",
+                    redacted.len(),
+                    inputs.len()
+                );
+            }
+            for ((ri, ci), out) in coords.into_iter().zip(redacted.into_iter()) {
+                outputs_by_row[ri][ci] = Some(out.redacted);
+            }
+        }
+
+        for (row, redacted) in rows.iter().zip(outputs_by_row.iter()) {
+            tables::write_redacted_ui_events(&self.pool, row.id, redacted).await?;
+        }
+
+        let n = rows.len() as u32;
+        let mut s = self.status.lock().await;
+        s.redacted_total += n as u64;
+        s.last_redacted_at = Some(chrono::Utc::now());
+        s.last_error = None;
+        Ok(n)
     }
 
     /// Redact the per-frame `full_text` search surface and, in the SAME

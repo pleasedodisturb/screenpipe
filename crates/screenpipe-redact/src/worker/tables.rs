@@ -12,8 +12,7 @@
 //!
 //! ## What we redact
 //!
-//! Five logical surfaces, six [`TargetTable`] variants (UI events
-//! split into keyboard vs clipboard):
+//! Five logical surfaces, five [`TargetTable`] variants:
 //!
 //! 1. **`frames.full_text`** — OCR + accessibility screen text, unified on the
 //!    frame after the `ocr_text` table was retired (2026-06). It backs
@@ -27,11 +26,16 @@
 //!    new home. The "is processed" timestamp is prefixed
 //!    (`accessibility_redacted_at`) so the same `frames` row can carry
 //!    independent state for accessibility text vs. image redaction.
-//! 4. **`ui_events`** — user input events. The same table holds both
-//!    typed/keystroke text (`event_type IN ('text', 'key')`) and
-//!    clipboard contents (`event_type = 'clipboard'`). Source column
-//!    `text_content`. Split into two variants so the row-fetch SQL
-//!    can filter by `event_type`.
+//! 4. **`ui_events`** — user input events. The same table holds typed
+//!    text, keystrokes, clipboard payloads AND the accessibility
+//!    element context captured on every click/focus
+//!    (`element_name` / `element_value` / `element_description`) plus
+//!    the `window_title`. ALL of those are free-text PII surfaces, so
+//!    the worker redacts them together per row, gated on the single
+//!    `ui_events.redacted_at` watermark. This is the only multi-column
+//!    target — see [`TargetTable::source_cols`] and
+//!    [`fetch_unredacted_ui_events`] / [`write_redacted_ui_events`]
+//!    (issue #4115).
 //! 5. **`elements`** — per-element OCR + accessibility rows (issue
 //!    #3993). Source column `text` (NULL on container nodes; the
 //!    fetch predicate skips those). The `elements_fts` mirror is
@@ -57,12 +61,18 @@ pub enum TargetTable {
     /// column is prefixed (`accessibility_redacted_at`) so it doesn't
     /// collide with `frames.image_redacted_at` (image PII worker).
     Accessibility,
-    /// Typed text + keystrokes captured via UI events
-    /// (`ui_events.text_content` filtered to `event_type IN ('text','key')`).
-    UiEventsKeyboard,
-    /// Clipboard payloads captured via UI events
-    /// (`ui_events.text_content` filtered to `event_type='clipboard'`).
-    UiEventsClipboard,
+    /// All free-text PII surfaces on a `ui_events` row, redacted
+    /// together: `text_content` (typed/keystroke/clipboard text) plus
+    /// the accessibility element context (`element_name`,
+    /// `element_value`, `element_description`) and `window_title`. The
+    /// element columns are written on EVERY event including clicks and
+    /// focus changes (a click on a filled form field persists its
+    /// contents in `element_value`), so unlike `text_content` this
+    /// surface is not gated on `event_type`. Multi-column — uses the
+    /// dedicated [`fetch_unredacted_ui_events`] /
+    /// [`write_redacted_ui_events`] path, not the generic single-column
+    /// helpers. Watermark `redacted_at` (issue #4115).
+    UiEvents,
     /// Per-element OCR + accessibility text (`elements.text`).
     /// Watermark column added by
     /// `20260613000000_add_elements_redacted_at.sql` (issue #3993).
@@ -86,9 +96,22 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::FullText,
     TargetTable::Accessibility,
     TargetTable::AudioTranscription,
-    TargetTable::UiEventsKeyboard,
-    TargetTable::UiEventsClipboard,
+    TargetTable::UiEvents,
     TargetTable::Elements,
+];
+
+/// Free-text columns on a `ui_events` row that the worker redacts
+/// together. `text_content` is the typed/clipboard text; the rest are
+/// accessibility element context (issue #4115) — all user-visible PII.
+/// `element_role` / `element_automation_id` are stable identifiers, not
+/// free text, so they're left out; `browser_url` is redacted on the
+/// frame's `full_text` surface and is structurally a URL, not prose.
+pub const UI_EVENT_TEXT_COLS: &[&str] = &[
+    "text_content",
+    "element_name",
+    "element_value",
+    "element_description",
+    "window_title",
 ];
 
 /// One row to redact.
@@ -106,7 +129,7 @@ impl TargetTable {
             // accessibility_text lives on frames after the 2026-03-12
             // consolidation; see the variant docs above.
             Self::Accessibility => "frames",
-            Self::UiEventsKeyboard | Self::UiEventsClipboard => "ui_events",
+            Self::UiEvents => "ui_events",
             Self::Elements => "elements",
             // full_text also lives on frames (a different column +
             // watermark than the accessibility variant).
@@ -114,14 +137,34 @@ impl TargetTable {
         }
     }
 
-    /// Source column the redactor reads AND overwrites.
+    /// Source column the redactor reads AND overwrites — for the
+    /// single-column targets. Panics on [`Self::UiEvents`], which is
+    /// multi-column and must go through [`fetch_unredacted_ui_events`] /
+    /// [`write_redacted_ui_events`] (see [`Self::source_cols`]); the
+    /// generic single-column path is never dispatched for it.
     pub fn source_col(&self) -> &'static str {
         match self {
             Self::AudioTranscription => "transcription",
             Self::Accessibility => "accessibility_text",
-            Self::UiEventsKeyboard | Self::UiEventsClipboard => "text_content",
             Self::Elements => "text",
             Self::FullText => "full_text",
+            Self::UiEvents => unreachable!(
+                "UiEvents is multi-column; use source_cols() / the ui_events worker path"
+            ),
+        }
+    }
+
+    /// Every free-text column this target redacts. One entry for the
+    /// single-column targets, the full [`UI_EVENT_TEXT_COLS`] set for
+    /// [`Self::UiEvents`]. Used by the generic fetch/write to stay
+    /// column-agnostic.
+    pub fn source_cols(&self) -> &'static [&'static str] {
+        match self {
+            Self::AudioTranscription => &["transcription"],
+            Self::Accessibility => &["accessibility_text"],
+            Self::Elements => &["text"],
+            Self::FullText => &["full_text"],
+            Self::UiEvents => UI_EVENT_TEXT_COLS,
         }
     }
 
@@ -145,13 +188,13 @@ impl TargetTable {
     }
 
     /// Extra `WHERE`-clause filter beyond the redacted-NULL predicate.
-    /// Used to slice the `ui_events` table by `event_type`.
+    /// No single-column target needs one any more: `ui_events` is now
+    /// redacted as a whole row (every event type can carry element PII),
+    /// so it's no longer sliced by `event_type`. Kept for the generic
+    /// fetch's call-site stability and future targets.
     pub fn extra_filter(&self) -> Option<&'static str> {
-        match self {
-            Self::UiEventsKeyboard => Some("event_type IN ('text','key')"),
-            Self::UiEventsClipboard => Some("event_type = 'clipboard'"),
-            _ => None,
-        }
+        // No current target restricts beyond the redacted-NULL predicate.
+        None
     }
 
     /// Stable-ish identifier for logs / status.
@@ -159,8 +202,7 @@ impl TargetTable {
         match self {
             Self::AudioTranscription => "audio_transcriptions",
             Self::Accessibility => "frames:accessibility_text",
-            Self::UiEventsKeyboard => "ui_events:keyboard",
-            Self::UiEventsClipboard => "ui_events:clipboard",
+            Self::UiEvents => "ui_events",
             Self::Elements => "elements",
             Self::FullText => "frames:full_text",
         }
@@ -175,6 +217,10 @@ pub async fn fetch_unredacted(
     table: TargetTable,
     limit: u32,
 ) -> Result<Vec<UnredactedRow>, sqlx::Error> {
+    debug_assert!(
+        table != TargetTable::UiEvents,
+        "UiEvents is multi-column; call fetch_unredacted_ui_events"
+    );
     let extra = table
         .extra_filter()
         .map(|f| format!(" AND {}", f))
@@ -268,6 +314,10 @@ pub async fn write_redacted(
     id: i64,
     redacted: &str,
 ) -> Result<(), sqlx::Error> {
+    debug_assert!(
+        table != TargetTable::UiEvents,
+        "UiEvents is multi-column; call write_redacted_ui_events"
+    );
     let q = format!(
         "UPDATE {tbl} SET \
             {src} = ?, \
@@ -283,6 +333,104 @@ pub async fn write_redacted(
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// One `ui_events` row to redact, carrying every free-text column so the
+/// worker can redact them all from one fetch and stamp the single
+/// `redacted_at` watermark once (issue #4115). Column order matches
+/// [`UI_EVENT_TEXT_COLS`]; `None`/empty cells need no redaction.
+#[derive(Debug)]
+pub struct UiEventTextRow {
+    pub id: i64,
+    /// Same length and order as [`UI_EVENT_TEXT_COLS`]. `None` where the
+    /// column was NULL or empty (nothing to redact, nothing to write back).
+    pub cols: Vec<Option<String>>,
+}
+
+/// Fetch up to `limit` `ui_events` rows that still need redaction
+/// (`redacted_at IS NULL`) and carry at least one non-empty free-text
+/// column. Newest-first, matching the other surfaces. Unlike the old
+/// keyboard/clipboard split this is NOT filtered by `event_type`: clicks
+/// and focus events carry element PII (`element_value` of a focused form
+/// field) and must be redacted too.
+pub async fn fetch_unredacted_ui_events(
+    pool: &SqlitePool,
+    limit: u32,
+) -> Result<Vec<UiEventTextRow>, sqlx::Error> {
+    // `col IS NOT NULL AND col != '' OR …` across every free-text column.
+    let any_nonempty = UI_EVENT_TEXT_COLS
+        .iter()
+        .map(|c| format!("({c} IS NOT NULL AND {c} != '')"))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let select_cols = UI_EVENT_TEXT_COLS.join(", ");
+    let q = format!(
+        "SELECT id, {select_cols} \
+         FROM ui_events \
+         WHERE redacted_at IS NULL AND ({any_nonempty}) \
+         ORDER BY id DESC \
+         LIMIT ?"
+    );
+    let rows = sqlx::query(&q).bind(limit as i64).fetch_all(pool).await?;
+    let out = rows
+        .into_iter()
+        .map(|r| {
+            let cols = UI_EVENT_TEXT_COLS
+                .iter()
+                .map(|c| {
+                    // Lossy UTF-8 decode — same invalid-byte guard as
+                    // `fetch_unredacted` (issue #4139); never panic the worker.
+                    r.get::<Option<Vec<u8>>, _>(*c)
+                        .map(|b| String::from_utf8_lossy(&b).into_owned())
+                })
+                .collect();
+            UiEventTextRow {
+                id: r.get::<i64, _>("id"),
+                cols,
+            }
+        })
+        .collect();
+    Ok(out)
+}
+
+/// Overwrite the redacted free-text columns of one `ui_events` row and
+/// stamp `redacted_at`. `redacted` is parallel to [`UI_EVENT_TEXT_COLS`]
+/// and to [`UiEventTextRow::cols`]: a `Some` cell is written back, a
+/// `None` cell (originally NULL/empty) is left untouched. The watermark is
+/// stamped regardless, so a row with no PII is still marked done and never
+/// re-fetched.
+pub async fn write_redacted_ui_events(
+    pool: &SqlitePool,
+    id: i64,
+    redacted: &[Option<String>],
+) -> Result<(), sqlx::Error> {
+    debug_assert_eq!(
+        redacted.len(),
+        UI_EVENT_TEXT_COLS.len(),
+        "redacted vec must be parallel to UI_EVENT_TEXT_COLS"
+    );
+    // Build `SET col = ?` only for the columns that actually changed,
+    // always plus the watermark. Binding order matches the SET order.
+    let mut set_clauses: Vec<String> = Vec::new();
+    let mut values: Vec<&str> = Vec::new();
+    for (col, val) in UI_EVENT_TEXT_COLS.iter().zip(redacted.iter()) {
+        if let Some(v) = val {
+            set_clauses.push(format!("{col} = ?"));
+            values.push(v);
+        }
+    }
+    set_clauses.push("redacted_at = strftime('%s', 'now')".to_string());
+
+    let q = format!(
+        "UPDATE ui_events SET {} WHERE id = ?",
+        set_clauses.join(", ")
+    );
+    let mut query = sqlx::query(&q);
+    for v in values {
+        query = query.bind(v);
+    }
+    query.bind(id).execute(pool).await?;
     Ok(())
 }
 
@@ -319,6 +467,10 @@ mod tests {
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
                 text_content TEXT,
+                window_title TEXT,
+                element_name TEXT,
+                element_value TEXT,
+                element_description TEXT,
                 redacted_at INTEGER
             );
             -- Per-element OCR/accessibility rows; `text` is NULL on
@@ -411,34 +563,128 @@ mod tests {
         assert_eq!(ids, vec![5, 4, 3, 2, 1]);
     }
 
+    /// Index of a column in [`UI_EVENT_TEXT_COLS`] / `UiEventTextRow::cols`.
+    fn col_idx(name: &str) -> usize {
+        UI_EVENT_TEXT_COLS.iter().position(|c| *c == name).unwrap()
+    }
+
+    /// Every event type that carries free text must be fetched — including
+    /// clicks/focus, which carry element PII (`element_value` of a focused
+    /// form field) but were NEVER fetched by the old keyboard/clipboard
+    /// split (issue #4115 root cause).
     #[tokio::test]
-    async fn ui_events_keyboard_filter_excludes_clipboard() {
+    async fn ui_events_fetch_covers_all_event_types_and_element_cols() {
         let pool = setup().await;
+        // A click event: no typed text, but the focused field's value is
+        // captured in element_value. This row was invisible to the old
+        // worker (event_type='click' matched neither filter).
+        sqlx::query(
+            "INSERT INTO ui_events (event_type, element_value, element_name) \
+             VALUES ('click', 'SSN 123-45-6789', 'Tax ID field')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A keyboard event with typed text.
         sqlx::query("INSERT INTO ui_events (event_type, text_content) VALUES ('text', 'hello')")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO ui_events (event_type, text_content) VALUES ('key', 'a')")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // A clipboard event.
         sqlx::query(
             "INSERT INTO ui_events (event_type, text_content) VALUES ('clipboard', 'paste')",
         )
         .execute(&pool)
         .await
         .unwrap();
-
-        let kb = fetch_unredacted(&pool, TargetTable::UiEventsKeyboard, 10)
+        // A pure mouse-move with no free text at all — must be skipped.
+        sqlx::query("INSERT INTO ui_events (event_type) VALUES ('move')")
+            .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(kb.len(), 2);
 
-        let cb = fetch_unredacted(&pool, TargetTable::UiEventsClipboard, 10)
+        let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        // The click, the keyboard, the clipboard — but NOT the empty move.
+        assert_eq!(rows.len(), 3);
+
+        // Newest-first: clipboard (id 3), keyboard (id 2), click (id 1).
+        let click = rows.iter().find(|r| r.id == 1).unwrap();
+        assert_eq!(
+            click.cols[col_idx("element_value")].as_deref(),
+            Some("SSN 123-45-6789")
+        );
+        assert_eq!(
+            click.cols[col_idx("element_name")].as_deref(),
+            Some("Tax ID field")
+        );
+        // No text_content on the click row.
+        assert!(click.cols[col_idx("text_content")].is_none());
+    }
+
+    /// Already-redacted rows (watermark set) must not be re-fetched.
+    #[tokio::test]
+    async fn ui_events_fetch_skips_redacted_rows() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO ui_events (event_type, element_value, redacted_at) \
+             VALUES ('click', '[SSN]', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// Writing back overwrites only the columns that had content and
+    /// stamps the single watermark; NULL columns stay NULL.
+    #[tokio::test]
+    async fn ui_events_write_overwrites_present_cols_and_stamps_watermark() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO ui_events (event_type, text_content, element_value) \
+             VALUES ('click', NULL, 'alice@example.com')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Redacted parallel vector: only element_value had content.
+        let mut redacted: Vec<Option<String>> = vec![None; UI_EVENT_TEXT_COLS.len()];
+        redacted[col_idx("element_value")] = Some("[EMAIL]".to_string());
+
+        write_redacted_ui_events(&pool, 1, &redacted).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT text_content, element_value, redacted_at FROM ui_events WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let tc: Option<String> = row.get(0);
+        let ev: String = row.get(1);
+        let when: Option<i64> = row.get(2);
+        assert!(tc.is_none(), "NULL column must stay NULL");
+        assert_eq!(ev, "[EMAIL]", "element_value must be overwritten");
+        assert!(when.is_some(), "redacted_at must be stamped");
+    }
+
+    /// A row with no PII (clean text) is still stamped so it's never
+    /// re-fetched — the watermark is the "is processed" bit.
+    #[tokio::test]
+    async fn ui_events_write_clean_row_still_stamps_watermark() {
+        let pool = setup().await;
+        sqlx::query("INSERT INTO ui_events (event_type, text_content) VALUES ('text', 'hello')")
+            .execute(&pool)
             .await
             .unwrap();
-        assert_eq!(cb.len(), 1);
-        assert_eq!(cb[0].text, "paste");
+        // No column changed (clean text → redactor returns it verbatim, but
+        // the worker still passes it through; here simulate no-op = all None).
+        let redacted: Vec<Option<String>> = vec![None; UI_EVENT_TEXT_COLS.len()];
+        write_redacted_ui_events(&pool, 1, &redacted).await.unwrap();
+
+        let pending = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
+        assert!(pending.is_empty(), "clean row must be marked done");
     }
 
     #[tokio::test]
