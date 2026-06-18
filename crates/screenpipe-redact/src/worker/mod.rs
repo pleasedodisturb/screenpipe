@@ -328,13 +328,16 @@ impl Worker {
         }
     }
 
-    /// Redact every free-text column of a `ui_events` row in one pass and
-    /// stamp the single `redacted_at` watermark. Unlike `text_content`,
-    /// the accessibility element columns (`element_name` / `element_value`
-    /// / `element_description`) and `window_title` are populated on EVERY
-    /// event — a click on a filled form field persists its contents in
-    /// `element_value` — so before this path those columns kept raw PII
-    /// indefinitely even with "AI PII removal" on (issue #4115).
+    /// Redact the runtime-authored free-text columns of a `ui_events` row
+    /// in one pass and stamp the single `redacted_at` watermark. Beyond
+    /// `text_content`, the in-scope columns ([`tables::UI_EVENT_TEXT_COLS`]
+    /// = `element_value` + `window_title`) carry user data on EVERY event —
+    /// a click on a filled form field persists its contents in
+    /// `element_value` — so before this path they kept raw PII indefinitely
+    /// even with "AI PII removal" on (issue #4115). The build-time
+    /// developer-authored fields (`element_name` / `element_description`)
+    /// never hold runtime user data and are deliberately skipped to avoid
+    /// wasted redactor CPU/GPU.
     ///
     /// All non-empty columns of the batch are flattened into one
     /// `redact_batch` call (the redactor amortizes a batch better than

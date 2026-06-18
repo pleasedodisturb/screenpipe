@@ -117,9 +117,14 @@ async fn seed(pool: &sqlx::SqlitePool) {
     .execute(pool)
     .await
     .unwrap();
+    // element_value (focused field contents) + window_title are runtime
+    // PII → must be redacted. element_name / element_description are
+    // developer-authored build-time labels → out of scope, must survive
+    // verbatim even though they happen to contain an email here. We seed
+    // emails into them precisely to prove the worker leaves them untouched.
     sqlx::query(
-        "INSERT INTO ui_events (event_type, element_value, element_name, window_title) \
-         VALUES ('click', 'erin@example.com', 'Email field with frank@example.com', 'Inbox — grace@example.com')",
+        "INSERT INTO ui_events (event_type, element_value, element_name, element_description, window_title) \
+         VALUES ('click', 'erin@example.com', 'Email field with frank@example.com', 'Field for henry@example.com', 'Inbox — grace@example.com')",
     )
     .execute(pool)
     .await
@@ -192,28 +197,34 @@ async fn worker_redacts_all_targets() {
         );
     }
 
-    // ui_events: the multi-column surface. Every text-bearing column on
-    // every row (typed text, clipboard, AND the click's element columns +
-    // window_title) must be redacted, and no raw PII may survive (issue
-    // #4115). Pre-fix, the click row was never even fetched.
+    // ui_events: the multi-column surface. Only the IN-SCOPE runtime
+    // columns (text_content, element_value, window_title) must have their
+    // raw PII removed — those are the user-data sinks (issue #4115).
+    // element_name / element_description are deliberately excluded from
+    // this leak check: they're build-time developer labels and are NOT
+    // redacted (louis030195's CPU/GPU point), so an email seeded there is
+    // expected to survive and is asserted verbatim below.
     let leaked: i64 = sqlx::query(
         "SELECT COUNT(*) FROM ui_events WHERE \
             text_content LIKE '%@example.com%' OR text_content LIKE '%AKIA%' \
             OR element_value LIKE '%@example.com%' \
-            OR element_name LIKE '%@example.com%' \
-            OR element_description LIKE '%@example.com%' \
             OR window_title LIKE '%@example.com%'",
     )
     .fetch_one(&pool)
     .await
     .unwrap()
     .get(0);
-    assert_eq!(leaked, 0, "raw PII survived in a ui_events column");
+    assert_eq!(
+        leaked, 0,
+        "raw PII survived in an in-scope ui_events column"
+    );
 
-    // The click row specifically: element_value / element_name /
-    // window_title all redacted, watermark stamped.
+    // The click row specifically: the in-scope columns (element_value,
+    // window_title) are redacted; the out-of-scope build-time columns
+    // (element_name, element_description) are left EXACTLY as seeded —
+    // including the email we planted there — proving the trimmed scope.
     let click = sqlx::query(
-        "SELECT element_value, element_name, window_title, redacted_at \
+        "SELECT element_value, element_name, element_description, window_title, redacted_at \
          FROM ui_events WHERE event_type = 'click'",
     )
     .fetch_one(&pool)
@@ -221,11 +232,25 @@ async fn worker_redacts_all_targets() {
     .unwrap();
     let ev: String = click.get(0);
     let en: String = click.get(1);
-    let wt: String = click.get(2);
-    let when: Option<i64> = click.get(3);
-    assert!(ev.contains("[EMAIL]"), "element_value not redacted: {ev:?}");
-    assert!(en.contains("[EMAIL]"), "element_name not redacted: {en:?}");
-    assert!(wt.contains("[EMAIL]"), "window_title not redacted: {wt:?}");
+    let ed: String = click.get(2);
+    let wt: String = click.get(3);
+    let when: Option<i64> = click.get(4);
+    assert!(
+        ev.contains("[EMAIL]"),
+        "in-scope element_value not redacted: {ev:?}"
+    );
+    assert!(
+        wt.contains("[EMAIL]"),
+        "in-scope window_title not redacted: {wt:?}"
+    );
+    assert_eq!(
+        en, "Email field with frank@example.com",
+        "out-of-scope element_name must be left verbatim (not redacted)"
+    );
+    assert_eq!(
+        ed, "Field for henry@example.com",
+        "out-of-scope element_description must be left verbatim (not redacted)"
+    );
     assert!(when.is_some(), "ui_events.redacted_at must be stamped");
 
     let status = worker.status().await;

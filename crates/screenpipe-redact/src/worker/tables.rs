@@ -61,17 +61,20 @@ pub enum TargetTable {
     /// column is prefixed (`accessibility_redacted_at`) so it doesn't
     /// collide with `frames.image_redacted_at` (image PII worker).
     Accessibility,
-    /// All free-text PII surfaces on a `ui_events` row, redacted
-    /// together: `text_content` (typed/keystroke/clipboard text) plus
-    /// the accessibility element context (`element_name`,
-    /// `element_value`, `element_description`) and `window_title`. The
-    /// element columns are written on EVERY event including clicks and
-    /// focus changes (a click on a filled form field persists its
-    /// contents in `element_value`), so unlike `text_content` this
-    /// surface is not gated on `event_type`. Multi-column — uses the
-    /// dedicated [`fetch_unredacted_ui_events`] /
-    /// [`write_redacted_ui_events`] path, not the generic single-column
-    /// helpers. Watermark `redacted_at` (issue #4115).
+    /// The RUNTIME-authored free-text PII surfaces on a `ui_events` row,
+    /// redacted together: `text_content` (typed/keystroke/clipboard text),
+    /// `element_value` (the focused form-field's contents — the key PII
+    /// sink), and `window_title` (app-authored at runtime — routinely an
+    /// email subject, document filename or account/page name, and indexed
+    /// in `ui_events_fts`, so a raw copy would stay searchable). These
+    /// carry user data on EVERY event including clicks and focus changes
+    /// (a click on a filled form field persists its contents in
+    /// `element_value`), so the surface is not gated on `event_type`. See
+    /// [`UI_EVENT_TEXT_COLS`] for the build-time fields we deliberately
+    /// skip. Multi-column — uses the dedicated
+    /// [`fetch_unredacted_ui_events`] / [`write_redacted_ui_events`] path,
+    /// not the generic single-column helpers. Watermark `redacted_at`
+    /// (issue #4115).
     UiEvents,
     /// Per-element OCR + accessibility text (`elements.text`).
     /// Watermark column added by
@@ -100,19 +103,27 @@ pub const ALL_TARGET_TABLES: &[TargetTable] = &[
     TargetTable::Elements,
 ];
 
-/// Free-text columns on a `ui_events` row that the worker redacts
-/// together. `text_content` is the typed/clipboard text; the rest are
-/// accessibility element context (issue #4115) — all user-visible PII.
-/// `element_role` / `element_automation_id` are stable identifiers, not
-/// free text, so they're left out; `browser_url` is redacted on the
-/// frame's `full_text` surface and is structurally a URL, not prose.
-pub const UI_EVENT_TEXT_COLS: &[&str] = &[
-    "text_content",
-    "element_name",
-    "element_value",
-    "element_description",
-    "window_title",
-];
+/// Columns on a `ui_events` row that the worker redacts together. The
+/// rule is RUNTIME-vs-BUILD-TIME authorship, not "is it text":
+///
+/// - **Redact (runtime-authored → carry user data):** `text_content`
+///   (typed/clipboard text), `element_value` (focused form-field
+///   contents — the key PII sink), and `window_title` (set by the app at
+///   runtime — routinely an email subject, document filename or
+///   account/page name, and indexed in `ui_events_fts`, so leaving it raw
+///   persists a searchable plaintext copy).
+/// - **Skip (build-time / developer-authored structural fields → never
+///   carry runtime user PII):** `element_name` and `element_description`
+///   are the accessibility name/description of a *control* ("Submit
+///   button", "Search field"), baked into the UI by its developer;
+///   `element_role` / `element_automation_id` are stable identifiers.
+///   Running the redactor over these every event is wasted CPU/GPU on
+///   props that never hold PII (per louis030195's review), so they're
+///   left untouched.
+///
+/// `browser_url` is redacted on the frame's `full_text` surface and is
+/// structurally a URL, not prose, so it's out of scope here too.
+pub const UI_EVENT_TEXT_COLS: &[&str] = &["text_content", "element_value", "window_title"];
 
 /// One row to redact.
 #[derive(Debug)]
@@ -576,8 +587,10 @@ mod tests {
     async fn ui_events_fetch_covers_all_event_types_and_element_cols() {
         let pool = setup().await;
         // A click event: no typed text, but the focused field's value is
-        // captured in element_value. This row was invisible to the old
-        // worker (event_type='click' matched neither filter).
+        // captured in element_value (in-scope). The developer-authored
+        // element_name ("Tax ID field") is build-time structural metadata
+        // and is NOT a redaction target — but the row is still fetched
+        // because element_value carries runtime PII.
         sqlx::query(
             "INSERT INTO ui_events (event_type, element_value, element_name) \
              VALUES ('click', 'SSN 123-45-6789', 'Tax ID field')",
@@ -602,23 +615,48 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        // A row whose ONLY populated text is the out-of-scope build-time
+        // fields (element_name / element_description). With the trimmed
+        // set these are never redacted, so this row has no in-scope content
+        // and must NOT be fetched — proves the fetch predicate dropped them.
+        sqlx::query(
+            "INSERT INTO ui_events (event_type, element_name, element_description) \
+             VALUES ('click', 'Submit button', 'Submits the form')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let rows = fetch_unredacted_ui_events(&pool, 10).await.unwrap();
-        // The click, the keyboard, the clipboard — but NOT the empty move.
+        // The click (id 1), the keyboard (id 2), the clipboard (id 3) —
+        // but NOT the empty move (id 4) and NOT the structural-only row
+        // (id 5, whose only text lives in the now-out-of-scope columns).
         assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().all(|r| r.id != 5),
+            "a row with PII only in element_name/element_description must \
+             no longer be fetched (those columns are out of scope)"
+        );
 
         // Newest-first: clipboard (id 3), keyboard (id 2), click (id 1).
         let click = rows.iter().find(|r| r.id == 1).unwrap();
         assert_eq!(
             click.cols[col_idx("element_value")].as_deref(),
-            Some("SSN 123-45-6789")
-        );
-        assert_eq!(
-            click.cols[col_idx("element_name")].as_deref(),
-            Some("Tax ID field")
+            Some("SSN 123-45-6789"),
+            "in-scope element_value must be carried for redaction"
         );
         // No text_content on the click row.
         assert!(click.cols[col_idx("text_content")].is_none());
+        // element_name is out of scope, so it's not even a column the
+        // fetch carries — col_idx would panic if it were still in the set.
+        assert!(
+            !UI_EVENT_TEXT_COLS.contains(&"element_name"),
+            "element_name must be dropped from the redacted column set"
+        );
+        assert!(
+            !UI_EVENT_TEXT_COLS.contains(&"element_description"),
+            "element_description must be dropped from the redacted column set"
+        );
     }
 
     /// Already-redacted rows (watermark set) must not be re-fetched.
@@ -641,31 +679,39 @@ mod tests {
     #[tokio::test]
     async fn ui_events_write_overwrites_present_cols_and_stamps_watermark() {
         let pool = setup().await;
+        // element_name holds developer-authored text and is OUT of scope:
+        // even though it's populated, the writer must never touch it.
         sqlx::query(
-            "INSERT INTO ui_events (event_type, text_content, element_value) \
-             VALUES ('click', NULL, 'alice@example.com')",
+            "INSERT INTO ui_events (event_type, text_content, element_value, element_name) \
+             VALUES ('click', NULL, 'alice@example.com', 'Email field')",
         )
         .execute(&pool)
         .await
         .unwrap();
 
-        // Redacted parallel vector: only element_value had content.
+        // Redacted parallel vector: only element_value had in-scope content.
         let mut redacted: Vec<Option<String>> = vec![None; UI_EVENT_TEXT_COLS.len()];
         redacted[col_idx("element_value")] = Some("[EMAIL]".to_string());
 
         write_redacted_ui_events(&pool, 1, &redacted).await.unwrap();
 
         let row = sqlx::query(
-            "SELECT text_content, element_value, redacted_at FROM ui_events WHERE id = 1",
+            "SELECT text_content, element_value, element_name, redacted_at \
+             FROM ui_events WHERE id = 1",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         let tc: Option<String> = row.get(0);
         let ev: String = row.get(1);
-        let when: Option<i64> = row.get(2);
+        let en: String = row.get(2);
+        let when: Option<i64> = row.get(3);
         assert!(tc.is_none(), "NULL column must stay NULL");
-        assert_eq!(ev, "[EMAIL]", "element_value must be overwritten");
+        assert_eq!(ev, "[EMAIL]", "in-scope element_value must be overwritten");
+        assert_eq!(
+            en, "Email field",
+            "out-of-scope element_name must be left exactly as-is (never redacted)"
+        );
         assert!(when.is_some(), "redacted_at must be stamped");
     }
 
