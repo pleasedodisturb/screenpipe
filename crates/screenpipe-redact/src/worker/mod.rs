@@ -328,12 +328,13 @@ impl Worker {
     }
 
     /// Redact the per-frame `full_text` search surface and, in the SAME
-    /// detection pass, propagate the result to that frame's
-    /// `accessibility_text` (a coherent substring of `full_text`) — so the
-    /// model runs once for both columns instead of twice. Falls back to
-    /// plain `full_text` redaction (leaving `accessibility_text` to its own
-    /// pass) when the redactor can't yield a value map (e.g. the span-less
-    /// enclave). Returns the number of column writes performed.
+    /// detection pass, propagate the result to that frame's derived copies
+    /// — `accessibility_text` (a coherent substring of `full_text`) and the
+    /// `accessibility_tree_json` node text (issue #4116) — so the model
+    /// runs once for all three instead of three times. Falls back to plain
+    /// `full_text` redaction (leaving the derived copies to their own
+    /// pass / next run) when the redactor can't yield a value map (e.g. the
+    /// span-less enclave). Returns the number of column writes performed.
     async fn process_frames_fulltext(&self) -> Result<u32, anyhow::Error> {
         let rows =
             tables::fetch_unredacted_frames_fulltext(&self.pool, self.cfg.batch_size).await?;
@@ -373,6 +374,38 @@ impl Worker {
                             .await?;
                             writes += 1;
                             propagated += 1;
+                        }
+                    }
+
+                    // Propagate to the accessibility_tree_json node text
+                    // (issue #4116). The tree is a derived copy of the same
+                    // screen content, so every node's text ⊆ full_text and
+                    // is in `map`. Scrub field-wise with the same map (no
+                    // model call), preserving structure. Malformed JSON →
+                    // skip + leave the watermark NULL so the row is retried
+                    // and never marked done while raw text may survive.
+                    if let Some(tree) = row.accessibility_tree_json.as_deref() {
+                        if !tree.is_empty() && row.accessibility_tree_redacted_at.is_none() {
+                            match crate::tree_json::redact_tree_json(tree, &map) {
+                                Ok(Some(redacted_json)) => {
+                                    tables::write_redacted_tree(&self.pool, row.id, &redacted_json)
+                                        .await?;
+                                    writes += 1;
+                                    propagated += 1;
+                                }
+                                // Empty map can't happen here (we're inside
+                                // the Some(map) arm with detected PII), but
+                                // the None contract means "no write needed".
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!(
+                                        frame_id = row.id,
+                                        error = %e,
+                                        "skipping malformed accessibility_tree_json; \
+                                         leaving it pending for retry"
+                                    );
+                                }
+                            }
                         }
                     }
                 }

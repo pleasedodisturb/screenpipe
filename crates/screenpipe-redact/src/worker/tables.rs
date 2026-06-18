@@ -211,28 +211,36 @@ pub async fn fetch_unredacted(
     Ok(out)
 }
 
-/// A frame's `full_text` plus the sibling `accessibility_text` the worker
-/// redacts from the SAME detection pass (screenpipe/website#291).
-/// `full_text` is the union of accessibility + OCR text (migration
+/// A frame's `full_text` plus the sibling derived copies the worker
+/// redacts from the SAME detection pass (screenpipe/website#291):
+/// `accessibility_text` and `accessibility_tree_json`. `full_text` is the
+/// union of accessibility + OCR text (migration
 /// `20260312000000_consolidate_search_to_frames_full_text.sql`), so every
-/// PII value in `accessibility_text` is present in `full_text` — detect
-/// once on `full_text`, propagate the resulting map to `accessibility_text`.
+/// PII value in those derived copies is present in `full_text` — detect
+/// once on `full_text`, propagate the resulting map to each.
 #[derive(Debug)]
 pub struct FrameTextRow {
     pub id: i64,
     pub full_text: String,
     pub accessibility_text: Option<String>,
     pub accessibility_redacted_at: Option<i64>,
+    /// The raw accessibility-tree JSON (issue #4116). Carried so the
+    /// worker can scrub its node-text fields with the same map, no extra
+    /// detection. `None` for frames captured without a tree.
+    pub accessibility_tree_json: Option<String>,
+    pub accessibility_tree_redacted_at: Option<i64>,
 }
 
 /// Fetch up to `limit` frames whose `full_text` needs redaction
-/// (newest-first), carrying the sibling `accessibility_text` + its
-/// watermark so the caller can propagate in one pass.
+/// (newest-first), carrying the sibling `accessibility_text` /
+/// `accessibility_tree_json` + their watermarks so the caller can
+/// propagate in one pass.
 pub async fn fetch_unredacted_frames_fulltext(
     pool: &SqlitePool,
     limit: u32,
 ) -> Result<Vec<FrameTextRow>, sqlx::Error> {
-    let q = "SELECT id, full_text, accessibility_text, accessibility_redacted_at \
+    let q = "SELECT id, full_text, accessibility_text, accessibility_redacted_at, \
+                    accessibility_tree_json, accessibility_tree_redacted_at \
              FROM frames \
              WHERE full_text IS NOT NULL AND full_text != '' \
                AND full_text_redacted_at IS NULL \
@@ -250,9 +258,37 @@ pub async fn fetch_unredacted_frames_fulltext(
                 .get::<Option<Vec<u8>>, _>("accessibility_text")
                 .map(|b| String::from_utf8_lossy(&b).into_owned()),
             accessibility_redacted_at: r.get::<Option<i64>, _>("accessibility_redacted_at"),
+            accessibility_tree_json: r
+                .get::<Option<Vec<u8>>, _>("accessibility_tree_json")
+                .map(|b| String::from_utf8_lossy(&b).into_owned()),
+            accessibility_tree_redacted_at: r
+                .get::<Option<i64>, _>("accessibility_tree_redacted_at"),
         })
         .collect();
     Ok(out)
+}
+
+/// Overwrite `frames.accessibility_tree_json` with its redacted form and
+/// stamp `accessibility_tree_redacted_at` (issue #4116). Separate from
+/// [`write_redacted`] because the tree JSON has no [`TargetTable`] variant
+/// — it's never redacted via plain string redaction (that would mangle
+/// the JSON); it's only ever scrubbed field-wise via a propagated map.
+pub async fn write_redacted_tree(
+    pool: &SqlitePool,
+    id: i64,
+    redacted_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE frames SET \
+            accessibility_tree_json = ?, \
+            accessibility_tree_redacted_at = strftime('%s', 'now') \
+         WHERE id = ?",
+    )
+    .bind(redacted_json)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Overwrite the source column with the redacted text and stamp the
@@ -313,7 +349,9 @@ mod tests {
                 full_text TEXT,
                 full_text_redacted_at INTEGER,
                 accessibility_text TEXT,
-                accessibility_redacted_at INTEGER
+                accessibility_redacted_at INTEGER,
+                accessibility_tree_json TEXT,
+                accessibility_tree_redacted_at INTEGER
             );
             CREATE TABLE ui_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -590,5 +628,71 @@ mod tests {
             .await
             .unwrap();
         assert!(pending_full.is_empty(), "full_text must be marked done");
+    }
+
+    /// The full_text fetch carries the sibling tree JSON + its watermark so
+    /// the worker can scrub it in the same detection pass (issue #4116).
+    #[tokio::test]
+    async fn fetch_fulltext_carries_tree_json_and_watermark() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO frames (full_text, accessibility_tree_json) \
+             VALUES ('mail bob@x.io', '[{\"text\":\"bob@x.io\"}]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let rows = fetch_unredacted_frames_fulltext(&pool, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].accessibility_tree_json.as_deref(),
+            Some("[{\"text\":\"bob@x.io\"}]")
+        );
+        assert!(
+            rows[0].accessibility_tree_redacted_at.is_none(),
+            "tree watermark must start NULL"
+        );
+    }
+
+    /// `write_redacted_tree` overwrites the tree JSON and stamps its own
+    /// prefixed watermark, independent of the other frame columns.
+    #[tokio::test]
+    async fn write_redacted_tree_overwrites_and_stamps() {
+        let pool = setup().await;
+        sqlx::query(
+            "INSERT INTO frames (full_text, accessibility_tree_json) \
+             VALUES ('x', '[{\"text\":\"alice@x.io\"}]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        write_redacted_tree(&pool, 1, "[{\"text\":\"[EMAIL]\"}]")
+            .await
+            .unwrap();
+
+        let row = sqlx::query(
+            "SELECT accessibility_tree_json, accessibility_tree_redacted_at \
+             FROM frames WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let json: String = row.get(0);
+        let when: Option<i64> = row.get(1);
+        assert_eq!(json, "[{\"text\":\"[EMAIL]\"}]", "tree must be overwritten");
+        assert!(when.is_some(), "tree watermark must be stamped");
+
+        // full_text / accessibility watermarks untouched by the tree write.
+        let other = sqlx::query(
+            "SELECT full_text_redacted_at, accessibility_redacted_at \
+             FROM frames WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(other.get::<Option<i64>, _>(0).is_none());
+        assert!(other.get::<Option<i64>, _>(1).is_none());
     }
 }

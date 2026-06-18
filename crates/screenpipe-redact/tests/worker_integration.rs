@@ -49,7 +49,11 @@ async fn setup_db() -> sqlx::SqlitePool {
             full_text TEXT,
             full_text_redacted_at INTEGER,
             accessibility_text TEXT,
-            accessibility_redacted_at INTEGER
+            accessibility_redacted_at INTEGER,
+            -- Raw accessibility-tree JSON + its prefixed watermark
+            -- (issue #4116); scrubbed via full_text propagation.
+            accessibility_tree_json TEXT,
+            accessibility_tree_redacted_at INTEGER
         );
         CREATE TABLE ui_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -502,6 +506,81 @@ async fn frame_fulltext_redaction_propagates_to_accessibility_once() {
         redactor.batch_calls.load(Ordering::SeqCst),
         0,
         "accessibility_text must be propagated, never independently redacted"
+    );
+}
+
+/// Issue #4116: the same full_text detection also scrubs the frame's
+/// `accessibility_tree_json` node text — structure preserved, raw secret
+/// gone, watermark stamped, and NO extra model pass (propagated map only).
+#[tokio::test]
+async fn frame_fulltext_redaction_propagates_to_tree_json() {
+    let pool = setup_db().await;
+    let secret = "sk-proj-AbCdEf123456GhIjKlMnOp";
+    let tree = format!(
+        r#"[{{"role":"AXStaticText","text":"login {secret}","depth":0,"on_screen":true}},
+            {{"role":"AXButton","value":"resend to {secret}","depth":1}}]"#
+    );
+    let full = format!("login {secret}\nocr dashboard {secret}");
+    sqlx::query("INSERT INTO frames (id, full_text, accessibility_tree_json) VALUES (1, ?, ?)")
+        .bind(&full)
+        .bind(&tree)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let redactor = Arc::new(CountingPipeline {
+        inner: Pipeline::regex_only(),
+        map_calls: AtomicUsize::new(0),
+        batch_calls: AtomicUsize::new(0),
+    });
+    let cfg = WorkerConfig {
+        batch_size: 16,
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::FullText, TargetTable::Accessibility],
+        ..Default::default()
+    };
+    let handle = Worker::new(pool.clone(), redactor.clone(), cfg).spawn();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    handle.abort();
+
+    let row = sqlx::query(
+        "SELECT accessibility_tree_json, accessibility_tree_redacted_at FROM frames WHERE id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let tree_red: String = row.get(0);
+    let tree_when: Option<i64> = row.get(1);
+
+    // Raw secret gone everywhere in the tree.
+    assert!(
+        !tree_red.contains(secret),
+        "raw secret survived in accessibility_tree_json: {tree_red:?}"
+    );
+    assert!(
+        tree_red.contains("[SECRET]"),
+        "tree json not redacted: {tree_red:?}"
+    );
+    // Structure preserved: still valid JSON with the same node fields.
+    let parsed: serde_json::Value = serde_json::from_str(&tree_red).unwrap();
+    let arr = parsed.as_array().expect("tree must still be an array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["role"], "AXStaticText");
+    assert_eq!(arr[0]["on_screen"], true);
+    assert_eq!(arr[1]["role"], "AXButton");
+    assert!(tree_when.is_some(), "tree watermark must be stamped");
+
+    // ONE detection (full_text), propagated — never re-detected per node.
+    assert_eq!(
+        redactor.map_calls.load(Ordering::SeqCst),
+        1,
+        "full_text should be detected exactly once"
+    );
+    assert_eq!(
+        redactor.batch_calls.load(Ordering::SeqCst),
+        0,
+        "tree json must be propagated, never independently redacted"
     );
 }
 
