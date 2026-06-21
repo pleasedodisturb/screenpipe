@@ -625,6 +625,32 @@ impl DatabaseManager {
         )?;
 
         background_results.append(&mut live_results);
+
+        // Collapse acoustic-loopback duplicates across the merged set: the same
+        // utterance captured by both the mic (input) and System Audio (output)
+        // when the user is on speakers, which surfaces as two near-identical
+        // rows of opposite direction. The gate is intentionally tight (opposite
+        // direction, within 1.5s, ≥4 words each, ≥0.85 word similarity) so it
+        // never collapses two distinct speakers — see `acoustic_loopback`.
+        let cand_segs: Vec<crate::acoustic_loopback::LoopbackSeg> = background_results
+            .iter()
+            .map(|r| crate::acoustic_loopback::LoopbackSeg {
+                captured_at: r.timestamp,
+                is_output: matches!(r.device_type, DeviceType::Output),
+                has_speaker: r.speaker.is_some(),
+                text: &r.transcription,
+            })
+            .collect();
+        let drop_idx = crate::acoustic_loopback::loopback_duplicate_indices(&cand_segs);
+        if !drop_idx.is_empty() {
+            let mut idx = 0;
+            background_results.retain(|_| {
+                let keep = !drop_idx.contains(&idx);
+                idx += 1;
+                keep
+            });
+        }
+
         background_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         Ok(background_results
             .into_iter()

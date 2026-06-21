@@ -1012,7 +1012,39 @@ impl DatabaseManager {
         .bind(meeting_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows)
+
+        // Collapse acoustic-loopback duplicates: the same utterance captured by
+        // both the mic (input) and System Audio (output) when the user is on
+        // speakers. The SQL above already applied the direction-SCOPED live/
+        // background dedup; this cross-direction pass is separate and far
+        // tighter (see `acoustic_loopback`). Rows whose timestamp can't be
+        // parsed are always kept.
+        let mut orig_indices: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut cand_segs: Vec<crate::acoustic_loopback::LoopbackSeg> =
+            Vec::with_capacity(rows.len());
+        for (idx, r) in rows.iter().enumerate() {
+            let Ok(captured_at) = DateTime::parse_from_rfc3339(&r.captured_at) else {
+                continue;
+            };
+            orig_indices.push(idx);
+            cand_segs.push(crate::acoustic_loopback::LoopbackSeg {
+                captured_at: captured_at.with_timezone(&Utc),
+                is_output: r.device_type.eq_ignore_ascii_case("output"),
+                has_speaker: r.speaker_id.is_some(),
+                text: &r.transcript,
+            });
+        }
+        let drop_cand = crate::acoustic_loopback::loopback_duplicate_indices(&cand_segs);
+        if drop_cand.is_empty() {
+            return Ok(rows);
+        }
+        let drop_orig: std::collections::HashSet<usize> =
+            drop_cand.into_iter().map(|c| orig_indices[c]).collect();
+        Ok(rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, r)| (!drop_orig.contains(&idx)).then_some(r))
+            .collect())
     }
 
     pub async fn delete_meeting(&self, id: i64) -> Result<u64, SqlxError> {
