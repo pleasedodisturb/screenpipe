@@ -749,6 +749,15 @@ impl DatabaseManager {
         }
         conditions.push("(speakers.id IS NULL OR speakers.hallucination = 0)");
         conditions.push("audio_chunks.file_path NOT LIKE 'cloud://%'");
+        // Exclude mirrored live-meeting rows from the background half. Every
+        // `transcription_engine = 'live'` row in `audio_transcriptions` is a copy
+        // written by `mirror_live_meeting_to_audio_transcriptions` from a
+        // `meeting_transcript_segments` row (the mirror only ever copies existing
+        // segments — strict subset). `search_audio` already queries those segments
+        // directly via `search_live_meeting_transcripts`, so without this filter
+        // every live meeting line is returned twice and `/search` double-surfaces
+        // the whole meeting. The canonical live copy stays; only the duplicate goes.
+        conditions.push("audio_transcriptions.transcription_engine != 'live'");
         if speaker_ids.is_some() {
             conditions.push("(json_array_length(?) = 0 OR audio_transcriptions.speaker_id IN (SELECT value FROM json_each(?)))");
         }
