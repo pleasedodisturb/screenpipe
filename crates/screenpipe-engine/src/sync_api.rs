@@ -142,6 +142,7 @@ pub async fn sync_init(
     let provider = Arc::new(ScreenpipeSyncProvider::new(
         state.db.clone(),
         machine_id.clone(),
+        state.use_pii_removal,
     ));
 
     // Create sync service config
@@ -228,6 +229,7 @@ pub async fn sync_init(
     let download_provider = Arc::new(ScreenpipeSyncProvider::new(
         state.db.clone(),
         machine_id.clone(),
+        state.use_pii_removal,
     ));
     let download_cursor = runtime_state.last_download_at.clone();
     let download_machine_id = machine_id.clone();
@@ -564,7 +566,11 @@ pub async fn sync_download(
     let mut records_imported = 0;
 
     // Import each blob
-    let provider = ScreenpipeSyncProvider::new(state.db.clone(), runtime.machine_id.clone());
+    let provider = ScreenpipeSyncProvider::new(
+        state.db.clone(),
+        runtime.machine_id.clone(),
+        state.use_pii_removal,
+    );
 
     for blob in blobs {
         if blob.blob_type == BlobType::ConnectionConfig {

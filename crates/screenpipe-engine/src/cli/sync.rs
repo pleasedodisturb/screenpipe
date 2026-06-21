@@ -56,7 +56,11 @@ pub async fn start_sync_service(
     let manager = Arc::new(manager);
 
     // Create sync data provider
-    let provider = Arc::new(ScreenpipeSyncProvider::new(db, machine_id));
+    let provider = Arc::new(ScreenpipeSyncProvider::new(
+        db,
+        machine_id,
+        args.use_pii_removal,
+    ));
 
     // Create sync service config
     let service_config = SyncServiceConfig {

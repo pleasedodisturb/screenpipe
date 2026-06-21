@@ -148,12 +148,22 @@ pub const SCHEMA_VERSION: u32 = 2;
 pub struct ScreenpipeSyncProvider {
     db: Arc<DatabaseManager>,
     machine_id: String,
+    /// When true, user-authored text is scrubbed (regex PII removal) as each
+    /// sync chunk is built, so raw PII never leaves the device even before the
+    /// async redaction worker has rewritten the stored columns. Mirrors the
+    /// "AI PII removal" toggle (`use_pii_removal`). See `redact_chunk`.
+    redact_on_read: bool,
 }
 
 impl ScreenpipeSyncProvider {
-    /// Create a new sync provider.
-    pub fn new(db: Arc<DatabaseManager>, machine_id: String) -> Self {
-        Self { db, machine_id }
+    /// Create a new sync provider. `redact_on_read` should be the engine's
+    /// `use_pii_removal` setting: when set, outgoing chunks are PII-scrubbed.
+    pub fn new(db: Arc<DatabaseManager>, machine_id: String, redact_on_read: bool) -> Self {
+        Self {
+            db,
+            machine_id,
+            redact_on_read,
+        }
     }
 
     /// Get unsynced frames and their OCR data for a time window.
@@ -802,6 +812,57 @@ impl ScreenpipeSyncProvider {
     }
 }
 
+/// Scrub user-authored text from a sync chunk in place (regex PII removal).
+///
+/// Only RUNTIME-authored, user-data fields are scrubbed — the same columns the
+/// async redaction worker targets, so the cloud copy matches what the worker
+/// eventually rewrites locally:
+///   * frames / OCR: `full_text`, `window_name`, `browser_url`
+///   * audio: `transcription`
+///   * accessibility: `text_content` (full_text), `window_name`, `browser_url`
+///   * ui_events: `text_content`, `element_value`, `window_title`,
+///     `element_name`, `element_description` (== worker's `UI_EVENT_TEXT_COLS`)
+///
+/// Build-time / structural fields (`app_name`, `element_role`,
+/// `element_automation_id`, coordinates, ids) are left untouched — they carry no
+/// user data and re-running regex over them every sync would waste CPU.
+fn redact_chunk(chunk: &mut SyncChunk) {
+    use screenpipe_core::pii_removal::remove_pii;
+
+    fn scrub(s: &mut String) {
+        *s = remove_pii(s);
+    }
+    fn scrub_opt(o: &mut Option<String>) {
+        if let Some(s) = o {
+            *s = remove_pii(s);
+        }
+    }
+
+    for f in &mut chunk.frames {
+        scrub_opt(&mut f.window_name);
+        scrub_opt(&mut f.browser_url);
+    }
+    for o in &mut chunk.ocr_records {
+        scrub(&mut o.text);
+        scrub_opt(&mut o.window_name);
+    }
+    for t in &mut chunk.transcriptions {
+        scrub(&mut t.transcription);
+    }
+    for a in &mut chunk.accessibility_records {
+        scrub(&mut a.text_content);
+        scrub(&mut a.window_name);
+        scrub_opt(&mut a.browser_url);
+    }
+    for e in &mut chunk.ui_events {
+        scrub_opt(&mut e.text_content);
+        scrub_opt(&mut e.element_value);
+        scrub_opt(&mut e.window_title);
+        scrub_opt(&mut e.element_name);
+        scrub_opt(&mut e.element_description);
+    }
+}
+
 #[async_trait]
 impl SyncDataProvider for ScreenpipeSyncProvider {
     async fn get_pending_data(
@@ -818,7 +879,14 @@ impl SyncDataProvider for ScreenpipeSyncProvider {
         };
 
         match chunk_result {
-            Some((chunk, time_start, time_end)) => {
+            Some((mut chunk, time_start, time_end)) => {
+                // Redact-on-read: scrub user-authored text before it leaves the
+                // device. The async redaction worker rewrites the STORED columns
+                // independently and may not have reached these rows yet, so
+                // without this a row could sync raw before being redacted.
+                if self.redact_on_read {
+                    redact_chunk(&mut chunk);
+                }
                 let text_content = Self::get_chunk_text(&chunk);
                 let data = serde_json::to_vec(&chunk).map_err(|e| {
                     SyncError::Database(format!("failed to serialize chunk: {}", e))
@@ -902,5 +970,190 @@ mod tests {
         assert_eq!(parsed.machine_id, "test-machine");
         assert_eq!(parsed.frames.len(), 1);
         assert_eq!(parsed.ocr_records.len(), 1);
+    }
+
+    /// `redact_chunk` scrubs every user-authored text field across all record
+    /// types, and leaves structural fields (app_name, element_role) untouched.
+    #[test]
+    fn redact_chunk_scrubs_user_text_not_structural() {
+        let email = "alice@example.com";
+        let ssn = "123-45-6789";
+        let mut chunk = SyncChunk {
+            schema_version: SCHEMA_VERSION,
+            machine_id: "m".to_string(),
+            time_start: "2024-01-28T14:00:00Z".to_string(),
+            time_end: "2024-01-28T14:05:00Z".to_string(),
+            frames: vec![FrameRecord {
+                sync_id: "f1".to_string(),
+                timestamp: "2024-01-28T14:00:00Z".to_string(),
+                offset_index: 0,
+                app_name: Some("Google Chrome".to_string()),
+                window_name: Some(format!("inbox {email}")),
+                browser_url: Some(format!("https://mail/u/{email}")),
+                device_name: "MacBook".to_string(),
+                cloud_frame_path: None,
+            }],
+            ocr_records: vec![OcrRecord {
+                sync_id: "o1".to_string(),
+                frame_sync_id: "f1".to_string(),
+                text: format!("my ssn is {ssn}"),
+                focused: true,
+                app_name: Some("Google Chrome".to_string()),
+                window_name: Some(format!("inbox {email}")),
+            }],
+            transcriptions: vec![TranscriptionRecord {
+                sync_id: "t1".to_string(),
+                timestamp: "2024-01-28T14:00:00Z".to_string(),
+                transcription: format!("call me at {email}"),
+                device: "mic".to_string(),
+                is_input_device: true,
+                speaker_id: None,
+            }],
+            accessibility_records: vec![AccessibilityRecord {
+                sync_id: "a1".to_string(),
+                timestamp: "2024-01-28T14:00:00Z".to_string(),
+                app_name: "Safari".to_string(),
+                window_name: format!("tab {email}"),
+                text_content: format!("contact {email}"),
+                browser_url: Some(format!("http://x/{email}")),
+            }],
+            ui_events: vec![UiEventSyncRecord {
+                sync_id: "u1".to_string(),
+                timestamp: "2024-01-28T14:00:00Z".to_string(),
+                event_type: "text".to_string(),
+                app_name: Some("Google Chrome".to_string()),
+                window_title: Some(format!("inbox {email}")),
+                browser_url: None,
+                text_content: Some(format!("typed {email}")),
+                x: None,
+                y: None,
+                key_code: None,
+                modifiers: None,
+                element_role: Some("AXTextField".to_string()),
+                element_name: Some(format!("field {email}")),
+                session_id: None,
+                relative_ms: None,
+                delta_x: None,
+                delta_y: None,
+                button: None,
+                click_count: None,
+                text_length: None,
+                app_pid: None,
+                element_value: Some(format!("ssn {ssn}")),
+                element_description: Some(format!("desc {email}")),
+                element_automation_id: None,
+                element_bounds: None,
+                frame_id: None,
+            }],
+        };
+
+        redact_chunk(&mut chunk);
+
+        // Every scrubbed field no longer carries the raw PII.
+        let f = &chunk.frames[0];
+        assert!(!f.window_name.as_ref().unwrap().contains(email));
+        assert!(!f.browser_url.as_ref().unwrap().contains(email));
+        let o = &chunk.ocr_records[0];
+        assert!(!o.text.contains(ssn));
+        assert!(!o.window_name.as_ref().unwrap().contains(email));
+        assert!(!chunk.transcriptions[0].transcription.contains(email));
+        let a = &chunk.accessibility_records[0];
+        assert!(!a.text_content.contains(email));
+        assert!(!a.window_name.contains(email));
+        assert!(!a.browser_url.as_ref().unwrap().contains(email));
+        let u = &chunk.ui_events[0];
+        assert!(!u.text_content.as_ref().unwrap().contains(email));
+        assert!(!u.element_value.as_ref().unwrap().contains(ssn));
+        assert!(!u.window_title.as_ref().unwrap().contains(email));
+        assert!(!u.element_name.as_ref().unwrap().contains(email));
+        assert!(!u.element_description.as_ref().unwrap().contains(email));
+
+        // Structural fields are left exactly as-is.
+        assert_eq!(f.app_name.as_deref(), Some("Google Chrome"));
+        assert_eq!(o.app_name.as_deref(), Some("Google Chrome"));
+        assert_eq!(a.app_name, "Safari");
+        assert_eq!(u.app_name.as_deref(), Some("Google Chrome"));
+        assert_eq!(u.element_role.as_deref(), Some("AXTextField"));
+    }
+
+    /// End-to-end: the `redact_on_read` flag controls whether a chunk built by
+    /// `get_pending_data` is PII-scrubbed before it would leave the device.
+    #[tokio::test]
+    async fn redact_on_read_flag_gates_sync_chunk() {
+        use screenpipe_db::{InsertUiEvent, UiEventType};
+        use std::sync::Arc;
+
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+        sqlx::migrate!("../screenpipe-db/src/migrations")
+            .run(&db.pool)
+            .await
+            .unwrap();
+
+        let event = InsertUiEvent {
+            timestamp: chrono::Utc::now(),
+            session_id: None,
+            relative_ms: 0,
+            event_type: UiEventType::Text,
+            x: None,
+            y: None,
+            delta_x: None,
+            delta_y: None,
+            button: None,
+            click_count: None,
+            key_code: None,
+            modifiers: None,
+            text_content: Some("reach me at alice@example.com".to_string()),
+            app_name: Some("Chrome".to_string()),
+            app_pid: None,
+            window_title: Some("inbox".to_string()),
+            browser_url: None,
+            element_role: Some("AXTextField".to_string()),
+            element_name: None,
+            element_value: Some("ssn 123-45-6789".to_string()),
+            element_description: None,
+            element_automation_id: None,
+            element_bounds: None,
+            frame_id: None,
+        };
+        db.insert_ui_event(&event).await.unwrap();
+
+        let db = Arc::new(db);
+
+        // redact_on_read = true → text scrubbed.
+        let provider = ScreenpipeSyncProvider::new(db.clone(), "m".to_string(), true);
+        let blobs = provider
+            .get_pending_data(BlobType::Input, 10)
+            .await
+            .unwrap();
+        let chunk: SyncChunk = serde_json::from_slice(&blobs[0].data).unwrap();
+        let ev = &chunk.ui_events[0];
+        assert!(
+            !ev.text_content
+                .as_ref()
+                .unwrap()
+                .contains("alice@example.com"),
+            "text_content should be scrubbed when redact_on_read is on"
+        );
+        assert!(!ev.element_value.as_ref().unwrap().contains("123-45-6789"));
+        assert_eq!(ev.app_name.as_deref(), Some("Chrome"));
+
+        // redact_on_read = false → raw passes through (the row was never marked
+        // synced, so it is still pending and returned again).
+        let raw_provider = ScreenpipeSyncProvider::new(db.clone(), "m".to_string(), false);
+        let raw_blobs = raw_provider
+            .get_pending_data(BlobType::Input, 10)
+            .await
+            .unwrap();
+        let raw_chunk: SyncChunk = serde_json::from_slice(&raw_blobs[0].data).unwrap();
+        assert!(
+            raw_chunk.ui_events[0]
+                .text_content
+                .as_ref()
+                .unwrap()
+                .contains("alice@example.com"),
+            "text_content should be raw when redact_on_read is off"
+        );
     }
 }
