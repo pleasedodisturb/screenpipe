@@ -1095,6 +1095,39 @@ fn ensure_screenpipe_skill(project_dir: &str) -> Result<(), String> {
 /// Web search uses the screenpipe cloud backend (Gemini + Google Search),
 /// so we only enable it for screenpipe-cloud presets to avoid sending
 /// user data to our backend when they chose a local/custom provider.
+/// Selects which web-search extension (if any) to install for a provider — a
+/// pure function so the routing is unit-testable without touching the filesystem.
+///
+/// - screenpipe-cloud / pi / default preset (`None`): the cloud extension, which
+///   POSTs to `api.screenpipe.com` (Gemini grounding).
+/// - `anthropic` with a BYO key: a native extension that calls the user's OWN
+///   Anthropic `web_search` tool — no screenpipe backend hop, preserving the
+///   privacy guarantee for BYO providers (#4177; louis asked for this on #4279).
+/// - everything else (openai / native-ollama / custom, or anthropic without a
+///   key): no provider-native search available yet → install nothing. OpenAI's
+///   Responses `web_search` and a generic SearXNG backend are the planned
+///   Phase 2; the #4279 "unavailable" stub is the correct no-config fallback.
+///
+/// The native extension reads its key/model/base-url from the env vars the pi
+/// process is already spawned with (`ANTHROPIC_API_KEY`, `SCREENPIPE_PI_MODEL`,
+/// `SCREENPIPE_PI_BASE_URL`), so the selector only needs to know the provider +
+/// whether a key is configured.
+fn web_search_extension_for(provider_config: Option<&PiProviderConfig>) -> Option<&'static str> {
+    const CLOUD: &str = include_str!("../assets/extensions/web-search.ts");
+    const ANTHROPIC: &str = include_str!("../assets/extensions/web-search-anthropic.ts");
+
+    let config = match provider_config {
+        None => return Some(CLOUD), // default preset = screenpipe cloud
+        Some(c) => c,
+    };
+    let has_key = config.api_key.as_deref().is_some_and(|k| !k.is_empty());
+    match config.provider.as_str() {
+        "screenpipe-cloud" | "pi" => Some(CLOUD),
+        "anthropic" if has_key => Some(ANTHROPIC),
+        _ => None,
+    }
+}
+
 fn ensure_web_search_extension(
     project_dir: &str,
     provider_config: Option<&PiProviderConfig>,
@@ -1104,28 +1137,24 @@ fn ensure_web_search_extension(
         .join("extensions");
     let ext_path = ext_dir.join("web-search.ts");
 
-    let is_screenpipe_cloud = match provider_config {
-        Some(config) => matches!(config.provider.as_str(), "screenpipe-cloud" | "pi"),
-        None => true, // default preset = screenpipe cloud
-    };
-
-    if is_screenpipe_cloud {
-        std::fs::create_dir_all(&ext_dir)
-            .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
-
-        let ext_content = include_str!("../assets/extensions/web-search.ts");
-        std::fs::write(&ext_path, ext_content)
-            .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
-
-        debug!("Web search extension installed at {:?}", ext_path);
-    } else if ext_path.exists() {
-        std::fs::remove_file(&ext_path)
-            .map_err(|e| format!("Failed to remove web-search extension: {}", e))?;
-
-        info!(
-            "Web search extension removed (provider {:?} is not screenpipe-cloud)",
-            provider_config.map(|c| &c.provider)
-        );
+    match web_search_extension_for(provider_config) {
+        Some(ext_content) => {
+            std::fs::create_dir_all(&ext_dir)
+                .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
+            std::fs::write(&ext_path, ext_content)
+                .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
+            debug!("Web search extension installed at {:?}", ext_path);
+        }
+        None => {
+            if ext_path.exists() {
+                std::fs::remove_file(&ext_path)
+                    .map_err(|e| format!("Failed to remove web-search extension: {}", e))?;
+                info!(
+                    "Web search extension removed (provider {:?} has no native search)",
+                    provider_config.map(|c| &c.provider)
+                );
+            }
+        }
     }
 
     Ok(())
@@ -1913,6 +1942,17 @@ pub async fn pi_start_inner(
                     _ => {}
                 }
             }
+        }
+
+        // Provider-native web-search extensions (e.g. web-search-anthropic.ts)
+        // call the configured provider's own search API directly — they need the
+        // model id and (for a non-default endpoint) the base URL, alongside the
+        // provider key already injected above.
+        if !config.model.is_empty() {
+            cmd.env("SCREENPIPE_PI_MODEL", &config.model);
+        }
+        if !config.url.is_empty() {
+            cmd.env("SCREENPIPE_PI_BASE_URL", &config.url);
         }
     }
 
@@ -3210,6 +3250,86 @@ pub fn ensure_pi_installed_background() {
 
 #[cfg(test)]
 mod tests {
+    // --- web-search extension router (web_search_extension_for) ---
+    fn web_search_provider(provider: &str, api_key: Option<&str>) -> super::PiProviderConfig {
+        super::PiProviderConfig {
+            provider: provider.to_string(),
+            url: String::new(),
+            model: "claude-opus-4-8".to_string(),
+            api_key: api_key.map(str::to_string),
+            max_tokens: 4096,
+            system_prompt: None,
+        }
+    }
+
+    #[test]
+    fn web_search_default_preset_uses_cloud() {
+        // No provider config = default preset = screenpipe cloud backend.
+        let ext =
+            super::web_search_extension_for(None).expect("default preset installs an extension");
+        assert!(
+            ext.contains("api.screenpipe.com"),
+            "default preset must use the screenpipe cloud backend"
+        );
+        assert!(ext.contains("sp_web_search"));
+    }
+
+    #[test]
+    fn web_search_cloud_presets_use_cloud() {
+        for p in ["screenpipe-cloud", "pi"] {
+            let cfg = web_search_provider(p, None);
+            let ext =
+                super::web_search_extension_for(Some(&cfg)).expect("cloud preset installs cloud");
+            assert!(
+                ext.contains("api.screenpipe.com"),
+                "{p} should use the cloud backend"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_anthropic_with_key_uses_native() {
+        let cfg = web_search_provider("anthropic", Some("sk-ant-xxx"));
+        let ext = super::web_search_extension_for(Some(&cfg))
+            .expect("anthropic+key installs native variant");
+        // The native variant calls the user's OWN Anthropic API, never screenpipe's.
+        assert!(
+            !ext.contains("api.screenpipe.com"),
+            "native variant must NOT hit the screenpipe backend"
+        );
+        assert!(
+            ext.contains("web_search_20250305"),
+            "native variant uses the Anthropic web_search tool"
+        );
+        assert!(
+            ext.contains("sp_web_search"),
+            "tool name stays sp_web_search (#3812)"
+        );
+    }
+
+    #[test]
+    fn web_search_anthropic_without_key_installs_nothing() {
+        for key in [None, Some("")] {
+            let cfg = web_search_provider("anthropic", key);
+            assert!(
+                super::web_search_extension_for(Some(&cfg)).is_none(),
+                "anthropic without a key → no native search (key={key:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_other_providers_install_nothing() {
+        // openai / native-ollama / custom have no provider-native search yet (Phase 2).
+        for p in ["openai", "native-ollama", "custom"] {
+            let cfg = web_search_provider(p, Some("some-key"));
+            assert!(
+                super::web_search_extension_for(Some(&cfg)).is_none(),
+                "{p} has no provider-native search (Phase 2)"
+            );
+        }
+    }
+
     #[cfg(windows)]
     use super::parse_where_output;
     #[cfg(not(windows))]
