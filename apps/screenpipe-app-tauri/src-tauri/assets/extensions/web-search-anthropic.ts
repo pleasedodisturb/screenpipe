@@ -57,7 +57,20 @@ export function mapAnthropicWebSearch(
     }
   }
 
-  const text = textParts.join("").trim() || "No results found.";
+  // The model can stop before emitting any prose — stop_reason "pause_turn"
+  // (it wanted another turn) or hitting max_tokens mid-search — yet still have
+  // returned web_search_tool_result sources. Falling back to "No results
+  // found." there is misleading: surface the sources we got instead (#4447
+  // review, louis030195).
+  const joinedText = textParts.join("").trim();
+  const text =
+    joinedText ||
+    (sources.length > 0
+      ? `Found ${sources.length} source${sources.length === 1 ? "" : "s"}:\n` +
+        sources
+          .map((s) => `- ${s.title ? `${s.title} — ` : ""}${s.url ?? ""}`)
+          .join("\n")
+      : "No results found.");
   return {
     content: [{ type: "text" as const, text }],
     details: { sources, query },
@@ -123,7 +136,10 @@ export default function (pi: ExtensionAPI) {
         },
         body: JSON.stringify({
           model,
-          max_tokens: 1024,
+          // A single-shot search + a cited answer routinely exceeds 1024
+          // tokens; too low truncates the answer to empty text even when
+          // sources came back (#4447 review).
+          max_tokens: 4096,
           messages: [{ role: "user", content: params.query }],
           // Basic web search (no code-execution dependency).
           tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 5 }],
