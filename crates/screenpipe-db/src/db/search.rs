@@ -1561,6 +1561,7 @@ impl DatabaseManager {
                    FROM {table}
                    {speaker_join}
                    WHERE {match_condition}
+                       AND audio_transcriptions.transcription_engine != 'live'
                        AND (?2 IS NULL OR audio_transcriptions.timestamp >= ?2)
                        AND (?3 IS NULL OR audio_transcriptions.timestamp <= ?3)
                        AND (?4 IS NULL OR COALESCE(audio_transcriptions.text_length, LENGTH(audio_transcriptions.transcription)) >= ?4)

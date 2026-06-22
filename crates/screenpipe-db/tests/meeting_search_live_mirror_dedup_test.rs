@@ -21,7 +21,7 @@
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, Utc};
-    use screenpipe_db::{AudioDevice, DatabaseManager, DeviceType};
+    use screenpipe_db::{AudioDevice, ContentType, DatabaseManager, DeviceType};
 
     async fn setup_test_db() -> DatabaseManager {
         let db = DatabaseManager::new("sqlite::memory:", Default::default())
@@ -139,6 +139,77 @@ mod tests {
             "surviving copy should be the canonical live segment (tagged 'meeting'), got tags {:?}",
             hits[0].tags
         );
+    }
+
+    /// Count-path regression (#4437 review, louis030195): the dedup must also
+    /// reach `count_search_results`, not just the page rows. The mirror inflates
+    /// `background_count`, which is then ADDED to the live count, so `total`
+    /// came back ~2× the rows actually returned — breaking pagination. Assert
+    /// the count equals the number of returned rows (1, not 2).
+    #[tokio::test]
+    async fn count_matches_returned_rows_for_mirrored_line() {
+        let db = setup_test_db().await;
+        let meeting_id = open_wide_meeting(&db).await;
+        let base = Utc::now();
+
+        db.insert_audio_chunk("System Audio (output)_meeting.mp4", Some(base))
+            .await
+            .unwrap();
+        let line = "the count path must not double this meeting line";
+        db.insert_meeting_transcript_segment(
+            meeting_id,
+            "screenpipe-cloud",
+            Some("nova-3"),
+            "deepgram:0:0",
+            "System Audio",
+            "output",
+            None,
+            line,
+            base,
+        )
+        .await
+        .unwrap();
+
+        let mirrored = db
+            .mirror_live_meeting_to_audio_transcriptions(meeting_id, 15.0)
+            .await
+            .unwrap();
+        assert_eq!(mirrored, 1, "mirror should copy exactly one segment");
+
+        // Page rows: deduped to the single canonical live copy.
+        let rows = all_audio(&db).await;
+        let hits = rows.iter().filter(|r| r.transcription == line).count();
+        assert_eq!(hits, 1, "page path should return the line once");
+
+        // Count must agree with the page rows. Before the count-path fix this
+        // returned 2 (background mirror + live), != rows returned.
+        let total = db
+            .count_search_results(
+                "",
+                ContentType::Audio,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            total,
+            rows.len(),
+            "audio count ({}) must match returned rows ({}) — no live-mirror double count",
+            total,
+            rows.len()
+        );
+        assert_eq!(total, 1, "exactly one audio row total, counted once");
     }
 
     /// A genuine background transcription (real Deepgram/whisper output, NOT a
