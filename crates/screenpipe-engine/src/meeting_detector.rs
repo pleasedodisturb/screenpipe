@@ -314,7 +314,21 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 browser_title_patterns: &[],
             },
             call_signals: vec![
-                CallSignal::AutomationIdContains("leave"),
+                // Webex runs messaging and meetings in one process. Its in-call
+                // controls carry locale-independent `callControl_*` automation ids
+                // (live-verified: the "End meeting" button is `callControl_end`).
+                // The messaging chrome's "Leave the space"/"Leave the team"
+                // affordance is an AXMenuItem with id `appMenuLeaveSpace` /
+                // `appMenuLeaveTeam` — which the previous `AutomationIdContains
+                // ("leave")` matched ("appMenu**Leave**Space" contains "leave"),
+                // firing a phantom meeting whenever Webex sat open for chat
+                // (#4145/#4337). Match the call-control id prefix instead, so only
+                // real in-call controls count. `appMenuLeaveSpace` does not contain
+                // "callcontrol", so messaging no longer trips it.
+                CallSignal::AutomationIdContains("callControl"),
+                // English-locale fallbacks. Both are role-constrained to AXButton,
+                // so the messaging "Leave the space" AXMenuItem can never match
+                // them (a real meeting's leave/end controls are buttons).
                 CallSignal::RoleWithName {
                     role: "AXButton",
                     name_contains: "leave",
@@ -325,12 +339,10 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                 },
             ],
             min_signals_required: 1,
-            // Webex is used as both a messaging app and a meeting app under one
-            // process. Its messaging window is titled exactly `Webex`; a real
-            // meeting window is titled with the meeting/space name. Drop signals
-            // originating from the bare-`Webex` messaging window so chat chrome
-            // ("Leave space"/"Leave team") never starts a phantom meeting, while
-            // a real meeting window's leave/end signals still count. See #4145.
+            // Defense-in-depth only. The signal-level discriminator above is the
+            // real fix: the phantom came from an app-menu item that has NO window
+            // title, so a window-title guard could never catch it. Kept because a
+            // window titled exactly `Webex` is unambiguously the messaging shell.
             ignore_window_titles: &["webex"],
         },
         // Discord native — macOS.
@@ -3886,15 +3898,18 @@ mod tests {
         ));
     }
 
-    // ── Webex messaging-vs-meeting window-title guard (#4145) ──────────
+    // ── Webex messaging-vs-meeting discrimination (#4145/#4337) ──────────
     //
-    // Webex runs messaging and meetings under one process. The messaging window
-    // is titled exactly `Webex` and its chrome exposes "Leave space"/"Leave
-    // team" affordances that trip the bare `leave` signal — a phantom meeting.
-    // A real meeting window is titled with the meeting/space name. The
-    // per-window guard drops signals from the bare-`Webex` window while letting
-    // a meeting window's signals through. These tests model that scan decision
-    // without a live AX tree.
+    // Webex runs messaging and meetings under one process. The phantom meeting
+    // came from the messaging app-menu item "Leave the space"/"Leave the team"
+    // (role AXMenuItem, identifier `appMenuLeaveSpace`/`appMenuLeaveTeam`), which
+    // the over-broad `AutomationIdContains("leave")` signal matched. Real in-call
+    // controls carry locale-independent `callControl_*` ids (live-captured: the
+    // "End meeting" button is `callControl_end`). The fix narrows the automation-id
+    // signal to `callControl`, so the messaging menu item no longer matches while
+    // real meetings still do. The element attributes asserted below are the exact
+    // ones captured from a live Webex on macOS. The remaining `ignore_window_titles`
+    // guard is retained as defense-in-depth (see the profile comment).
 
     /// The Webex profile as loaded in production.
     fn webex_profile() -> MeetingDetectionProfile {
@@ -3955,86 +3970,94 @@ mod tests {
     }
 
     #[test]
-    fn webex_messaging_leave_chrome_does_not_start_meeting() {
-        // Repro of the phantom: the messaging window exposes "Leave space" /
-        // "Leave team" buttons that match the bare `leave` signal. On their own
-        // they would declare a call active. The guard fires first because the
-        // owning window is titled exactly `Webex`, so no meeting starts.
+    fn webex_messaging_leave_menuitem_produces_no_signal() {
+        // THE FIX (live-captured): the messaging "Leave the space"/"Leave the
+        // team" affordance is an AXMenuItem with identifier `appMenuLeaveSpace`/
+        // `appMenuLeaveTeam` — NOT an AXButton. The old `AutomationIdContains
+        // ("leave")` matched its id and started a phantom meeting. With the signal
+        // narrowed to `callControl`, it produces NO signal — and note this holds
+        // at the signal level, independent of any window-title guard (the node has
+        // no window title at all, which is why the title guard alone never fixed it).
         let p = webex_profile();
-
-        // The chat-chrome buttons DO match a call signal (this is the root bug).
         assert!(
-            any_signal_matches(&p, "AXButton", Some("Leave space"), None, None),
-            "sanity: chat 'Leave space' matches the bare `leave` signal"
+            !any_signal_matches(
+                &p,
+                "AXMenuItem",
+                Some("Leave the space"),
+                None,
+                Some("appMenuLeaveSpace"),
+            ),
+            "messaging 'Leave the space' menu item must NOT count as a call signal"
         );
-        assert!(any_signal_matches(
-            &p,
-            "AXButton",
-            Some("Leave team"),
-            None,
-            None
-        ));
-
-        // ...but the window guard suppresses them, so the scan finds no signals.
-        let messaging_window_title = Some("Webex");
-        let suppressed = window_title_is_ignored(messaging_window_title, &p);
         assert!(
-            suppressed,
-            "bare `Webex` window must be skipped before walking"
+            !any_signal_matches(
+                &p,
+                "AXMenuItem",
+                Some("Leave the team"),
+                None,
+                Some("appMenuLeaveTeam"),
+            ),
+            "messaging 'Leave the team' menu item must NOT count as a call signal"
         );
-
-        // Net per-window decision: signals are dropped → no phantom meeting.
-        let in_call =
-            !suppressed && any_signal_matches(&p, "AXButton", Some("Leave space"), None, None);
-        assert!(!in_call, "Webex messaging must not auto-start a meeting");
     }
 
     #[test]
-    fn real_webex_meeting_still_detected() {
-        // A real meeting window: titled with the meeting name (not guarded) and
-        // exposing the in-call "Leave" / "Leave Meeting" control. Detection must
-        // still fire — the fix must not silence real meetings.
+    fn real_webex_meeting_call_controls_are_detected() {
+        // A real meeting's in-call controls carry `callControl_*` ids. Detection
+        // must still fire — the fix must not silence real meetings.
         let p = webex_profile();
-        let meeting_window_title = Some("Project Update Call");
-
-        let suppressed = window_title_is_ignored(meeting_window_title, &p);
-        assert!(!suppressed, "a real meeting window must not be guarded");
-
-        let in_call =
-            !suppressed && any_signal_matches(&p, "AXButton", Some("Leave Meeting"), None, None);
+        // Host: "End meeting" button, identifier callControl_end (live-captured).
         assert!(
-            in_call,
-            "real Webex meeting must auto-start (signal counts)"
+            any_signal_matches(
+                &p,
+                "AXButton",
+                Some("End meeting"),
+                None,
+                Some("callControl_end"),
+            ),
+            "host 'End meeting' control (callControl_end) must be detected"
         );
-
-        // The leave-button automation id also still counts in a meeting window.
-        let in_call_via_id = !suppressed
-            && any_signal_matches(&p, "AXButton", None, None, Some("leave-call-button"));
-        assert!(in_call_via_id);
+        // Participant: a leave control with a callControl_* id.
+        assert!(
+            any_signal_matches(
+                &p,
+                "AXButton",
+                Some("Leave meeting"),
+                None,
+                Some("callControl_leave"),
+            ),
+            "participant leave control (callControl_*) must be detected"
+        );
+        // Even without a callControl id, the role-constrained AXButton name
+        // fallback catches a leave/end button (English locale).
+        assert!(
+            any_signal_matches(&p, "AXButton", Some("Leave Meeting"), None, None),
+            "AXButton named 'Leave Meeting' must be detected via the name fallback"
+        );
     }
 
     #[test]
     fn webex_messaging_open_during_meeting_still_detects_meeting() {
-        // Both windows open at once. The guard is per-window: signals from the
-        // bare-`Webex` messaging window are dropped, but the meeting window
-        // (matched by its own title) is still scanned and detected.
+        // Both open at once: the messaging menu item contributes no signal (it is
+        // excluded at the signal level), while the meeting's call control fires —
+        // so the process is correctly in a call.
         let p = webex_profile();
-
-        let messaging_dropped = window_title_is_ignored(Some("Webex"), &p);
-        let meeting_dropped = window_title_is_ignored(Some("Weekly Sync"), &p);
-        assert!(messaging_dropped);
-        assert!(!meeting_dropped);
-
-        // Aggregate scan outcome across both windows: meeting window contributes
-        // its signal, so the process is in a call.
-        let process_in_call = (!messaging_dropped
-            && any_signal_matches(&p, "AXButton", Some("Leave team"), None, None))
-            || (!meeting_dropped
-                && any_signal_matches(&p, "AXButton", Some("Leave Meeting"), None, None));
-        assert!(
-            process_in_call,
-            "meeting must still be detected when messaging is open alongside it"
+        let messaging_signal = any_signal_matches(
+            &p,
+            "AXMenuItem",
+            Some("Leave the space"),
+            None,
+            Some("appMenuLeaveSpace"),
         );
+        let meeting_signal = any_signal_matches(
+            &p,
+            "AXButton",
+            Some("End meeting"),
+            None,
+            Some("callControl_end"),
+        );
+        assert!(!messaging_signal, "messaging must contribute no signal");
+        assert!(meeting_signal, "meeting call control must be detected");
     }
 
     #[test]
