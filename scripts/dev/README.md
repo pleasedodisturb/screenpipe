@@ -76,5 +76,5 @@ scripts/dev/pr-evidence --out fix.gif \
 scripts/dev/pr-evidence-gui --out demo.gif --seconds 20
 ```
 
-Deps: `brew install asciinema agg ffmpeg`. The scripts are MIT-licensed along
-with the rest of the repo; copy or adapt freely.
+Deps: `brew install asciinema agg ffmpeg`. These scripts are part of the
+repository and covered by its [LICENSE.md](../../LICENSE.md).
