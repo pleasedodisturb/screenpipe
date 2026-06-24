@@ -13,6 +13,7 @@ an agent. Everything here is opt-in; nothing runs unless you call it.
 | `screenpipe-dev` | Build + run a dev instance on an **isolated port + data dir** so it never touches your real `~/.screenpipe` | anywhere (headless OK) |
 | `pr-evidence` | **Tier 1** — headless terminal before/after GIF (asciinema → agg) for engine/CLI/DB changes | anywhere (headless OK) |
 | `pr-evidence-gui` | **Tier 2** — screen-record the real app window → GIF for UX changes | **logged-in GUI session only** (see below) |
+| `pr-demo` | **Orchestrator** — build → drive → record → verify → verdict (PASS/UNSURE/FAIL), escalating on anything unconfirmed | **logged-in GUI session** (uses `pr-evidence-gui`) |
 
 ## Why two tiers of evidence
 
@@ -56,10 +57,28 @@ or the demo fails after a retry**. That keeps a broken demo from ever
 auto-passing, while leaving the 1% of genuinely manual setup (creating a test
 account, a one-time login) to a person.
 
-> Status: `screenpipe-dev`, `pr-evidence`, and `pr-evidence-gui` are working
-> today. The full orchestrator loop above is the shape they slot into — the
-> recording/verify primitives are here; wiring the cron-style driver on top is
-> the remaining piece.
+`pr-demo` implements the **console-agent side** of that loop (the right-hand
+column) as one command — it drives the scenario, records via `pr-evidence-gui`,
+runs your verify check, and emits a verdict, escalating on anything it can't
+confirm. Its bias is deliberate: only an explicit positive signal earns `PASS`;
+no verify check at all is `UNSURE` (a human looks), never `PASS`. A denied/hung
+screen capture is killed by a watchdog and reported as `FAIL` rather than
+wedging the run.
+
+```bash
+# webex demo: confirm no phantom meeting starts, escalate if unconfirmed
+scripts/dev/pr-demo --label "webex messaging starts no meeting (#4337)" \
+  --out webex.gif --seconds 25 \
+  --drive 'osascript demo/webex.scpt' \
+  --expect '"meetings":\s*0' --probe 'curl -s localhost:3030/search?content_type=ui | jq .meetings'
+# exit 0 = PASS · 2 = UNSURE (look at the GIF) · 1 = FAIL (recording/verify failed)
+```
+
+> Status: `screenpipe-dev`, `pr-evidence`, `pr-evidence-gui`, and the `pr-demo`
+> single-machine orchestrator are working today (`pr-demo` has unit tests in
+> `pr-demo.test.sh`). The remaining piece is the **cross-machine cron dispatch**
+> — the headless left-hand column that hands jobs to a `pr-demo` running on a
+> logged-in Mac. That part is environment-specific glue, not in this PR.
 
 ## Quick start
 
@@ -74,6 +93,10 @@ scripts/dev/pr-evidence --out fix.gif \
 
 # app change: record the window (run on the logged-in Mac)
 scripts/dev/pr-evidence-gui --out demo.gif --seconds 20
+
+# app change, orchestrated: record + auto-verify + verdict (run on the logged-in Mac)
+scripts/dev/pr-demo --label "what this proves" --out demo.gif --seconds 20 \
+  --expect 'expected string' --probe 'curl -s localhost:3030/…'
 ```
 
 Deps: `brew install asciinema agg ffmpeg`. These scripts are part of the
