@@ -215,7 +215,7 @@ cargo test
 one command i keep using to avoid having to kill my main "production" process is:
 
 ```bash
-./target/release/screenpipe --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
+./target/release/screenpipe record --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
 ```
 
 it will avoid conflicts with the port and avoid conflicts with the data dir

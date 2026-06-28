@@ -76,8 +76,10 @@ say "extra:    ${EXTRA_ARGS[*]:-<none>}"
 say "prod app on :3030 can keep running — this uses :$DEV_PORT"
 
 cd "$SRC_DIR"
+# `record` is the recording/daemon subcommand; --data-dir/--port are its flags.
 # ${arr[@]+...} guard keeps `set -u` happy when no extra args were passed.
 exec cargo run -p screenpipe-engine --bin screenpipe -- \
+  record \
   --data-dir "$DEV_DATA" \
   --port "$DEV_PORT" \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
