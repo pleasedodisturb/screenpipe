@@ -224,6 +224,8 @@ especially useful if you've done new database migrations and want to avoid break
 
 on macos, prefer `$TMPDIR` (a per-user temp dir) over `/tmp` — the system periodically sweeps `/tmp` and can wipe your dev data-dir mid-session, while `$TMPDIR` sticks around for the session. the `${TMPDIR:-/tmp}` form above uses it when set and falls back to `/tmp` otherwise.
 
+if you keep prod running 24/7 and want this loop scripted — pull, run dev, put prod back when you're done — [`scripts/dev`](scripts/dev) does it both ways: the cli on its own isolated dir+port (same idea as above) or the app via `bun tauri dev`. it also documents the apple-silicon build gotchas (full xcode, metal toolchain, `pre_build.js`). optional; macos only.
+
 ### macos: keeping screen/mic/accessibility permissions across dev rebuilds
 
 macos ties tcc permissions — screen recording, microphone, accessibility — to the app's *code signature*. an unsigned or ad-hoc-signed build gets a fresh signature on every rebuild, so macos sees each rebuild as a new app and re-prompts — or silently drops the permission, which shows up as "capture suddenly returns nothing" after a rebuild.
